@@ -1,0 +1,4 @@
+# Prefer: pip install -e .
+# This file mirrors runtime deps for environments that only pin requirements.txt.
+transformers>=4.40
+huggingface_hub>=0.20

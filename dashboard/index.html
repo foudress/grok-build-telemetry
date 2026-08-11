@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Grok Token Telemetry</title>
+  <link rel="stylesheet" href="css/tokens.css" />
+  <link rel="stylesheet" href="css/layout.css" />
+  <link rel="stylesheet" href="css/components.css" />
+  <link rel="stylesheet" href="css/charts.css" />
+</head>
+<body>
+  <header>
+    <h1>Grok Token Telemetry</h1>
+    <span id="liveBadge" class="badge">connecting…</span>
+    <div class="session-picker">
+      <label for="sessionSelect">Session</label>
+      <select id="sessionSelect" title="Active sessions + recent">
+        <option value="">loading…</option>
+      </select>
+      <span id="sessionPinHint" class="pin-hint" hidden>pinned</span>
+    </div>
+    <span id="sessionMeta" class="meta">—</span>
+    <span id="phaseMeta" class="meta"></span>
+  </header>
+
+  <main>
+    <section class="cards">
+      <div class="card accent">
+        <div class="label">Context now (TUI)</div>
+        <div class="value" id="ctxNow">—</div>
+        <div class="progress"><span id="ctxBar"></span></div>
+      </div>
+      <div class="card green">
+        <div class="label">Session cost (official)</div>
+        <div class="value" id="costOfficial">—</div>
+      </div>
+      <div class="card amber">
+        <div class="label">Session cost (estimate)</div>
+        <div class="value" id="costEstimate">—</div>
+      </div>
+      <div class="card rose">
+        <div class="label">Last turn gen rate</div>
+        <div class="value" id="genRate">—</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Context tokens</h2>
+      <div style="position:relative">
+        <canvas id="ctxChart" height="320"></canvas>
+        <div id="ctxTip" class="chart-tip" role="tooltip"></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Cost per round</h2>
+      <div class="chart-toolbar">
+        <label title="Split each round by attribution (system/user/harness/thought/…)">
+          <input type="checkbox" id="costDetailToggle" /> Detailed attribution
+        </label>
+        <span class="unit-toggle" title="Y-axis unit" role="group" aria-label="Cost chart unit">
+          <button type="button" id="costUnitUsd" class="unit-btn active" aria-pressed="true">$</button>
+          <button type="button" id="costUnitTok" class="unit-btn" aria-pressed="false">Tok</button>
+        </span>
+        <button type="button" id="costDrillBack" hidden>← Back to rounds</button>
+        <span id="costModeLabel" class="mode-pill"></span>
+      </div>
+      <div style="position:relative">
+        <canvas id="costChart" class="bars" height="320"></canvas>
+        <div id="costTip" class="chart-tip" role="tooltip"></div>
+      </div>
+      <div id="costLegend" class="cost-legend" title="Click a category to hide/show it in the bars"></div>
+    </section>
+
+    <section class="panel" style="grid-column:1/-1">
+      <h2>Round hierarchy</h2>
+      <div class="tree" id="roundTree"></div>
+    </section>
+
+    <section class="panel" style="grid-column:1/-1">
+      <h2>Session signals + pricing</h2>
+      <div class="split">
+        <div id="signalsBox" class="meta" style="line-height:1.7"></div>
+        <div id="pricingBox" class="meta" style="line-height:1.7"></div>
+      </div>
+    </section>
+  </main>
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,48 @@
+# Generated / local extract output (batch dumps, summaries)
+/out/
+out/
+*.log
+
+# Session payloads — may contain prompts, paths, tool args (never publish)
+**/updates.jsonl
+**/chat_history.jsonl
+**/events.jsonl
+**/signals.json
+# Loose extract artifacts if written outside out/
+*-events.jsonl
+*-summary.json
+
+# Local maintainer regression scripts (not part of the public tree)
+/test/
+
+# Maintainer session notes (not required for install)
+.grok/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+ENV/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Secrets / local overrides (never commit)
+.env
+.env.*
+*.local.json

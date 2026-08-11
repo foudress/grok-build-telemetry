@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "token-telemetry"
+version = "0.1.0"
+description = "Live companion dashboard for Grok Build token usage, cache, and cost"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "token-telemetry contributors" }]
+keywords = ["grok", "xai", "tokens", "telemetry", "dashboard", "cost"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Debuggers",
+]
+dependencies = [
+  "transformers>=4.40",
+  "huggingface_hub>=0.20",
+]
+
+[project.scripts]
+token-telemetry = "token_telemetry.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/foudress/grok-build-telemetry"
+Documentation = "https://github.com/foudress/grok-build-telemetry#readme"
+Repository = "https://github.com/foudress/grok-build-telemetry"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["token_telemetry*"]
