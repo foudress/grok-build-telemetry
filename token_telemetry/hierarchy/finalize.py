@@ -3,8 +3,9 @@
 Free functions take a HierarchyBuilder-like object as first arg ``hb``.
 HierarchyBuilder methods are thin wrappers so behavior stays identical.
 
-R1/System residual: ``_inject_system_message_residual`` is freeze-zone —
-moved verbatim, no body edits.
+R1/System window identity (2026-08-13 override):
+System + R1 In = context_end. Tool defs + Message is the remainder
+after history parts — not official multi-call Σ off_unc, not a hardcoded 8.2k.
 """
 
 from __future__ import annotations
@@ -231,38 +232,13 @@ def _finalize_round(hb: Any, r: dict[str, Any]) -> None:
         hb._attach_prev_llm_answer(r)
         hb._merge_bootstrap_into_breakdown(r)
 
-def _inject_system_message_residual(
-    hb: Any, r: dict[str, Any], recon: dict[str, Any]
-) -> None:
-    """
-    System "Message" = unexplained uncached Input residual after R1.
+_DROP_SYS_PARTS = frozenset(
+    {"message", "hooks", "tool_definitions", "tool_defs_message"}
+)
 
-    Known mass = System parts (excl. Message) + Round-1 tree In
-    (User uncached + Σ LLM call In). Official off_unc is the ceiling:
 
-        Message = max(0, off_unc − known_sys − r1_tree_in)
-
-    If known already covers/exceeds official uncached (common when
-    tokenizer + tool-defs slightly overshoot), Message is 0 — never inflate
-    System past the real API uncached pool.
-    """
-    sys_p = r.get("system_prompt")
-    if not isinstance(sys_p, dict) or sys_p.get("kind") != "system_prompt":
-        return
-
-    usage = r.get("usage_raw") or r.get("usage") or {}
-    try:
-        off_in = int(usage.get("inputTokens") or 0)
-        off_cache = int(usage.get("cachedReadTokens") or 0)
-    except (TypeError, ValueError):
-        off_in = off_cache = 0
-    off_unc = max(0, off_in - min(off_cache, off_in)) if off_in else 0
-
-    parts = list(sys_p.get("parts") or [])
-    # Drop stale hooks part if any (hooks are not in the prompt)
-    parts = [p for p in parts if p.get("kind") not in ("message", "hooks")]
-    known_sys = sum(int(p.get("tokens") or 0) for p in parts)
-
+def _r1_tree_in_tokens(r: dict[str, Any]) -> int:
+    """User uncached + Σ LLM call In. recon.tree_in is harness-only — do not use it."""
     up = r.get("user_prompt") if isinstance(r.get("user_prompt"), dict) else {}
     user_in = int(
         (up or {}).get("tokens_in")
@@ -274,77 +250,99 @@ def _inject_system_message_residual(
         int(s.get("tokens_in") or s.get("harness_in_tokens") or 0)
         for s in steps_m
     )
-    # Always User + Σ Call In. recon.tree_in is harness-only before merge —
-    # do not use it here or Message residual absorbs the user mass.
-    r1_tree = int(user_in) + int(sum_call)
+    return int(user_in) + int(sum_call)
 
-    residual = 0
-    if off_unc > 0:
-        residual = max(0, int(off_unc) - int(known_sys) - int(r1_tree))
-    else:
-        # No official usage yet — do not invent residual from stream gap
-        residual = 0
 
-    if residual <= 0:
-        # Clear any previous Message inflate; parts already sans message/hooks
-        sys_p["parts"] = parts
-        new_tok = int(known_sys)
-        sys_p["tokens_in"] = new_tok
-        sys_p["logical_tokens"] = new_tok
-        sys_p["uncached_est"] = new_tok
-        sys_p["message_residual_tokens"] = 0
-        boot = r.get("session_bootstrap")
-        if isinstance(boot, dict):
-            boot["system_tokens"] = int(known_sys)
-            boot["message_residual_tokens"] = 0
-            boot["parts"] = [
-                p
-                for p in (boot.get("parts") or [])
-                if isinstance(p, dict) and p.get("kind") not in ("message", "hooks")
-            ]
-        r["bootstrap_residual_tokens"] = 0
-        if isinstance(r.get("step_usage"), dict):
-            r["step_usage"]["bootstrap_residual_tokens"] = 0
+def _inject_system_message_residual(
+    hb: Any, r: dict[str, Any], recon: dict[str, Any]
+) -> None:
+    """
+    Window identity (R1):
+
+        System + R1 In = context_end
+
+    Last LLM Out is next-round In (already folded into later-call In when
+    not last). History parts stay tokenized from chat_history. Remainder
+    is one bucket — silent tool schemas + unexplained glue:
+
+        ToolDef+Message = max(0, context_end − R1_tree − history)
+
+    History = System + User info + Reminders/skills + MCP (+ other).
+    Never use official multi-call Σ off_unc (that inflates Message).
+    Never keep a hardcoded 8.2k tool-def part on the System card.
+    """
+    sys_p = r.get("system_prompt")
+    if not isinstance(sys_p, dict) or sys_p.get("kind") != "system_prompt":
         return
 
-    parts.append(
-        {
-            "kind": "message",
-            "label": "Message",
-            "tokens": int(residual),
-            "tokenizer_tokens": int(residual),
-            "chars": 0,
-            "preview": (
-                "Unattributed uncached Input residual after System parts + R1 tree"
-            ),
-            "messages": 0,
-            "note": (
-                "Message = max(0, off_unc − known_system − R1_tree_In). "
-                "Only the portion of official uncached Input not explained by "
-                "history/tools/user/harness."
-            ),
-        }
-    )
+    parts = [
+        p
+        for p in (sys_p.get("parts") or [])
+        if isinstance(p, dict) and p.get("kind") not in _DROP_SYS_PARTS
+    ]
+    known_hist = sum(int(p.get("tokens") or 0) for p in parts)
+    r1_tree = _r1_tree_in_tokens(r)
+
+    end = r.get("context_end")
+    if isinstance(end, int) and end > 0:
+        bucket = max(0, int(end) - int(r1_tree) - int(known_hist))
+    else:
+        bucket = 0
+
+    tool_meta = r.get("tool_definitions") if isinstance(r.get("tool_definitions"), dict) else {}
+    if bucket > 0:
+        count = int(tool_meta.get("count") or 0)
+        parts.append(
+            {
+                "kind": "tool_defs_message",
+                "label": "Tool definitions + Message",
+                "tokens": int(bucket),
+                "tokenizer_tokens": int(bucket),
+                "chars": 0,
+                "tool_count": count or None,
+                "preview": (
+                    f"{count} tools · context_end − R1 In − history"
+                    if count
+                    else "context_end − R1 In − history"
+                ),
+                "messages": 0,
+                "note": (
+                    "ToolDef+Message = max(0, context_end − R1_In − "
+                    "System − User info − Reminders − MCP). "
+                    "System + R1 In = context_end. Last LLM Out is next-round In."
+                ),
+            }
+        )
+
+    new_tok = int(known_hist) + int(bucket)
     sys_p["parts"] = parts
-    new_tok = int(known_sys) + int(residual)
     sys_p["tokens_in"] = new_tok
     sys_p["logical_tokens"] = new_tok
     sys_p["uncached_est"] = new_tok
-    sys_p["message_residual_tokens"] = int(residual)
+    sys_p["message_residual_tokens"] = int(bucket)
+    sys_p["tool_definitions_tokens"] = int(bucket)
+    sys_p["note"] = (
+        "System + R1 In = context_end. History parts from chat_history; "
+        "Tool definitions + Message is the window remainder "
+        "(not a hardcoded 8.2k, not official Σ uncached)."
+    )
+
     boot = r.get("session_bootstrap")
     if isinstance(boot, dict):
         boot["system_tokens"] = int(new_tok)
-        boot["message_residual_tokens"] = int(residual)
+        boot["message_residual_tokens"] = int(bucket)
+        boot["tool_definitions_tokens"] = int(bucket)
         bparts = [
             p
             for p in (boot.get("parts") or [])
-            if isinstance(p, dict) and p.get("kind") not in ("message", "hooks")
+            if isinstance(p, dict) and p.get("kind") not in _DROP_SYS_PARTS
         ]
-        bparts.append(parts[-1])
+        if bucket > 0:
+            bparts.append(parts[-1])
         boot["parts"] = bparts
-    r["bootstrap_residual_tokens"] = int(residual)
+    r["bootstrap_residual_tokens"] = int(bucket)
     if isinstance(r.get("step_usage"), dict):
-        r["step_usage"]["bootstrap_residual_tokens"] = int(residual)
+        r["step_usage"]["bootstrap_residual_tokens"] = int(bucket)
 
 def _merge_bootstrap_into_breakdown(hb: Any, r: dict[str, Any]) -> None:
     """Surface System / User on round.breakdown; tree In includes user uncached."""
@@ -404,22 +402,13 @@ def _merge_bootstrap_into_breakdown(hb: Any, r: dict[str, Any]) -> None:
         bd["tree_in_tokens"] = int(user_tok) + harness_tok
         bd["tree_in_usd"] = float(user_usd) + harness_usd
     if cold:
-        # R1 only: round ctx start was inflated by tool-def / first-prompt
-        # bump (e.g. ~12k) while System already holds bootstrap In (~11.2k).
-        # Rebase so: context_start + tree_in + output ≈ context_end.
-        # Leave model_steps[*].context_start alone (cache reconstruct).
+        # R1: System + R1 In = context_end. Last LLM Out is next-round In
+        # (already inside later-call In). Leave model_steps[*].context_start
+        # alone (cache reconstruct).
         end = r.get("context_end")
         tree = bd.get("tree_in_tokens")
-        out = bd.get("output_tokens")
-        if out is None:
-            usage = r.get("usage_raw") if isinstance(r.get("usage_raw"), dict) else {}
-            out = usage.get("outputTokens")
-        if (
-            isinstance(end, int)
-            and isinstance(tree, int)
-            and isinstance(out, int)
-        ):
-            peeled = max(0, int(end) - int(tree) - int(out))
+        if isinstance(end, int) and isinstance(tree, int):
+            peeled = max(0, int(end) - int(tree))
             r["context_start"] = peeled
             r["context_delta"] = int(end) - peeled
             bd["context_start_peeled_system"] = True

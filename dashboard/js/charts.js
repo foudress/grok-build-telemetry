@@ -313,7 +313,7 @@ function drawLineChart(canvas, series, color, rounds) {
             `<span class="muted">Y context</span> <b>${fmtTokens(yVal)}</b>`,
             joinParts([partIn(best.tokens_in, best.cost_in_usd)].filter(Boolean)) || "—",
             best.tool_definitions_tokens
-              ? `<span class="muted">incl. tool defs ${fmtTokens(best.tool_definitions_tokens)}</span>`
+              ? `<span class="muted">tool defs + message ${fmtTokens(best.tool_definitions_tokens)}</span>`
               : "",
           ]
         : [

@@ -444,15 +444,20 @@ function renderRoundTree(rounds) {
       ? `<span class="tok-cached" title="context removed (no longer billed going forward)">${fmtDelta(-removed)}</span>`
       : "";
     const absBit = (before != null || after != null)
-      ? `<span class="muted" title="Context before → after compact">ctx ${fmtTokens(before)}${AR}${fmtTokens(after)}</span>`
+      ? `ctx ${fmtTokens(before)}${AR}${fmtTokens(after)}`
       : "";
 
     return `<div class="compact-row" title="${esc(c.cost_note || "Between rounds · " + (where || ""))}">
       <span class="tag compact">Compact</span>
-      ${headParts}
-      ${totalUsd > 0 ? totalPrice(totalUsd) : ""}
-      ${absBit}
-      ${deltaBit}
+      <span class="compact-meta"></span>
+      <span class="compact-ledger">
+        ${headParts}
+        ${totalUsd > 0 ? totalPrice(totalUsd) : ""}
+      </span>
+      <span class="compact-ctx muted">
+        ${absBit}
+        ${deltaBit}
+      </span>
     </div>`;
   }
 
@@ -473,13 +478,16 @@ function renderRoundTree(rounds) {
       : (Number(c.pre_read_cached_usd) || 0) + (Number(c.prompt_in_usd) || 0) + (Number(c.out_usd) || 0);
     // absolute = full fork context; delta N/A (fork does not grow session)
     const absBit = (ctxTok > 0)
-      ? `<span class="muted" title="Full session context re-read on the fork (cached)">ctx ${fmtTokens(ctxTok)}</span>`
+      ? `ctx ${fmtTokens(ctxTok)}`
       : "";
     return `<div class="compact-row recap-row" title="${esc(c.cost_note || "Fork recap · " + (where || ""))}">
       <span class="tag recap">Recap${c.auto ? " · auto" : ""}</span>
-      ${headParts}
-      ${totalUsd > 0 ? totalPrice(totalUsd) : ""}
-      ${absBit}
+      <span class="compact-meta"></span>
+      <span class="compact-ledger">
+        ${headParts}
+        ${totalUsd > 0 ? totalPrice(totalUsd) : ""}
+      </span>
+      <span class="compact-ctx muted" title="Full session context re-read on the fork (cached)">${absBit}</span>
     </div>`;
   }
 
@@ -511,9 +519,12 @@ function renderRoundTree(rounds) {
     }).join("");
     return `<div class="compact-row system-row" title="${esc(sp.note || "Session bootstrap (before Round 1)")}">
       <span class="tag system">System</span>
-      <span class="muted">${esc(sp.label || "System / tools / reminders / MCP / Message")}</span>
-      ${joinParts([partIn(tot, sp.cost_in_usd)])}
-      ${sp.estimate_usd != null ? totalPrice(sp.estimate_usd) : ""}
+      <span class="compact-meta muted">${esc(sp.label || "System / tools / reminders / MCP / Message")}</span>
+      <span class="compact-ledger">
+        ${joinParts([partIn(tot, sp.cost_in_usd)])}
+        ${sp.estimate_usd != null ? totalPrice(sp.estimate_usd) : ""}
+      </span>
+      <span class="compact-ctx"></span>
       ${parts ? `<div class="system-parts">${parts}</div>` : ""}
     </div>`;
   }

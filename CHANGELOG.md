@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-08-13
+
+### Fixed
+
+- **System card Message residual** no longer uses official multi-call `Σ uncached` (`off_unc`). That leftover (~6.4k here) was later-call uncached parked as if it were missing bootstrap.
+- Identity is now **System + Round 1 In = `context_end`**. Last LLM Out is next-round In (already inside later-call In when not last).
+- **Tool definitions + Message** is one window remainder, not a hardcoded 8.2k plus a second Message line:
+
+  `bucket = max(0, context_end − R1_In − System − User info − Reminders − MCP)`
+
+- R1 displayed `context_start` peels as `end − tree` (no Out), so it matches the System total.
+- Recap / Compact / System header numbers **right-pad** like Round heads (tag | spacer | ledger | ctx).
+
+### Added
+
+- `test/test_system_window.py` — window identity, peel, overshoot, no invented bucket without `context_end`.
+
 ## [0.3.0] — 2026-08-13
 
 ### Added

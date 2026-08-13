@@ -455,7 +455,12 @@ def inject_tool_definitions_into_bootstrap(
     boot: dict[str, Any],
     tool_defs: dict[str, Any],
 ) -> dict[str, Any]:
-    """Append Tool definitions as a System-card part (absolute tokens, not re-scaled)."""
+    """Append Tool definitions as a provisional System-card part.
+
+    Finalize replaces this with the window remainder (ToolDef+Message =
+    context_end − R1 In − history). The hardcoded default is only a
+    call-1 context_start bump for cache reconstruct, not the card total.
+    """
     tok = int(tool_defs.get("tokens") or 0)
     if tok <= 0:
         return boot

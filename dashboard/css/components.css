@@ -950,17 +950,45 @@
 }
 
 .tree .compact-row {
-  /* Vertical spacing comes from .tree gap */
+  /* Same right-pad ledger as .round-head: tag | spacer | In/$ | ctx */
   margin: 0;
   padding: var(--space-2) var(--space-3);
   border: 1px solid #3a2a18;
   border-radius: var(--radius-md);
   background: linear-gradient(90deg, #1a140c 0%, var(--bg-elevated) 100%);
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px 14px;
-  align-items: baseline;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  gap: 4px 12px;
+  align-items: center;
   line-height: 1.45;
+}
+
+.tree .compact-row .compact-meta {
+  min-width: 0;
+}
+
+.tree .compact-row .compact-ledger {
+  justify-self: end;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.tree .compact-row .compact-ctx {
+  justify-self: end;
+  white-space: nowrap;
+}
+
+.tree .compact-row .system-parts {
+  grid-column: 1 / -1;
+}
+
+@media (max-width: 900px) {
+  .tree .compact-row {
+    grid-template-columns: auto 1fr;
+  }
+  .tree .compact-row .compact-meta { grid-column: 1 / -1; }
+  .tree .compact-row .compact-ledger,
+  .tree .compact-row .compact-ctx { justify-self: start; }
 }
 
 /* Tree motion: reduced — instant or opacity-only enter; no chevron spin / press scale */

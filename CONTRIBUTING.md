@@ -26,7 +26,7 @@ python scripts/live_dashboard.py
 ## Scope rules
 
 1. **One focused change per PR** — easier review, safer accounting.
-2. **Do not change Round 1 / System accounting or UI reconstruct** unless the PR description explicitly says so. That surface is frozen for pixel-correct cold bootstrap.
+2. **Round 1 / System window identity:** `System + R1 In = context_end`. ToolDef+Message is the remainder after history parts — do not revert to official multi-call `Σ off_unc` or a hardcoded 8.2k on the card. Other R1 reconstruct (call-level cache, call1 start bump) stays frozen unless the PR says so.
 3. **Prefer pure functions** for pricing math; keep `HierarchyBuilder` orchestration thin.
 4. **Zero-build UI** — modular HTML/CSS/JS only (no React/npm build). Design tokens live in `dashboard/css/tokens.css`.
 5. **No personal paths or session dumps** in the repo (prompts, `updates.jsonl`, machine-specific cwd encodings).
