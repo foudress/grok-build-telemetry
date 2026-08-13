@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-08-13
+
+### Added
+
+- **Sub-agent sessions** as first-class telemetry: spawn / `get_command_or_subagent_output` links to `session_kind: subagent` dirs.
+- Parent `turn_completed.usage` is **peeled** of child API bills (input / cache / output / modelCalls / ticks) before per-LLM-call reconstruct. R1 / System stay frozen.
+- Dashboard **Main / Sub N** tabs (cost chart + tree). Main card keeps the harness général $ with parent + children split.
+- Tree **Sub Agent N** row between LLM calls: In (green) · Cached (yellow) · Out (red) · $ — one line.
+- Cost per Round: child $ **stacked on the parent round** (violet). Drill keeps a dedicated S# bar per agent; click opens that tab.
+- Legend hide list **resets** when switching Rounds ↔ Drill (Cached no longer leaks).
+- `token_telemetry/session/subagents.py` + `test/test_subagent_peel.py`.
+
+### Changed
+
+- Per-call displayed context on R2+ is anchored to official-share Input; last call stays on the stream window and is clamped so it cannot exceed session end (`_meta.totalTokens` is a harness estimate).
+- Session picker marks sub-agent dirs `↳` and auto-follow skips them.
+
 ## [0.2.0] — 2026-08-13
 
 ### Added

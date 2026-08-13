@@ -15,6 +15,7 @@ out/
 # Local maintainer regression scripts (not part of the public tree)
 /test/*
 !/test/test_model_rates.py
+!/test/test_subagent_peel.py
 
 # Maintainer session notes (not required for install)
 .grok/

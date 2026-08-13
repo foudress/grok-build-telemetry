@@ -24,6 +24,12 @@ from token_telemetry.session.discover import (
     read_active_session_ids,
     resolve_session_dir,
 )
+from token_telemetry.session.subagents import (
+    collect_child_ids_from_round,
+    is_subagent_session,
+    read_session_summary,
+    sibling_session_dir,
+)
 
 
 def _enrich_user_prompt(up: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -109,6 +115,81 @@ MAX_READ_CHUNK = 1_500_000  # bytes per tick when catching up
 API_ROUNDS = 20  # rounds sent to browser
 
 
+class _ChildWatch:
+    """Incremental hierarchy for one sub-agent session under a parent."""
+
+    def __init__(self, session_dir: Path) -> None:
+        self.session_dir = session_dir
+        self.session_id = session_dir.name
+        self.hierarchy = HierarchyBuilder()
+        self.hierarchy.set_session_dir(session_dir)
+        self._updates_path = session_dir / "updates.jsonl"
+        self._updates_offset = 0
+        self.turns: list[dict[str, Any]] = []
+        self.live: dict[str, Any] = {"context_tokens": None}
+        self.error: Optional[str] = None
+
+    def tick(self, read_lines) -> None:
+        try:
+            lines, self._updates_offset = read_lines(
+                self._updates_path, self._updates_offset
+            )
+            for line in lines:
+                try:
+                    raw = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                self.hierarchy.feed_raw(raw)
+                upd = ((raw.get("params") or {}).get("update") or {})
+                if upd.get("sessionUpdate") == "turn_completed":
+                    usage = upd.get("usage") or {}
+                    ticks = usage.get("costUsdTicks")
+                    self.turns.append(
+                        {
+                            "index": len(self.turns) + 1,
+                            "input_tokens": int(usage.get("inputTokens") or 0),
+                            "output_tokens": int(usage.get("outputTokens") or 0),
+                            "cached_read_tokens": int(usage.get("cachedReadTokens") or 0),
+                            "total_tokens": int(usage.get("totalTokens") or 0),
+                            "model_calls": usage.get("modelCalls"),
+                            "official_ticks": ticks,
+                            "official_usd": ticks_to_usd(ticks) if ticks is not None else 0.0,
+                        }
+                    )
+                meta = (raw.get("params") or {}).get("_meta") or {}
+                tt = meta.get("totalTokens")
+                if isinstance(tt, int):
+                    self.live["context_tokens"] = tt
+            self.error = None
+        except Exception as e:  # noqa: BLE001
+            self.error = f"{type(e).__name__}: {e}"
+
+    def snapshot(self, enrich_round) -> dict[str, Any]:
+        summary = read_session_summary(self.session_dir)
+        official = sum(float(t.get("official_usd") or 0) for t in self.turns)
+        rounds_all = self.hierarchy.snapshot_rounds(include_open=True)
+        rounds_raw = rounds_all[-API_ROUNDS:] if len(rounds_all) > API_ROUNDS else rounds_all
+        rounds = [enrich_round(r) for r in rounds_raw]
+        title = (
+            summary.get("generated_title")
+            or summary.get("session_summary")
+            or summary.get("agent_name")
+            or self.session_id[:8]
+        )
+        return {
+            "session_id": self.session_id,
+            "session_kind": summary.get("session_kind") or "subagent",
+            "agent_name": summary.get("agent_name"),
+            "title": title,
+            "label": title,
+            "official_usd": round(official, 6),
+            "turns": list(self.turns),
+            "rounds": rounds,
+            "live": dict(self.live),
+            "error": self.error,
+        }
+
+
 class SessionMonitor:
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -151,6 +232,7 @@ class SessionMonitor:
         self._snap_rev: int = -1
         self._snap_bytes: Optional[bytes] = None
         self._snap_sig_key: Optional[tuple] = None
+        self._children: dict[str, "_ChildWatch"] = {}
 
     def attach(self, session_dir: Path, *, pin: bool = False) -> None:
         """Attach to a session. Call with lock held OR not — re-entrant safe via unlocked path."""
@@ -195,6 +277,7 @@ class SessionMonitor:
         self._snap_rev = -1
         self._snap_bytes = None
         self._snap_sig_key = None
+        self._children = {}
         self.live["model"] = getattr(self.hierarchy, "_pricing_model", None)
 
     def select_session(self, session_id: Optional[str]) -> dict[str, Any]:
@@ -839,10 +922,47 @@ class SessionMonitor:
                     continue
 
             self._load_signals()
+            self._sync_children()
             self.bootstrapped = True
             self.error = None
         except Exception as e:  # noqa: BLE001 — surface in UI
             self.error = f"{type(e).__name__}: {e}"
+
+    def _known_child_ids(self) -> list[str]:
+        ids: list[str] = []
+        seen: set[str] = set()
+        for rr in self.hierarchy.rounds:
+            if not isinstance(rr, dict):
+                continue
+            for uid in collect_child_ids_from_round(rr):
+                if uid not in seen:
+                    seen.add(uid)
+                    ids.append(uid)
+        open_r = getattr(self.hierarchy, "_open", None)
+        if isinstance(open_r, dict):
+            for uid in collect_child_ids_from_round(open_r):
+                if uid not in seen:
+                    seen.add(uid)
+                    ids.append(uid)
+        return ids
+
+    def _sync_children(self) -> None:
+        if not self.session_dir or is_subagent_session(self.session_dir):
+            self._children = {}
+            return
+        wanted = self._known_child_ids()
+        for uid in list(self._children):
+            if uid not in wanted:
+                self._children.pop(uid, None)
+        for uid in wanted:
+            watch = self._children.get(uid)
+            if watch is None:
+                d = sibling_session_dir(self.session_dir, uid)
+                if d is None or not (d / "updates.jsonl").is_file():
+                    continue
+                watch = _ChildWatch(d)
+                self._children[uid] = watch
+            watch.tick(self._read_new_lines)
 
     def snapshot_bytes(self) -> bytes:
         """Return JSON bytes for /api/state; rebuild only when data revision changes."""
@@ -867,6 +987,10 @@ class SessionMonitor:
                 self.session_id,
                 self.pinned_session_id,
                 tuple(s["session_id"] for s in sessions[:20]),
+                tuple(
+                    (cid, w.hierarchy.revision, len(w.turns))
+                    for cid, w in self._children.items()
+                ),
             )
             if (
                 self._snap_bytes is not None
@@ -880,6 +1004,11 @@ class SessionMonitor:
             for t in self.turns:
                 official += float(t.get("official_usd") or 0)
                 ticks_sum += int(t.get("official_ticks") or 0)
+            children_official = 0.0
+            for w in self._children.values():
+                children_official += sum(float(t.get("official_usd") or 0) for t in w.turns)
+            # Parent-only = harness bill minus children (same $ the peel removes)
+            parent_only = max(0.0, official - children_official)
 
             ctx = self.live.get("context_tokens")
             rounds_all = self.hierarchy.snapshot_rounds(include_open=True)
@@ -916,8 +1045,12 @@ class SessionMonitor:
             if len(rounds_raw) > API_ROUNDS:
                 rounds_raw = rounds_raw[-API_ROUNDS:]
             rounds = [self._enrich_round_usage(r) for r in rounds_raw]
+            sub_sessions = [w.snapshot(self._enrich_round_usage) for w in self._children.values()]
             # Drop heavy nested estimate blobs from completed steps already priced
-            for rr in rounds:
+            slim_rounds = list(rounds)
+            for ss in sub_sessions:
+                slim_rounds.extend(ss.get("rounds") or [])
+            for rr in slim_rounds:
                 for step in rr.get("model_steps") or []:
                     if not isinstance(step, dict):
                         continue
@@ -939,6 +1072,7 @@ class SessionMonitor:
                 "signals": _slim_signals(self.signals),
                 "turns": list(self.turns),
                 "rounds": rounds,
+                "sub_sessions": sub_sessions,
                 "context_series": list(self.context_series),
                 "feed": list(self.feed),
                 "totals": {
@@ -946,6 +1080,10 @@ class SessionMonitor:
                     "estimate_usd": round(est, 6),
                     "official_ticks": ticks_sum,
                     "turns": len(self.turns),
+                    "parent_only_usd": round(parent_only, 6),
+                    "children_usd": round(children_official, 6),
+                    "combined_usd": round(official, 6),
+                    "subagent_count": len(sub_sessions),
                 },
                 "pricing": pricing_payload(
                     model=getattr(self.hierarchy, "_pricing_model", None),

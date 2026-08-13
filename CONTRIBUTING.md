@@ -38,7 +38,7 @@ python scripts/live_dashboard.py
 | Package entry / CLI | `token_telemetry/__main__.py`, `token_telemetry/live_dashboard.py` |
 | Hierarchy / bootstrap | `token_telemetry/hierarchy/` (`builder.py`, `bootstrap.py`, …) |
 | Pricing rates & reconstruct | `token_telemetry/pricing/` (`rates.py`, `reconstruct.py`) |
-| Session discovery & monitor | `token_telemetry/session/` (`discover.py`, `monitor.py`) |
+| Session discovery & monitor | `token_telemetry/session/` (`discover.py`, `monitor.py`, `subagents.py`) |
 | HTTP API & static serving | `token_telemetry/server/http.py` |
 | Tokenizer weights | `token_telemetry/tokenizer.py` |
 | Dashboard UI | `dashboard/index.html`, `dashboard/css/*`, `dashboard/js/*` |

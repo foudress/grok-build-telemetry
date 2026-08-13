@@ -11,21 +11,25 @@ def compact_round_inplace(r: dict[str, Any]) -> None:
     """Drop heavy / redundant fields so retained rounds stay small."""
     # Collapse full usage blob to slim counters (enough for dashboard)
     usage = r.get("usage_raw")
+    _usage_keys = (
+        "inputTokens",
+        "outputTokens",
+        "reasoningTokens",
+        "cachedReadTokens",
+        "totalTokens",
+        "costUsdTicks",
+        "apiDurationMs",
+        "modelCalls",
+        "modelUsage",
+    )
     if isinstance(usage, dict) and usage:
         r["usage_raw"] = {
-            k: usage.get(k)
-            for k in (
-                "inputTokens",
-                "outputTokens",
-                "reasoningTokens",
-                "cachedReadTokens",
-                "totalTokens",
-                "costUsdTicks",
-                "apiDurationMs",
-                "modelCalls",
-                "modelUsage",
-            )
-            if usage.get(k) is not None
+            k: usage.get(k) for k in _usage_keys if usage.get(k) is not None
+        }
+    unpeeled = r.get("usage_raw_unpeeled")
+    if isinstance(unpeeled, dict) and unpeeled:
+        r["usage_raw_unpeeled"] = {
+            k: unpeeled.get(k) for k in _usage_keys if unpeeled.get(k) is not None
         }
     for key in ("user_preview",):
         if key in r:

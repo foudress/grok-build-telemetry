@@ -859,6 +859,10 @@ def _finalize_step(hb: Any, step: dict[str, Any]) -> None:
                 "declare_ctx": t.get("declare_ctx"),
                 "plan": t.get("plan"),
                 "is_plan": bool(t.get("is_plan") or t.get("plan")),
+                "subagent_id": t.get("subagent_id"),
+                "subagent_ids": list(t.get("subagent_ids") or []) or None,
+                "subagent_type": t.get("subagent_type"),
+                "subagent_description": t.get("subagent_description"),
             }
         )
     # Stamp chat_history tool_result (chars + tokenizer weights; authoritative)
@@ -1436,6 +1440,39 @@ def _attach_step_estimates(hb: Any, r: dict[str, Any]) -> None:
         if isinstance(cs0, int) and cs0 > prior:
             user_unc = max(0, int(cs0) - int(prior))
 
+    # Peel child-session official usage out of the parent turn bill (R2+).
+    # R1/System stays frozen — never rewrite that official dict.
+    # Always peel from the unpeeled original so reprice is idempotent.
+    # Late import: session.__init__ pulls monitor → hierarchy (cycle).
+    from token_telemetry.session.subagents import (
+        attach_subagents_after_steps,
+        collect_child_ids_from_round,
+        peel_round_usage,
+    )
+
+    if usage and not is_session_first and r.get("system_prompt") is None:
+        child_ids = collect_child_ids_from_round(r)
+        if child_ids:
+            cache = getattr(hb, "_child_usage_cache", None)
+            if cache is None:
+                cache = {}
+                hb._child_usage_cache = cache
+            src = r.get("usage_raw_unpeeled")
+            if not isinstance(src, dict) or not src:
+                src = dict(usage)
+            peeled, peel_meta = peel_round_usage(
+                src,
+                parent_dir=getattr(hb, "_session_dir", None),
+                child_ids=child_ids,
+                cache=cache,
+            )
+            r["usage_raw_unpeeled"] = dict(src)
+            r["subagent_peel"] = peel_meta
+            if peel_meta.get("peeled"):
+                usage = peeled
+                r["usage_raw"] = peeled
+            attach_subagents_after_steps(r, peel_meta)
+
     fam = r.get("model_family") or getattr(hb, "_pricing_model", None)
     with pricing_model_scope(fam):
         recon = reconstruct_model_step_usage(
@@ -1473,6 +1510,77 @@ def _attach_step_estimates(hb: Any, r: dict[str, Any]) -> None:
 
         # Compact cost = re-read(kept ctx) + deferred reload (tools/system)
         hb._fill_compact_cost(r)
+
+        # R2+: show per-call context from official-share Input, not harness
+        # char/4 totalTokens. Stream snaps kept as stream_context_*.
+        if not is_session_first and r.get("system_prompt") is None:
+            _anchor_call_context_to_input(r)
+
+
+def _anchor_call_context_to_input(r: dict[str, Any]) -> None:
+    """Align displayed LLM-call context with that call's reconstructed Input."""
+    steps = [s for s in (r.get("model_steps") or []) if isinstance(s, dict)]
+    if not steps:
+        return
+    inputs: list[int] = []
+    for s in steps:
+        se = s.get("estimate") if isinstance(s.get("estimate"), dict) else {}
+        inp = se.get("input_tokens")
+        if inp is None:
+            inp = int(s.get("tokens_cached") or 0) + int(s.get("paid_at_start_tokens") or 0)
+        try:
+            inputs.append(max(0, int(inp or 0)))
+        except (TypeError, ValueError):
+            inputs.append(0)
+    session_end = None
+    last = steps[-1]
+    for key in ("context_end", "stream_context_end", "context_peak"):
+        v = last.get(key)
+        if isinstance(v, int) and v > 0:
+            session_end = v if session_end is None else max(session_end, v)
+    rend = r.get("context_end")
+    if isinstance(rend, int) and rend > 0:
+        session_end = rend if session_end is None else max(session_end, rend)
+
+    for i, s in enumerate(steps):
+        if isinstance(s.get("context_start"), int) and s.get("stream_context_start") is None:
+            s["stream_context_start"] = s["context_start"]
+        if isinstance(s.get("context_end"), int) and s.get("stream_context_end") is None:
+            s["stream_context_end"] = s["context_end"]
+        se = s.get("estimate") if isinstance(s.get("estimate"), dict) else {}
+        cache_t = 0
+        try:
+            cache_t = int(s.get("tokens_cached") or se.get("cached_read_tokens") or 0)
+        except (TypeError, ValueError):
+            cache_t = 0
+        inp = inputs[i]
+        stream_start = s.get("stream_context_start")
+        stream_end = s.get("stream_context_end")
+        last = i == len(steps) - 1
+        # Last call Cached=0 by design — its reconstructed Input is uncached
+        # only, not the window. Keep the stream snap so ctx cannot collapse.
+        if last or cache_t <= 0 or inp <= 0:
+            if isinstance(stream_start, int) and stream_start > 0:
+                s["context_start"] = stream_start
+            ce = stream_end if isinstance(stream_end, int) else s.get("context_end")
+        else:
+            s["context_start"] = inp
+            if i + 1 < len(steps) and inputs[i + 1] > 0 and cache_t > 0:
+                ce = max(inp, inputs[i + 1])
+            elif isinstance(stream_end, int) and stream_end >= inp:
+                ce = stream_end
+            else:
+                ce = inp + max(0, int(s.get("context_growth_est") or s.get("tokens_out") or 0))
+        if not isinstance(s.get("context_start"), int):
+            continue
+        if not isinstance(ce, int):
+            ce = s["context_start"]
+        if isinstance(session_end, int) and session_end > 0:
+            ce = min(ce, session_end)
+            if s["context_start"] > session_end:
+                s["context_start"] = session_end
+        s["context_end"] = max(s["context_start"], ce)
+        s["context_delta"] = max(0, s["context_end"] - s["context_start"])
 
 def _enc_stamp_signature(hb: Any) -> tuple:
     """Fingerprint of encrypted_content stamps across completed rounds."""

@@ -5,6 +5,83 @@ import { drawLineChart, drawBars, setCostUnit } from './charts.js';
 import { fillSessionSelect, switchSession, bindPoll } from './sessions.js';
 
 const TIER_CLIFF = 200000;
+let _taskTab = "main";
+
+function resetCostChartMode() {
+  const st = window.__costChart;
+  if (!st) return;
+  st.drillTurn = null;
+  st.hiddenLegend = new Set();
+  st._wasDrill = false;
+}
+
+function switchTaskTab(id) {
+  _taskTab = id || "main";
+  resetCostChartMode();
+  const last = window.__lastState;
+  if (last) render(last);
+}
+window.__switchTaskTab = switchTaskTab;
+
+function paintTaskTabs(state) {
+  const el = $("taskTabs");
+  if (!el) return;
+  const subs = state.sub_sessions || [];
+  if (!subs.length) {
+    el.hidden = true;
+    el.innerHTML = "";
+    _taskTab = "main";
+    return;
+  }
+  el.hidden = false;
+  const bits = [
+    { id: "main", label: "Main" },
+    ...subs.map((s, i) => ({
+      id: s.session_id,
+      label: `Sub ${i + 1}`,
+      tip: [s.title || s.label, s.agent_name ? `type ${s.agent_name}` : ""]
+        .filter(Boolean).join(" · "),
+    })),
+  ];
+  if (_taskTab !== "main" && !subs.some((s) => s.session_id === _taskTab)) {
+    _taskTab = "main";
+  }
+  el.innerHTML = bits.map((b) => (
+    `<button type="button" class="task-tab${_taskTab === b.id ? " is-on" : ""}" data-tab="${esc(b.id)}" title="${esc(b.tip || b.label)}">${esc(b.label)}</button>`
+  )).join("");
+  el.querySelectorAll("[data-tab]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      switchTaskTab(btn.getAttribute("data-tab") || "main");
+    });
+  });
+}
+
+function activeTaskView(state) {
+  const subs = state.sub_sessions || [];
+  if (_taskTab && _taskTab !== "main") {
+    const sub = subs.find((s) => s.session_id === _taskTab);
+    if (sub) {
+      return {
+        kind: "sub",
+        rounds: sub.rounds || [],
+        turns: sub.turns || [],
+        live: sub.live || {},
+        official_usd: sub.official_usd,
+        estimate_usd: sub.official_usd,
+        title: sub.title || sub.label,
+      };
+    }
+  }
+  return {
+    kind: "main",
+    rounds: state.rounds || [],
+    turns: state.turns || [],
+    live: state.live || {},
+    official_usd: (state.totals || {}).official_usd,
+    estimate_usd: (state.totals || {}).estimate_usd,
+    title: null,
+  };
+}
 
 function showBanner(msg, kind) {
   const el = $("statusBanner");
@@ -87,11 +164,15 @@ function render(state) {
   $("sessionMeta").innerHTML = `<code title="${esc(sid)}">${esc(short)}</code>`;
   fillSessionSelect(state);
 
-  const live = state.live || {};
-  $("phaseMeta").textContent = live.phase ? `phase: ${live.phase}` : "";
+  paintTaskTabs(state);
+  const view = activeTaskView(state);
+  const live = view.live || state.live || {};
+  $("phaseMeta").textContent = live.phase
+    ? `phase: ${live.phase}`
+    : (view.kind === "sub" ? "sub-agent" : "");
 
   const sig = state.signals || {};
-  const ctx = live.context_tokens_ui ?? live.context_tokens ?? sig.contextTokensUsed;
+  const ctx = live.context_tokens_ui ?? live.context_tokens ?? (view.kind === "main" ? sig.contextTokensUsed : null);
   const win = sig.contextWindowTokens || 500000;
   $("ctxNow").textContent = fmtTokens(ctx);
   const pct = ctx != null && win ? Math.min(100, (ctx / win) * 100) : 0;
@@ -114,13 +195,35 @@ function render(state) {
   paintPressure(ctx, win);
 
   const totals = state.totals || {};
-  $("costOfficial").textContent = fmtUsd(totals.official_usd);
-  $("costEstimate").textContent = fmtUsd(totals.estimate_usd);
-  const off = Number(totals.official_usd);
-  const est = Number(totals.estimate_usd);
+  const offShow = view.kind === "sub" ? view.official_usd : totals.official_usd;
+  const estShow = view.kind === "sub" ? view.estimate_usd : totals.estimate_usd;
+  $("costOfficial").textContent = fmtUsd(offShow);
+  $("costEstimate").textContent = fmtUsd(estShow);
+  const off = Number(offShow);
+  const est = Number(estShow);
   const offSub = $("costOfficialSub");
   const estSub = $("costEstimateSub");
-  if (Number.isFinite(off) && Number.isFinite(est)) {
+  if (view.kind === "sub") {
+    if (offSub) {
+      offSub.textContent = view.title ? String(view.title) : "sub-agent session";
+      offSub.className = "sub";
+    }
+    if (estSub) {
+      estSub.textContent = "child session (own API bill)";
+      estSub.className = "sub";
+    }
+  } else if (Number(totals.subagent_count) > 0) {
+    if (offSub) {
+      offSub.textContent = `général · parent ${fmtUsd(totals.parent_only_usd)} + ${totals.subagent_count} sub ${fmtUsd(totals.children_usd)}`;
+      offSub.className = "sub";
+    }
+    if (estSub) {
+      estSub.textContent = Number.isFinite(est) && Number.isFinite(off)
+        ? `Δ ${est - off >= 0 ? "+" : ""}${fmtUsd(est - off)} vs official`
+        : "";
+      estSub.className = "sub";
+    }
+  } else if (Number.isFinite(off) && Number.isFinite(est)) {
     const delta = est - off;
     const match = Math.abs(delta) < 0.0005;
     if (offSub) {
@@ -152,7 +255,7 @@ function render(state) {
     }
   }
 
-  const last = (state.turns || []).slice(-1)[0];
+  const last = (view.turns || state.turns || []).slice(-1)[0];
   const genSub = $("genRateSub");
   if (last && last.gen_tokens_per_sec != null) {
     $("genRate").textContent = last.gen_tokens_per_sec.toFixed(1) + "/s";
@@ -162,13 +265,25 @@ function render(state) {
     }
   } else {
     $("genRate").textContent = "—";
-    if (genSub) genSub.textContent = "";
+    if (genSub) genSub.textContent = view.kind === "sub" ? "sub-agent" : "";
   }
 
-  paintKvChip(state.rounds || []);
-  drawLineChart($("ctxChart"), state.context_series || [], "#3d9cf0", state.rounds || []);
-  drawBars($("costChart"), state.turns || [], state.rounds || []);
-  renderRoundTree(state.rounds || []);
+  paintKvChip(view.rounds || []);
+  drawLineChart(
+    $("ctxChart"),
+    view.kind === "main" ? (state.context_series || []) : [],
+    "#3d9cf0",
+    view.rounds || []
+  );
+  drawBars($("costChart"), view.turns || [], view.rounds || []);
+  renderRoundTree(view.rounds || []);
+  document.querySelectorAll("[data-sub-tab]").forEach((el) => {
+    el.addEventListener("click", () => {
+      const id = el.getAttribute("data-sub-tab");
+      if (!id) return;
+      switchTaskTab(id);
+    });
+  });
 
   $("signalsBox").innerHTML = `
     <div><b>Latency</b></div>
@@ -253,18 +368,16 @@ $("sessionSelect")?.addEventListener("change", (ev) => {
 $("costDetailToggle")?.addEventListener("change", (ev) => {
   window.__costChart.detail = !!ev.target.checked;
   try { localStorage.setItem("tt-cost-detail", ev.target.checked ? "1" : "0"); } catch { /* ignore */ }
-  if (window.__lastState) {
-    drawBars($("costChart"), window.__lastState.turns || [], window.__lastState.rounds || []);
-  }
+  const st = window.__costChart;
+  if (st) drawBars($("costChart"), st.turns, st.rounds);
 });
 $("costUnitUsd")?.addEventListener("click", () => setCostUnit("usd"));
 $("costUnitTok")?.addEventListener("click", () => setCostUnit("tokens"));
 $("costDrillBack")?.addEventListener("click", () => {
   window.__costChart.drillTurn = null;
   clearRoundFocus();
-  if (window.__lastState) {
-    drawBars($("costChart"), window.__lastState.turns || [], window.__lastState.rounds || []);
-  }
+  const st = window.__costChart;
+  if (st) drawBars($("costChart"), st.turns, st.rounds);
 });
 
 $("densStandard")?.addEventListener("click", () => setTreeDensity("standard"));

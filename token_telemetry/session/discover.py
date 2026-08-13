@@ -156,6 +156,20 @@ def list_sessions_for_ui() -> list[dict[str, Any]]:
         age_seconds = max(0.0, now - float(last_epoch or 0))
         age_label = format_age(age_seconds)
 
+        kind = summary.get("session_kind")
+        if isinstance(kind, str):
+            kind = kind.strip().lower() or None
+        else:
+            kind = None
+        agent_name = summary.get("agent_name")
+        if not isinstance(agent_name, str) or not agent_name.strip():
+            agent_name = None
+        else:
+            agent_name = agent_name.strip()
+        if kind == "subagent":
+            sub_bit = agent_name or "sub"
+            label = f"↳ {sub_bit} · {label}"
+
         return {
             "session_id": sid,
             "label": str(label),
@@ -169,6 +183,8 @@ def list_sessions_for_ui() -> list[dict[str, Any]]:
             "updates_bytes": size,
             "path": str(d),
             "cwd": cwd,
+            "session_kind": kind,
+            "agent_name": agent_name,
         }
 
     # Active first (stable order from file, last = most recent open)
@@ -196,14 +212,23 @@ def resolve_session_dir(session_id: Optional[str] = None) -> Optional[Path]:
     if session_id:
         return by_id.get(session_id)
 
+    def _is_sub(d: Path) -> bool:
+        summary = _read_session_summary(d)
+        kind = summary.get("session_kind")
+        return isinstance(kind, str) and kind.strip().lower() == "subagent"
+
     # Prefer an active session that still has a fresh updates file
+    # (never auto-follow a sub-agent session — those live under the parent)
     active = read_active_session_ids()
     for sid in reversed(active):  # last opened wins
-        if sid in by_id:
-            return by_id[sid]
+        d = by_id.get(sid)
+        if d is not None and not _is_sub(d):
+            return d
 
-    if not dirs:
+    mains = [d for d in dirs if not _is_sub(d)]
+    pool = mains or dirs
+    if not pool:
         return None
-    dirs.sort(key=lambda d: (d / "updates.jsonl").stat().st_mtime, reverse=True)
-    return dirs[0]
+    pool.sort(key=lambda d: (d / "updates.jsonl").stat().st_mtime, reverse=True)
+    return pool[0]
 

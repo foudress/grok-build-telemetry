@@ -438,7 +438,9 @@ const COST_COLORS = {
   llm: "#1a6b3c",        /* dark green — LLM Out→In */
   compact: "#f0a070",
   official: "#3d9cf0",
+  sub: "#8b7cf7",
 };
+const SUB_SHADES = ["#8b7cf7", "#a78bfa", "#6d5ae6", "#c4b5fd"];
 
 function costSegMetric(seg, unit) {
   if (!seg) return 0;
@@ -1011,6 +1013,96 @@ function callCostParts(step, callIndex, round) {
   };
 }
 
+function subagentCostBar(sa) {
+  if (!sa || !sa.session_id) return null;
+  const u = sa.usage || {};
+  const tin = Number(sa.tokens_in);
+  const tcache = Number(sa.tokens_cached);
+  const tout = Number(sa.tokens_out);
+  const inTok = Number.isFinite(tin)
+    ? tin
+    : Math.max(0, Number(u.inputTokens || 0) - Number(u.cachedReadTokens || 0));
+  const cacheTok = Number.isFinite(tcache) ? tcache : Number(u.cachedReadTokens || 0);
+  const outTok = Number.isFinite(tout) ? tout : Number(u.outputTokens || 0);
+  const cin = Number(sa.cost_in_usd) || 0;
+  const ccache = Number(sa.cost_cached_usd) || 0;
+  const cout = Number(sa.cost_out_usd) || 0;
+  const official = sa.official_usd != null ? Number(sa.official_usd) : null;
+  const est = Number(sa.estimate_usd) || (cin + ccache + cout);
+  const total = (official != null && official > 0) ? official : est;
+  const totalTok = Math.max(0, inTok) + Math.max(0, cacheTok) + Math.max(0, outTok);
+  if (!(total > 0) && !(totalTok > 0)) return null;
+  const n = sa.n != null ? sa.n : "";
+  const title = sa.title || sa.label || sa.agent_name || "Sub Agent";
+  return {
+    segs: [{
+      k: "sub",
+      label: "Sub",
+      legendKey: "sub",
+      v: total || 0,
+      tok: totalTok || 0,
+      color: COST_COLORS.sub,
+    }],
+    in: cin,
+    cached: ccache,
+    out: cout,
+    total: total || 0,
+    total_tok: totalTok || 0,
+    official: official,
+    index: "S" + n,
+    label: "S" + n,
+    kind: "subagent",
+    session_id: sa.session_id,
+    title,
+    agent_name: sa.agent_name,
+    uncached_tokens: inTok,
+    cached_tokens: cacheTok,
+    out_tokens: outTok,
+  };
+}
+
+function collectRoundSubagentBars(round) {
+  if (!round) return [];
+  const seen = new Set();
+  const out = [];
+  for (const step of round.model_steps || []) {
+    if (!step) continue;
+    for (const sa of step.subagents_after || []) {
+      const id = sa && sa.session_id;
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      const bar = subagentCostBar(sa);
+      if (bar) out.push(bar);
+    }
+  }
+  return out;
+}
+
+/** Rounds overview: fold each child bill into that turn's stack (not its own X slot). */
+function attachSubagentSegsToTurn(turnBar, round) {
+  if (!turnBar) return turnBar;
+  const kids = collectRoundSubagentBars(round);
+  if (!kids.length) return turnBar;
+  if (!turnBar.segs) turnBar.segs = [];
+  kids.forEach((sb, i) => {
+    const n = String(sb.label || "").replace(/^S/, "") || String(i + 1);
+    turnBar.segs.push({
+      k: "sub",
+      label: "S" + n,
+      legendKey: "sub:" + (sb.session_id || n),
+      v: sb.total || 0,
+      tok: sb.total_tok || 0,
+      color: SUB_SHADES[i % SUB_SHADES.length],
+      session_id: sb.session_id,
+      title: sb.title,
+    });
+    turnBar.total = (Number(turnBar.total) || 0) + (sb.total || 0);
+    turnBar.total_tok = (Number(turnBar.total_tok) || 0) + (sb.total_tok || 0);
+  });
+  turnBar.has_subagents = true;
+  return turnBar;
+}
+
 function compactCostBar(c, compactIndex) {
   if (!c || c.kind !== "compaction") return null;
   const segs = [];
@@ -1084,8 +1176,19 @@ function drawBars(canvas, turns, rounds) {
   if (st.drillTurn != null) {
     const round = findRound(st.rounds, st.drillTurn);
     const steps = (round && round.model_steps) || [];
-    bars = steps.map((s, i) => callCostParts(s, s.index ?? i + 1, round));
-    bars.forEach(b => { b.turnIndex = st.drillTurn; });
+    bars = [];
+    steps.forEach((s, i) => {
+      const b = callCostParts(s, s.index ?? i + 1, round);
+      b.turnIndex = st.drillTurn;
+      bars.push(b);
+      for (const sa of s.subagents_after || []) {
+        const sb = subagentCostBar(sa);
+        if (sb) {
+          sb.turnIndex = st.drillTurn;
+          bars.push(sb);
+        }
+      }
+    });
   } else {
     const slice = (turns || []).slice(-16);
     // Separate System bar before Round 1 when bootstrap system exists
@@ -1122,7 +1225,10 @@ function drawBars(canvas, turns, rounds) {
         const cbBefore = compactCostBar(round.compact_before, compactN);
         if (cbBefore) bars.push(cbBefore);
       }
-      bars.push(turnCostParts(t, round, { detail: st.detail, peelSystem }));
+      bars.push(attachSubagentSegsToTurn(
+        turnCostParts(t, round, { detail: st.detail, peelSystem }),
+        round
+      ));
       // Compact after this round (between R[n] and R[n+1])
       const c = round && round.compact_after;
       if (c && c.kind === "compaction") {
@@ -1149,22 +1255,16 @@ function drawBars(canvas, turns, rounds) {
   const unit = st.unit === "tokens" ? "tokens" : "usd";
   const isDrill = st.drillTurn != null;
 
-  // When entering drill from all-rounds: drop hide keys not present in this drill
-  // so stale tool hides don't clutter the legend UI.
-  if (isDrill && !st._wasDrill) {
-    const present = new Set();
-    bars.forEach(p => (p.segs || []).forEach(s => {
-      const k = costSegKey(s);
-      if (k) present.add(k);
-      if (s.label) present.add(s.label);
-    }));
-    for (const h of [...st.hiddenLegend]) {
-      if (!present.has(h)) st.hiddenLegend.delete(h);
-    }
+  // Rounds ↔ drill: drop every hidden chip (Cached stay-off was leaking).
+  if (isDrill !== !!st._wasDrill) {
+    st.hiddenLegend = new Set();
   }
   st._wasDrill = isDrill;
 
   const hidden = st.hiddenLegend;
+  if (hidden.has("sub") || hidden.has("Sub")) {
+    bars = bars.filter((b) => b.kind !== "subagent");
+  }
 
   // Visible stack per bar (legend click hides categories for granularity)
   const visStacks = bars.map(p => {
@@ -1257,7 +1357,12 @@ function drawBars(canvas, turns, rounds) {
       ctx.lineTo(x0 + bw + 2, oy);
       ctx.stroke();
     }
-    ctx.fillStyle = CHART_AXIS.labelDim;
+    if (p.kind === "subagent") {
+      ctx.strokeStyle = COST_COLORS.sub;
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(x0 + 0.5, yBase + 0.5, bw - 1, (top + plotH) - yBase - 1);
+    }
+    ctx.fillStyle = p.kind === "subagent" ? COST_COLORS.sub : CHART_AXIS.labelDim;
     ctx.font = "10px system-ui, Segoe UI, sans-serif";
     ctx.textAlign = "center";
     ctx.fillText(p.label || String(p.index), x0 + bw / 2, h - 8);
@@ -1280,6 +1385,8 @@ function drawBars(canvas, turns, rounds) {
       ["Cached", { label: "Cached", color: COST_COLORS.cached }],
       ["Out", { label: "Out", color: COST_COLORS.out }],
     ];
+    if (bars.some((b) => b.kind === "subagent" || (b.segs || []).some((s) => s.k === "sub")))
+      legendItems.push(["sub", { label: "Sub", color: COST_COLORS.sub, k: "sub" }]);
     if (unit === "usd")
       legendItems.push(["official", { label: "official", color: COST_COLORS.official }]);
   } else if (st.drillTurn == null && unit === "usd") {
@@ -1310,7 +1417,7 @@ function drawBars(canvas, turns, rounds) {
     const fixed = [
       "System", "User", "user", "In", "in", "Cached", "cached",
       "thought", "reasoning", "message", "LLM Out→In", "llm_out_in",
-      "Out", "out", "official", "in residual", "reload", "pre-read", "pre-read In",
+      "Out", "out", "Sub", "sub", "official", "in residual", "reload", "pre-read", "pre-read In",
     ];
     const fi = fixed.indexOf(key) >= 0 ? fixed.indexOf(key) : fixed.indexOf(lab);
     if (fi >= 0) return fi;
@@ -1344,7 +1451,8 @@ function drawBars(canvas, turns, rounds) {
         hideChartTip(tipEl);
         return;
       }
-      canvas.style.cursor = found.p.kind === "turn" ? "pointer" : "default";
+      canvas.style.cursor = (found.p.kind === "turn" || found.p.kind === "subagent")
+        ? "pointer" : "default";
       const p = found.p;
       tipEl.style.whiteSpace = "normal";
       tipEl.style.maxWidth = "300px";
@@ -1352,7 +1460,9 @@ function drawBars(canvas, turns, rounds) {
         ? ("LLM call " + p.index)
         : (p.kind === "system" ? "System"
           : (p.kind === "compact" ? ("Compact " + p.label)
-            : ("Round " + p.index)));
+            : (p.kind === "subagent"
+              ? ("Sub Agent " + String(p.label || "").replace(/^S/, "") + (p.title ? " · " + p.title : ""))
+              : ("Round " + p.index))));
       const lines = [`<b>${esc(head)}</b>`];
       if (p.kind === "compact" && (p.tokens_before != null || p.tokens_after != null)) {
         lines.push(
@@ -1360,18 +1470,29 @@ function drawBars(canvas, turns, rounds) {
         );
       }
       const u = p._unit || window.__costChart.unit || "usd";
-      (p.segs || []).forEach(s => {
-        const mv = costSegMetric(s, u);
-        if (!(mv > 0)) return;
-        const cnt = s.n > 1 ? ` ×${s.n}` : "";
-        lines.push(
-          `<span style="color:${s.color}">●</span> ${esc(s.label)}${cnt} ${fmtCostAxis(mv, u)}`
-        );
-      });
+      if (p.kind === "subagent") {
+        if (p.uncached_tokens || p.in)
+          lines.push(`<span style="color:${COST_COLORS.in}">●</span> In ${fmtTokens(p.uncached_tokens)} · ${fmtUsd(p.in)}`);
+        if (p.cached_tokens || p.cached)
+          lines.push(`<span style="color:${COST_COLORS.cached}">●</span> Cached ${fmtTokens(p.cached_tokens)} · ${fmtUsd(p.cached)}`);
+        if (p.out_tokens || p.out)
+          lines.push(`<span style="color:${COST_COLORS.out}">●</span> Out ${fmtTokens(p.out_tokens)} · ${fmtUsd(p.out)}`);
+      } else {
+        (p.segs || []).forEach(s => {
+          const mv = costSegMetric(s, u);
+          if (!(mv > 0)) return;
+          const cnt = s.n > 1 ? ` ×${s.n}` : "";
+          const extra = s.title ? " · " + s.title : "";
+          lines.push(
+            `<span style="color:${s.color}">●</span> ${esc(s.label)}${esc(extra)}${cnt} ${fmtCostAxis(mv, u)}`
+          );
+        });
+      }
       lines.push(`<b>→ ${fmtCostAxis(p.total || 0, u)}</b>`);
       if (u === "usd" && p.official != null && !window.__costChart.hiddenLegend?.has("official"))
         lines.push(`<span class="muted">official ${fmtUsd(p.official)}</span>`);
       if (p.kind === "turn") lines.push(`<span class="muted">click: tree + drill calls</span>`);
+      if (p.kind === "subagent") lines.push(`<span class="muted">click: open this sub-agent tab</span>`);
       const html = lines.join("<br>");
       // Tooltip top-right of cursor (above + to the right) — keep existing placement
       const { tw, th } = measureChartTip(tipEl, html);
@@ -1392,6 +1513,11 @@ function drawBars(canvas, turns, rounds) {
       const my = ev.clientY - rect.top;
       const found = canvas._barHit.find(b => mx >= b.x0 && mx <= b.x1 && my >= b.y0 && my <= b.y1);
       if (!found || !found.p) return;
+      if (found.p.kind === "subagent" && found.p.session_id) {
+        if (typeof window.__switchTaskTab === "function")
+          window.__switchTaskTab(found.p.session_id);
+        return;
+      }
       if (found.p.kind === "turn") {
         window.__costChart.drillTurn = found.p.index;
         drawBars(canvas, window.__costChart.turns, window.__costChart.rounds);
@@ -1460,9 +1586,8 @@ function setCostUnit(unit) {
     tokBtn.classList.toggle("active", !isUsd);
     tokBtn.setAttribute("aria-pressed", !isUsd ? "true" : "false");
   }
-  if (window.__lastState) {
-    drawBars($("costChart"), window.__lastState.turns || [], window.__lastState.rounds || []);
-  }
+  const st = window.__costChart;
+  if (st) drawBars($("costChart"), st.turns, st.rounds);
 }
 
 export {

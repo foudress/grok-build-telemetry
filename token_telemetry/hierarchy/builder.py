@@ -104,6 +104,7 @@ class HierarchyBuilder:
         # Bumps when structure changes (for dashboard snapshot cache)
         self.revision: int = 0
         self._session_dir: Optional[Path] = None
+        self._child_usage_cache: dict[str, dict[str, int]] = {}
         # hook_execution payloads (session-level; first-prompt ones feed bootstrap)
         self._hooks: list[dict[str, Any]] = []
         self._bootstrap_hooks: list[dict[str, Any]] = []
@@ -171,6 +172,7 @@ class HierarchyBuilder:
         self._pricing_model = None
         self._models_raw = []
         self._priced_with = None
+        self._child_usage_cache = {}
         set_pricing_model(None)
         self.revision += 1
 
@@ -734,6 +736,26 @@ class HierarchyBuilder:
             "plan": plan,
             "is_plan": bool(plan),
         }
+        if name in (
+            "spawn_subagent",
+            "get_command_or_subagent_output",
+            "kill_command_or_subagent",
+        ):
+            from token_telemetry.session.subagents import extract_task_ids, parse_subagent_meta
+
+            ids = extract_task_ids(raw_in)
+            if ids:
+                tool["subagent_ids"] = ids
+                tool["subagent_id"] = ids[0]
+            meta_s = parse_subagent_meta(
+                raw_in.get("prompt") if isinstance(raw_in, dict) else None
+            )
+            if meta_s.get("subagent_id"):
+                tool["subagent_id"] = meta_s["subagent_id"]
+            if meta_s.get("subagent_type"):
+                tool["subagent_type"] = meta_s["subagent_type"]
+            if meta_s.get("subagent_description"):
+                tool["subagent_description"] = meta_s["subagent_description"]
         step["tools"].append(tool)
 
     def _on_tool_update(
@@ -785,6 +807,43 @@ class HierarchyBuilder:
             )
             if metrics.get("result_preview") and not tool.get("result_preview"):
                 tool["result_preview"] = metrics["result_preview"]
+        if str(tool.get("name") or "") in (
+            "spawn_subagent",
+            "get_command_or_subagent_output",
+            "kill_command_or_subagent",
+        ):
+            from token_telemetry.session.subagents import (
+                extract_ids_from_text,
+                extract_task_ids,
+                parse_subagent_meta,
+            )
+
+            raw_in_now = update.get("rawInput") or {}
+            if isinstance(raw_in_now, dict):
+                ids = extract_task_ids(raw_in_now)
+                if ids:
+                    tool["subagent_ids"] = ids
+                    tool.setdefault("subagent_id", ids[0])
+            blob = tool.get("result_preview") or metrics.get("result_preview") or ""
+            content = update.get("content")
+            if isinstance(content, str) and content.strip():
+                blob = content
+            meta_s = parse_subagent_meta(blob if isinstance(blob, str) else "")
+            if not meta_s.get("subagent_id"):
+                ids2 = extract_ids_from_text(blob)
+                if ids2:
+                    meta_s["subagent_id"] = ids2[0]
+                    prev_ids = list(tool.get("subagent_ids") or [])
+                    for uid in ids2:
+                        if uid not in prev_ids:
+                            prev_ids.append(uid)
+                    tool["subagent_ids"] = prev_ids
+            if meta_s.get("subagent_id"):
+                tool["subagent_id"] = meta_s["subagent_id"]
+            if meta_s.get("subagent_type"):
+                tool["subagent_type"] = meta_s["subagent_type"]
+            if meta_s.get("subagent_description"):
+                tool["subagent_description"] = meta_s["subagent_description"]
         if metrics.get("path") and not tool.get("path"):
             tool["path"] = metrics["path"]
         if metrics.get("offset") is not None:

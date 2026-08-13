@@ -46,6 +46,39 @@ function renderHookNode(h) {
   </div>`;
 }
 
+function renderSubagentCard(sa) {
+  if (!sa) return "";
+  const n = sa.n != null ? sa.n : "?";
+  const title = sa.title || sa.label || "Sub Agent";
+  const u = sa.usage || {};
+  const sid = sa.session_id || "";
+  const inTok = sa.tokens_in != null
+    ? sa.tokens_in
+    : Math.max(0, Number(u.inputTokens || 0) - Number(u.cachedReadTokens || 0));
+  const cacheTok = sa.tokens_cached != null ? sa.tokens_cached : (u.cachedReadTokens || 0);
+  const outTok = sa.tokens_out != null ? sa.tokens_out : (u.outputTokens || 0);
+  const cin = sa.cost_in_usd;
+  const ccache = sa.cost_cached_usd;
+  const cout = sa.cost_out_usd;
+  const usd = sa.official_usd != null
+    ? sa.official_usd
+    : (Number(cin || 0) + Number(ccache || 0) + Number(cout || 0));
+  const line = joinParts([
+    partIn(inTok, cin),
+    partCached(cacheTok, ccache),
+    partOut(outTok, cout),
+  ]);
+  const typeTip = sa.agent_name
+    ? `type ${sa.agent_name} (spawn role) · ${sid}`
+    : sid;
+  return `<div class="subagent-card" data-sub-tab="${esc(sid)}" title="${esc(typeTip)}">
+    <span class="tag subagent">Sub Agent ${esc(String(n))}</span>
+    <span class="sum-gray">${esc(title)}</span>
+    ${line}
+    ${usd != null && usd !== "" ? totalPrice(usd) : ""}
+  </div>`;
+}
+
 function compBar(comp, se) {
   if (!comp && !se) return "";
   // Thought/Message/ToolReq = exact TokZ; Enc = residual of full off_out
@@ -764,16 +797,17 @@ function renderRoundTree(rounds) {
           ctxGrowth = sane;
         }
       }
+      const subCards = (s.subagents_after || []).map(renderSubagentCard).join("");
       return `<details class="step" data-sid="${sid}"${sOpen}>
         <summary>
           <span class="tag">LLM call [${s.index}]</span>
           ${callLine || `<span class="muted">ctx ${fmtTokens(s.context_start)}${AR}${fmtTokens(s.context_end)}</span>`}
           ${apiCost != null ? " " + totalPrice(apiCost) : ""}
-          ${ctxGrowth != null ? `<span class="muted" title="Context window growth for this call: max(totalTokens Δ, Out + tool results). Not the API uncached bill."> · Δctx ${fmtDelta(ctxGrowth)}</span>` : ""}
+          ${ctxGrowth != null ? `<span class="muted" title="Context window growth for this call: official-share Input after peeling sub-agent bills. Stream totalTokens is a harness estimate."> · Δctx ${fmtDelta(ctxGrowth)}</span>` : ""}
         </summary>
         ${compBar(s.composition, se)}
         ${children || `<div class="node muted">—</div>`}
-      </details>`;
+      </details>${subCards}`;
     }).join("");
 
     // Newest-first: put compact_before / recaps_before *after* this card so

@@ -14,7 +14,8 @@ Live companion dashboard for **[Grok Build](https://x.ai)** sessions: exact toke
 - **Official $** from `costUsdTicks` (1 USD = 10¹⁰ ticks)
 - **Estimate $** from published xAI rates (≤200k / >200k); **model-aware cache** (4.5 vs 4.6)
 - **Round tree** — user / system / tools / thoughts with In · Cached · Out · $ (Standard / Expert density)
-- **Cost chart** — composition per round (drill into calls; harness In green)
+- **Cost chart** — composition per round (drill into calls; harness In green). Sub-agent $ stacks on the parent round (violet); drill has a dedicated bar per agent
+- **Sub-agents** — child sessions are peeled out of the parent LLM-call math, then shown as tabs + Sub Agent N rows (In / Cached / Out / $)
 - **Context over time** chart (200k rate-cliff line)
 - Header **KV** chip (warm / stale idle / miss) + context pressure bar
 - Latency & tools from `signals.json`
