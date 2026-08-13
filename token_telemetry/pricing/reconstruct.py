@@ -6,8 +6,6 @@ from typing import Any, Optional
 
 from token_telemetry.tokenizer import (
     count_chars_as_tokens,
-    count_tokens,
-    scale_weights_to_target,
     tokenizer_mode,
 )
 

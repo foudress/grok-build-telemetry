@@ -63,10 +63,10 @@ def _on_recap(hb: Any, update: dict[str, Any], agent_ms: Any) -> None:
         out_usd = float(e["cost_usd"]["output"])
         total_usd = float(e["cost_usd"]["total"])
     except Exception:
-        # ≤200k floor rates
-        rate_c, rate_u, rate_o = 0.3, 2.0, 6.0
-        if ctx_i > 200_000:
-            rate_c, rate_u, rate_o = 0.6, 4.0, 12.0
+        from token_telemetry.pricing import pick_tier
+
+        t = pick_tier(ctx_i)
+        rate_c, rate_u, rate_o = t["cached_input"], t["input"], t["output"]
         pre_usd = ctx_i * rate_c / 1e6
         prompt_usd = max(0, prompt_tok) * rate_u / 1e6
         out_usd = out_tok * rate_o / 1e6
@@ -212,8 +212,9 @@ def _on_compact(hb: Any, update: dict[str, Any], agent_ms: Any) -> None:
             pre_read_cache_usd = float(e["cost_usd"]["cached_input"])
             pre_read_usd = pre_read_cache_usd
         except Exception:
-            # >200k tier cache $0.60/M as rough floor
-            rate = 0.6 if before_i > 200_000 else 0.3
+            from token_telemetry.pricing import pick_tier
+
+            rate = pick_tier(before_i)["cached_input"]
             pre_read_cache_usd = before_i * rate / 1_000_000.0
             pre_read_usd = pre_read_cache_usd
 

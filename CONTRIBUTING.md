@@ -47,6 +47,13 @@ python scripts/live_dashboard.py
 
 Import the package (`from token_telemetry.hierarchy import HierarchyBuilder`, etc.). Shims under `scripts/` exist so older `import hierarchy` / `python scripts/live_dashboard.py` paths keep working.
 
+## Pricing
+
+- List rates live in `token_telemetry/pricing/rates.py` (`RATES_BY_FAMILY`).
+- Detect the session model; **do not** hardcode 4.5 cache when pricing 4.6.
+- Reconstruct math stays model-agnostic — use `pricing_model_scope` / `rates_for`, do not thread `model` through `reconstruct.py` (R1 freeze).
+- Public rate tests: `pytest test/test_model_rates.py`.
+
 ## Style
 
 - Python 3.10+, type hints on new public functions.

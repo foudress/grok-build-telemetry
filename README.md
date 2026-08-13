@@ -12,10 +12,11 @@ Live companion dashboard for **[Grok Build](https://x.ai)** sessions: exact toke
 
 - **Context size** live (`_meta.totalTokens` + `signals.json`)
 - **Official $** from `costUsdTicks` (1 USD = 10¹⁰ ticks)
-- **Estimate $** from published xAI rates (≤200k / >200k tiers)
-- **Round tree** — user / system / tools / thoughts with In · Cached · Out · $
-- **Cost chart** — composition per round (drill into calls)
-- **Context over time** chart
+- **Estimate $** from published xAI rates (≤200k / >200k); **model-aware cache** (4.5 vs 4.6)
+- **Round tree** — user / system / tools / thoughts with In · Cached · Out · $ (Standard / Expert density)
+- **Cost chart** — composition per round (drill into calls; harness In green)
+- **Context over time** chart (200k rate-cliff line)
+- Header **KV** chip (warm / stale idle / miss) + context pressure bar
 - Latency & tools from `signals.json`
 
 ## Requirements
@@ -61,12 +62,14 @@ Opens **http://127.0.0.1:8765/** — leave it beside Grok Build.
 
 ## Pricing estimates
 
-List rates (docs.x.ai style; override later via config is planned):
+List rates (docs.x.ai). Session model is read from `signals.modelsUsed` / `_meta.modelId` / `usage.modelUsage` / `chat_history.model_id`. **Cached input is the only 4.5↔4.6 delta.**
 
-| Context | Input /1M | Output /1M | Cached input /1M |
-|---------|-----------|------------|------------------|
-| ≤ 200k  | $2        | $6         | $0.30            |
-| > 200k  | $4        | $12        | $0.60            |
+| Model | Context | Input /1M | Output /1M | Cached input /1M |
+|-------|---------|-----------|------------|------------------|
+| grok-4.5 | ≤ 200k | $2 | $6 | $0.30 |
+| grok-4.5 | > 200k | $4 | $12 | $0.60 |
+| grok-4.6 | ≤ 200k | $2 | $6 | $0.50 |
+| grok-4.6 | > 200k | $4 | $12 | $1.00 |
 
 - `uncached = inputTokens − cachedReadTokens` (cache ⊆ input)
 - `$ ≈ uncached×input + cache×cache_rate + output×out`

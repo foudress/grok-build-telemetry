@@ -38,7 +38,7 @@ header {
   position: sticky;
   top: 0;
   z-index: 100;
-  /* Content scrolls under the frosted bar */
+  padding-bottom: calc(var(--space-3) + 3px);
 }
 
 header h1 {
@@ -144,6 +144,64 @@ header h1 {
   border: 1px solid var(--amber-border);
 }
 
+/* ── Context pressure strip (header bottom edge) ────────────── */
+.ctx-pressure {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3px;
+  background: var(--bg-sunken);
+  overflow: visible;
+}
+
+.ctx-pressure[hidden] { display: none; }
+
+.ctx-pressure > #ctxPressureFill {
+  display: block;
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--accent), var(--cyan));
+  transition: width var(--duration-slow) var(--ease-out);
+}
+
+.ctx-pressure.is-tier > #ctxPressureFill {
+  background: linear-gradient(90deg, var(--accent), var(--amber));
+}
+
+.ctx-pressure.is-hot > #ctxPressureFill {
+  background: linear-gradient(90deg, var(--amber), var(--rose));
+}
+
+.ctx-pressure .tier-notch {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--amber);
+  opacity: 0.85;
+  pointer-events: none;
+}
+
+/* ── Status banner ──────────────────────────────────────────── */
+.status-banner {
+  margin: 0;
+  padding: 8px var(--space-4);
+  font-size: var(--font-size-sm);
+  color: var(--amber);
+  background: var(--amber-soft);
+  border-bottom: 1px solid var(--amber-border);
+}
+
+.status-banner[hidden] { display: none; }
+
+.status-banner.is-error {
+  color: var(--rose);
+  background: var(--rose-soft);
+  border-bottom-color: var(--rose-border);
+}
+
 /* ── Main grid ──────────────────────────────────────────────── */
 main {
   display: grid;
@@ -164,15 +222,6 @@ main {
     gap: var(--space-4);
     padding: var(--space-4) var(--space-5) var(--space-8);
   }
-}
-
-/* ── Footer (if present) ────────────────────────────────────── */
-footer {
-  padding: var(--space-2) var(--space-4) var(--space-4);
-  color: var(--muted-2);
-  font-size: var(--font-size-xs);
-  max-width: 1600px;
-  margin: 0 auto;
 }
 
 /* ── Global focus-visible for interactive elements ──────────── */

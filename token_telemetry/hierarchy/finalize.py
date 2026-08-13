@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Optional
 
-from token_telemetry.pricing import reconstruct_model_step_usage
+from token_telemetry.pricing import pricing_model_scope, reconstruct_model_step_usage
 from token_telemetry.tokenizer import (
     count_chars_as_tokens,
     count_tokens,
@@ -223,11 +223,13 @@ def _finalize_round(hb: Any, r: dict[str, Any]) -> None:
     if isinstance(r.get("user_prompt"), dict):
         r["user_prompt"]["hooks"] = up_hooks
 
-    hb._attach_step_estimates(r)
-    hb._price_bootstrap_prompts(r)
-    hb._apply_session_restart_cache_miss(r)
-    hb._attach_prev_llm_answer(r)
-    hb._merge_bootstrap_into_breakdown(r)
+    fam = r.get("model_family") or getattr(hb, "_pricing_model", None)
+    with pricing_model_scope(fam):
+        hb._attach_step_estimates(r)
+        hb._price_bootstrap_prompts(r)
+        hb._apply_session_restart_cache_miss(r)
+        hb._attach_prev_llm_answer(r)
+        hb._merge_bootstrap_into_breakdown(r)
 
 def _inject_system_message_residual(
     hb: Any, r: dict[str, Any], recon: dict[str, Any]
@@ -1434,41 +1436,43 @@ def _attach_step_estimates(hb: Any, r: dict[str, Any]) -> None:
         if isinstance(cs0, int) and cs0 > prior:
             user_unc = max(0, int(cs0) - int(prior))
 
-    recon = reconstruct_model_step_usage(
-        steps,
-        official_usage=usage,
-        prior_context_tokens=prior if isinstance(prior, int) else None,
-        context_reread=bool(reread),
-        reread_uncached_tokens=int(reread["reread_tokens"]) if reread else 0,
-        user_uncached_tokens=int(user_unc),
-    )
-    r["model_steps"] = recon["steps"]
-    r["step_usage"] = {
-        "method": recon["method"],
-        "calibrated": recon["calibrated"],
-        "totals": recon["totals"],
-        "breakdown": recon.get("breakdown") or {},
-        "note": recon.get("note"),
-        "prior_context_tokens": prior,
-        "bootstrap_residual_tokens": recon.get("bootstrap_residual_tokens") or 0,
-    }
-    # Surface cost parts on the round for compact UI headers
-    totals = recon.get("totals") or {}
-    bd = recon.get("breakdown") or {}
-    r["cost_in_usd"] = totals.get("cost_in_usd")  # paid@start (API)
-    r["cost_tree_in_usd"] = totals.get("cost_tree_in_usd") or bd.get("tree_in_usd")
-    r["tree_in_tokens"] = totals.get("tree_in") or bd.get("tree_in_tokens")
-    r["cost_cached_usd"] = totals.get("cost_cached_usd")
-    r["cost_out_usd"] = totals.get("cost_out_usd")
-    r["estimate_usd"] = totals.get("cost_usd")
-    r["breakdown"] = bd
-    r["bootstrap_residual_tokens"] = int(recon.get("bootstrap_residual_tokens") or 0)
+    fam = r.get("model_family") or getattr(hb, "_pricing_model", None)
+    with pricing_model_scope(fam):
+        recon = reconstruct_model_step_usage(
+            steps,
+            official_usage=usage,
+            prior_context_tokens=prior if isinstance(prior, int) else None,
+            context_reread=bool(reread),
+            reread_uncached_tokens=int(reread["reread_tokens"]) if reread else 0,
+            user_uncached_tokens=int(user_unc),
+        )
+        r["model_steps"] = recon["steps"]
+        r["step_usage"] = {
+            "method": recon["method"],
+            "calibrated": recon["calibrated"],
+            "totals": recon["totals"],
+            "breakdown": recon.get("breakdown") or {},
+            "note": recon.get("note"),
+            "prior_context_tokens": prior,
+            "bootstrap_residual_tokens": recon.get("bootstrap_residual_tokens") or 0,
+        }
+        # Surface cost parts on the round for compact UI headers
+        totals = recon.get("totals") or {}
+        bd = recon.get("breakdown") or {}
+        r["cost_in_usd"] = totals.get("cost_in_usd")  # paid@start (API)
+        r["cost_tree_in_usd"] = totals.get("cost_tree_in_usd") or bd.get("tree_in_usd")
+        r["tree_in_tokens"] = totals.get("tree_in") or bd.get("tree_in_tokens")
+        r["cost_cached_usd"] = totals.get("cost_cached_usd")
+        r["cost_out_usd"] = totals.get("cost_out_usd")
+        r["estimate_usd"] = totals.get("cost_usd")
+        r["breakdown"] = bd
+        r["bootstrap_residual_tokens"] = int(recon.get("bootstrap_residual_tokens") or 0)
 
-    # Inject System "Message" residual (stream under-count vs official input)
-    hb._inject_system_message_residual(r, recon)
+        # Inject System "Message" residual (stream under-count vs official input)
+        hb._inject_system_message_residual(r, recon)
 
-    # Compact cost = re-read(kept ctx) + deferred reload (tools/system)
-    hb._fill_compact_cost(r)
+        # Compact cost = re-read(kept ctx) + deferred reload (tools/system)
+        hb._fill_compact_cost(r)
 
 def _enc_stamp_signature(hb: Any) -> tuple:
     """Fingerprint of encrypted_content stamps across completed rounds."""

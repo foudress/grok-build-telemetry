@@ -10,12 +10,11 @@ from pathlib import Path
 from typing import Any, Optional
 
 from token_telemetry.pricing import (
-    CONTEXT_TIER_THRESHOLD,
-    TIER_HIGH,
-    TIER_LOW,
     estimate_cost_usd,
     estimate_from_usage,
     pick_tier,
+    pricing_model_scope,
+    pricing_payload,
     ticks_to_usd,
 )
 from token_telemetry.hierarchy import HierarchyBuilder
@@ -121,7 +120,6 @@ class SessionMonitor:
         self._updates_offset = 0
         self._events_path: Optional[Path] = None
         self._events_offset = 0
-        self._inode_key: Optional[tuple] = None
 
         self.context_series: deque[dict[str, Any]] = deque(maxlen=MAX_CONTEXT_POINTS)
         self.feed: deque[dict[str, Any]] = deque(maxlen=60)
@@ -139,6 +137,7 @@ class SessionMonitor:
             "prompt_id": None,
             "tier": None,
             "chars_per_sec": None,
+            "model": None,
         }
         # stream phase char rate
         self._stream_kind: Optional[str] = None
@@ -184,6 +183,7 @@ class SessionMonitor:
             "prompt_id": None,
             "tier": None,
             "chars_per_sec": None,
+            "model": None,
         }
         self._stream_kind = None
         self._stream_start_ms = None
@@ -192,10 +192,10 @@ class SessionMonitor:
         self._last_ctx_logged = None
         self.bootstrapped = False
         self.error = None
-        self._inode_key = None
         self._snap_rev = -1
         self._snap_bytes = None
         self._snap_sig_key = None
+        self.live["model"] = getattr(self.hierarchy, "_pricing_model", None)
 
     def select_session(self, session_id: Optional[str]) -> dict[str, Any]:
         """
@@ -214,13 +214,6 @@ class SessionMonitor:
                 return {"ok": False, "error": f"unknown session {session_id}"}
             self._attach_unlocked(d, pin=True)
             return {"ok": True, "session_id": d.name, "pinned": True}
-
-    def _file_key(self, path: Path) -> Optional[tuple]:
-        try:
-            st = path.stat()
-            return (st.st_mtime_ns, st.st_size)
-        except OSError:
-            return None
 
     def _read_new_lines(self, path: Optional[Path], offset: int) -> tuple[list[str], int]:
         """Read new complete lines; cap bytes per call to avoid multi-MB spikes."""
@@ -298,14 +291,19 @@ class SessionMonitor:
                 user_unc = int(up0.get("tokens_in") or up0.get("uncached_est") or 0)
             except (TypeError, ValueError):
                 user_unc = 0
-            recon = reconstruct_model_step_usage(
-                steps,
-                official_usage=usage if usage else None,
-                prior_context_tokens=prior if isinstance(prior, int) else None,
-                context_reread=reread_flag,
-                reread_uncached_tokens=reread_tok,
-                user_uncached_tokens=int(user_unc),
+            fam = (
+                round_.get("model_family")
+                or getattr(self.hierarchy, "_pricing_model", None)
             )
+            with pricing_model_scope(fam):
+                recon = reconstruct_model_step_usage(
+                    steps,
+                    official_usage=usage if usage else None,
+                    prior_context_tokens=prior if isinstance(prior, int) else None,
+                    context_reread=reread_flag,
+                    reread_uncached_tokens=reread_tok,
+                    user_uncached_tokens=int(user_unc),
+                )
             steps = recon["steps"]
             step_usage = {
                 "method": recon["method"],
@@ -316,8 +314,13 @@ class SessionMonitor:
                 "prior_context_tokens": recon.get("prior_context_tokens"),
             }
 
-        user_prompt = _enrich_user_prompt(round_.get("user_prompt"))
-        system_prompt = _enrich_system_prompt(round_.get("system_prompt"))
+        fam = (
+            round_.get("model_family")
+            or getattr(self.hierarchy, "_pricing_model", None)
+        )
+        with pricing_model_scope(fam):
+            user_prompt = _enrich_user_prompt(round_.get("user_prompt"))
+            system_prompt = _enrich_system_prompt(round_.get("system_prompt"))
         # Prefer hierarchy merge (includes session-restart user In / tree_in)
         breakdown = dict(
             round_.get("breakdown")
@@ -448,6 +451,9 @@ class SessionMonitor:
             "user_prompt": user_prompt,
             "system_prompt": system_prompt,
             "stop_reason": round_.get("stop_reason"),
+            "model_id": round_.get("model_id"),
+            "model_family": round_.get("model_family")
+            or getattr(self.hierarchy, "_pricing_model", None),
         }
 
         if not usage:
@@ -466,7 +472,12 @@ class SessionMonitor:
                 "tier": None,
             }
 
-        est = estimate_from_usage(usage, peak_context_tokens=peak)
+        est = estimate_from_usage(
+            usage,
+            peak_context_tokens=peak,
+            model=round_.get("model_family")
+            or getattr(self.hierarchy, "_pricing_model", None),
+        )
         ticks = usage.get("costUsdTicks")
         official = ticks_to_usd(ticks) if ticks is not None else None
         api_ms = usage.get("apiDurationMs") or 0
@@ -541,6 +552,7 @@ class SessionMonitor:
 
         # hierarchical reconstruction (round → model step → tools)
         self.hierarchy.feed_raw(raw)
+        self.live["model"] = getattr(self.hierarchy, "_pricing_model", None)
 
         agent_ms = meta.get("agentTimestampMs")
         t_label = ""
@@ -628,7 +640,12 @@ class SessionMonitor:
             last_round = self.hierarchy.rounds[-1] if self.hierarchy.rounds else None
             if last_round:
                 peak = last_round.get("context_peak") or peak
-            est = estimate_from_usage(usage, peak_context_tokens=peak)
+            est = estimate_from_usage(
+                usage,
+                peak_context_tokens=peak,
+                model=(last_round or {}).get("model_family")
+                or getattr(self.hierarchy, "_pricing_model", None),
+            )
             # Prefer sum of reconstructed model-step list prices
             step_est = None
             if last_round and (last_round.get("step_usage") or {}).get("totals"):
@@ -725,9 +742,12 @@ class SessionMonitor:
         elif et == "first_token":
             self._push_feed("first_token", "model first token", (raw.get("ts") or "")[-12:-1])
         elif et == "turn_started":
+            mid = raw.get("model_id")
+            if mid:
+                self.hierarchy._note_model({"model_id": mid})
             self._push_feed(
                 "turn_started",
-                f"turn {raw.get('turn_number')} model={raw.get('model_id')}",
+                f"turn {raw.get('turn_number')} model={mid}",
                 (raw.get("ts") or "")[-12:-1],
             )
         elif et == "turn_ended":
@@ -760,6 +780,8 @@ class SessionMonitor:
             self.live["tier"] = pick_tier(int(self.live["context_tokens_stream"]))["name"]
         if self.live.get("phase") is None and self.phase:
             self.live["phase"] = self.phase
+        self.hierarchy._note_model(self.signals)
+        self.live["model"] = getattr(self.hierarchy, "_pricing_model", None)
 
     def tick(self) -> None:
         """One poll cycle — must be called with self.lock held (or from unlocked context carefully)."""
@@ -840,6 +862,8 @@ class SessionMonitor:
                 self.signals.get("contextTokensUsed"),
                 self.signals.get("turnCount"),
                 self.signals.get("toolCallCount"),
+                self.signals.get("primaryModelId"),
+                getattr(self.hierarchy, "_pricing_model", None),
                 self.session_id,
                 self.pinned_session_id,
                 tuple(s["session_id"] for s in sessions[:20]),
@@ -923,17 +947,11 @@ class SessionMonitor:
                     "official_ticks": ticks_sum,
                     "turns": len(self.turns),
                 },
-                "pricing": {
-                    "threshold": CONTEXT_TIER_THRESHOLD,
-                    "low": TIER_LOW,
-                    "high": TIER_HIGH,
-                    "notes": [
-                        "uncached = input − cache (cache ⊆ input)",
-                        "Session estimate = sum of full per-turn API bills "
-                        "(R1 api_total includes System; white R1 total stays peeled)",
-                        "Compact $ = pre-read full ctx + reload tools/system",
-                    ],
-                },
+                "pricing": pricing_payload(
+                    model=getattr(self.hierarchy, "_pricing_model", None),
+                    models_raw=list(getattr(self.hierarchy, "_models_raw", None) or []),
+                    assumed=getattr(self.hierarchy, "_pricing_model", None) is None,
+                ),
                 "context_now_estimate_note": (
                     "Context card uses signals.contextTokensUsed (TUI-aligned). "
                     f"Current context {ctx} → tier {pick_tier(ctx or 0)['name']}."
@@ -948,9 +966,6 @@ class SessionMonitor:
             self._snap_rev = rev
             self._snap_sig_key = sig_key
             return body
-
-    def snapshot(self) -> dict[str, Any]:
-        return json.loads(self.snapshot_bytes())
 
 
 MONITOR = SessionMonitor()
@@ -973,6 +988,7 @@ def _slim_signals(sig: dict[str, Any]) -> dict[str, Any]:
         "turnCount",
         "sessionDurationSeconds",
         "modelsUsed",
+        "primaryModelId",
         "toolsUsed",
     )
     out = {k: sig[k] for k in keys if k in sig}

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from contextlib import contextmanager
+from contextvars import ContextVar, Token
+from pathlib import Path
+from typing import Any, Iterator, Optional
 
 from token_telemetry.tokenizer import BYTES_PER_TOKEN
 
@@ -12,19 +15,264 @@ CONTEXT_TIER_THRESHOLD = 200_000
 # Align with xai-token-estimation BYTES_PER_TOKEN (open-round proxy)
 CHARS_PER_TOKEN = float(BYTES_PER_TOKEN)
 
-# USD per 1_000_000 tokens (grok-4.5 list rates)
-TIER_LOW = {
-    "name": "≤200k",
-    "input": 2.0,
-    "output": 6.0,
-    "cached_input": 0.3,
+# USD per 1_000_000 tokens (docs.x.ai). In/out match; cache differs by family.
+DEFAULT_MODEL_FAMILY = "grok-4.5"
+
+RATES_BY_FAMILY: dict[str, dict[str, Any]] = {
+    "grok-4.5": {
+        "family": "grok-4.5",
+        "label": "Grok 4.5",
+        "low": {
+            "name": "≤200k",
+            "input": 2.0,
+            "output": 6.0,
+            "cached_input": 0.3,
+        },
+        "high": {
+            "name": ">200k",
+            "input": 4.0,
+            "output": 12.0,
+            "cached_input": 0.6,
+        },
+    },
+    "grok-4.6": {
+        "family": "grok-4.6",
+        "label": "Grok 4.6",
+        "low": {
+            "name": "≤200k",
+            "input": 2.0,
+            "output": 6.0,
+            "cached_input": 0.5,
+        },
+        "high": {
+            "name": ">200k",
+            "input": 4.0,
+            "output": 12.0,
+            "cached_input": 1.0,
+        },
+    },
 }
-TIER_HIGH = {
-    "name": ">200k",
-    "input": 4.0,
-    "output": 12.0,
-    "cached_input": 0.6,
-}
+
+# Back-compat aliases = grok-4.5 list (historical default)
+TIER_LOW = dict(RATES_BY_FAMILY[DEFAULT_MODEL_FAMILY]["low"])
+TIER_HIGH = dict(RATES_BY_FAMILY[DEFAULT_MODEL_FAMILY]["high"])
+
+_pricing_model: ContextVar[Optional[str]] = ContextVar(
+    "tt_pricing_model", default=None
+)
+
+
+def normalize_model_id(raw: Any) -> Optional[str]:
+    """Map API / TUI ids (``grok-4.6-build``) to a priced family, or None."""
+    if raw is None:
+        return None
+    s = str(raw).strip().lower().replace("_", "-").replace(" ", "-")
+    if not s:
+        return None
+    if "4.6" in s or "4-6" in s:
+        return "grok-4.6"
+    if "4.5" in s or "4-5" in s:
+        return "grok-4.5"
+    return None
+
+
+def collect_model_hints(obj: Any, *, depth: int = 0) -> list[str]:
+    """Pull model ids from known session / update nests (bounded)."""
+    if obj is None or depth > 6:
+        return []
+    found: list[str] = []
+    if isinstance(obj, dict):
+        for k in ("modelId", "model_id", "current_model_id", "primaryModelId"):
+            v = obj.get(k)
+            if isinstance(v, str) and v.strip():
+                found.append(v.strip())
+        mu = obj.get("modelUsage")
+        if isinstance(mu, dict):
+            found.extend(str(k) for k in mu if k)
+        used = obj.get("modelsUsed")
+        if isinstance(used, list):
+            found.extend(str(x) for x in used if x)
+        for nk in ("params", "update", "_meta", "usage"):
+            if nk in obj:
+                found.extend(collect_model_hints(obj[nk], depth=depth + 1))
+    elif isinstance(obj, list) and depth < 3:
+        for it in obj[:40]:
+            found.extend(collect_model_hints(it, depth=depth + 1))
+    return found
+
+
+def model_family(raw: Any = None) -> str:
+    """Priced family for *raw*, else the active context, else grok-4.5."""
+    n = normalize_model_id(raw) if raw is not None else None
+    if n is None:
+        n = _pricing_model.get()
+    if n in RATES_BY_FAMILY:
+        return n
+    return DEFAULT_MODEL_FAMILY
+
+
+def rates_for(model: Any = None) -> dict[str, Any]:
+    fam = model_family(model)
+    pack = RATES_BY_FAMILY[fam]
+    return {
+        "family": pack["family"],
+        "label": pack["label"],
+        "low": dict(pack["low"]),
+        "high": dict(pack["high"]),
+        "threshold": CONTEXT_TIER_THRESHOLD,
+    }
+
+
+def set_pricing_model(model: Any) -> Token:
+    fam = normalize_model_id(model)
+    if fam is None and model is not None:
+        fam = str(model).strip() or None
+        if fam not in RATES_BY_FAMILY:
+            fam = None
+    return _pricing_model.set(fam)
+
+
+def reset_pricing_model(token: Token) -> None:
+    _pricing_model.reset(token)
+
+
+@contextmanager
+def pricing_model_scope(model: Any) -> Iterator[str]:
+    token = set_pricing_model(model)
+    try:
+        yield model_family(model)
+    finally:
+        reset_pricing_model(token)
+
+
+def pricing_payload(
+    *,
+    model: Any = None,
+    models_raw: Optional[list[str]] = None,
+    assumed: bool = False,
+) -> dict[str, Any]:
+    pack = rates_for(model)
+    raw = [str(x) for x in (models_raw or []) if x]
+    families = []
+    for x in raw:
+        n = normalize_model_id(x)
+        if n and n not in families:
+            families.append(n)
+    fam = pack["family"]
+    mixed = len(families) > 1
+    known = (bool(raw) and fam in families) or (
+        normalize_model_id(model) in RATES_BY_FAMILY
+    )
+    notes = [
+        "uncached = input − cache (cache ⊆ input)",
+        "Session estimate = sum of full per-turn API bills "
+        "(R1 api_total includes System; white R1 total stays peeled)",
+        "Compact $ = pre-read full ctx + reload tools/system",
+        f"Rates: {pack['label']} (docs.x.ai); cache is the only 4.5↔4.6 delta",
+    ]
+    if mixed:
+        notes.append(
+            "Mixed models in this session — each round uses its own family when known"
+        )
+    if assumed or not known:
+        notes.append(
+            f"Model not detected — assuming {DEFAULT_MODEL_FAMILY} rates "
+            "(cached $0.30 / $0.60). Check signals.modelsUsed / _meta.modelId"
+        )
+    return {
+        "threshold": CONTEXT_TIER_THRESHOLD,
+        "model": fam,
+        "model_label": pack["label"],
+        "model_ids": raw,
+        "families": families or [fam],
+        "mixed": mixed,
+        "assumed": bool(assumed or not known),
+        "low": pack["low"],
+        "high": pack["high"],
+        "notes": notes,
+    }
+
+
+def _tail_lines(path: Path, *, max_lines: int, max_bytes: int = 256_000) -> list[str]:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return []
+    take = min(size, max_bytes)
+    try:
+        with path.open("rb") as f:
+            if size > take:
+                f.seek(size - take)
+            raw = f.read(take)
+    except OSError:
+        return []
+    text = raw.decode("utf-8", errors="replace")
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    return lines[-max_lines:]
+
+
+def detect_session_model(session_dir: Optional[Path]) -> dict[str, Any]:
+    """Scan session files for model ids (signals / summary / history / updates)."""
+    ids: list[str] = []
+    if session_dir is None:
+        return {"ids": [], "family": None, "assumed": True}
+    root = Path(session_dir)
+    for name in ("signals.json", "summary.json"):
+        p = root / name
+        if not p.is_file():
+            continue
+        try:
+            import json
+
+            ids.extend(collect_model_hints(json.loads(p.read_text(encoding="utf-8"))))
+        except (OSError, ValueError, TypeError):
+            pass
+    hist = root / "chat_history.jsonl"
+    if hist.is_file():
+        try:
+            import json
+
+            for ln in _tail_lines(hist, max_lines=40):
+                try:
+                    ids.extend(collect_model_hints(json.loads(ln)))
+                except (ValueError, TypeError):
+                    continue
+        except OSError:
+            pass
+    updates = root / "updates.jsonl"
+    if updates.is_file():
+        try:
+            import json
+
+            # First user_message usually carries _meta.modelId
+            with updates.open("r", encoding="utf-8", errors="replace") as f:
+                for i, ln in enumerate(f):
+                    if i >= 40:
+                        break
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        ids.extend(collect_model_hints(json.loads(ln)))
+                    except (ValueError, TypeError):
+                        continue
+            for ln in _tail_lines(updates, max_lines=20):
+                try:
+                    ids.extend(collect_model_hints(json.loads(ln)))
+                except (ValueError, TypeError):
+                    continue
+        except OSError:
+            pass
+    seen: list[str] = []
+    for x in ids:
+        if x and x not in seen:
+            seen.append(x)
+    family = None
+    for x in seen:
+        family = normalize_model_id(x)
+        if family:
+            break
+    return {"ids": seen, "family": family, "assumed": family is None}
 
 
 def ticks_to_usd(ticks: Optional[int | float]) -> Optional[float]:
@@ -43,10 +291,11 @@ def usd_to_ticks(usd: float) -> int:
     return int(round(usd * COST_USD_TICKS_PER_USD))
 
 
-def pick_tier(context_tokens: int) -> dict[str, Any]:
+def pick_tier(context_tokens: int, model: Any = None) -> dict[str, Any]:
+    pack = rates_for(model)
     if context_tokens > CONTEXT_TIER_THRESHOLD:
-        return dict(TIER_HIGH)
-    return dict(TIER_LOW)
+        return dict(pack["high"])
+    return dict(pack["low"])
 
 
 def step_tier_ctx(step: Optional[dict[str, Any]], *, fallback: int = 1) -> int:
@@ -124,6 +373,7 @@ def estimate_cost_usd(
     context_tokens: Optional[int] = None,
     peak_context_tokens: Optional[int] = None,
     model_calls: Optional[int] = None,
+    model: Any = None,
 ) -> dict[str, Any]:
     """Estimate USD from token counts using published rates."""
     in_t = max(0, int(input_tokens or 0))
@@ -144,7 +394,7 @@ def estimate_cost_usd(
         cached_read_tokens=cache_t,
     )
     context_tokens = int(tier_info["context_tokens_for_tier"])
-    tier = pick_tier(context_tokens)
+    tier = pick_tier(context_tokens, model=model)
 
     # Generation: bill output only (reasoning ⊆ / reported inside output shape)
     gen_billed = out_t
@@ -155,6 +405,7 @@ def estimate_cost_usd(
 
     return {
         "tier": tier["name"],
+        "model": model_family(model),
         "context_tokens_for_tier": context_tokens,
         "tier_resolution": tier_info,
         "rates": {
@@ -192,6 +443,7 @@ def estimate_from_usage(
     usage: dict[str, Any],
     *,
     peak_context_tokens: Optional[int] = None,
+    model: Any = None,
 ) -> dict[str, Any]:
     """usage dict with camelCase (from turn_completed) or snake_case."""
 
@@ -216,6 +468,9 @@ def estimate_from_usage(
         if peak_context_tokens is not None
         else g_opt("peakContextTokens", "peak_context_tokens"),
         model_calls=g_opt("modelCalls", "model_calls"),
+        model=model
+        if model is not None
+        else next(iter(usage.get("modelUsage") or usage.get("model_usage") or {}), None),
     )
 
 
@@ -251,22 +506,22 @@ def _scale_ints(raw: list[float], target: int) -> list[int]:
     return ints
 
 
-def _price_in(tokens: int, tier_ctx: int) -> float:
+def _price_in(tokens: int, tier_ctx: int, model: Any = None) -> float:
     if tokens <= 0:
         return 0.0
-    return tokens * pick_tier(tier_ctx)["input"] / 1_000_000
+    return tokens * pick_tier(tier_ctx, model=model)["input"] / 1_000_000
 
 
-def _price_cache(tokens: int, tier_ctx: int) -> float:
+def _price_cache(tokens: int, tier_ctx: int, model: Any = None) -> float:
     if tokens <= 0:
         return 0.0
-    return tokens * pick_tier(tier_ctx)["cached_input"] / 1_000_000
+    return tokens * pick_tier(tier_ctx, model=model)["cached_input"] / 1_000_000
 
 
-def _price_out(tokens: int, tier_ctx: int) -> float:
+def _price_out(tokens: int, tier_ctx: int, model: Any = None) -> float:
     if tokens <= 0:
         return 0.0
-    return tokens * pick_tier(tier_ctx)["output"] / 1_000_000
+    return tokens * pick_tier(tier_ctx, model=model)["output"] / 1_000_000
 
 
 def _money_parts(

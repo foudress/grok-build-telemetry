@@ -23,6 +23,7 @@ def compact_round_inplace(r: dict[str, Any]) -> None:
                 "costUsdTicks",
                 "apiDurationMs",
                 "modelCalls",
+                "modelUsage",
             )
             if usage.get(k) is not None
         }

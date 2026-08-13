@@ -27,7 +27,6 @@ from typing import Any, Optional
 
 # --- xai-token-estimation (fallback) ---
 BYTES_PER_TOKEN = 4
-IMAGE_TOKEN_ESTIMATE = 765
 
 HF_GROK2_ID = "alvarobartt/grok-2-tokenizer"
 
@@ -186,15 +185,6 @@ def estimate_tokens(s: str) -> int:
     if not isinstance(s, str):
         s = str(s)
     return len(s.encode("utf-8")) // BYTES_PER_TOKEN
-
-
-def estimate_chars(tokens: int) -> int:
-    """Inverse of estimate_tokens (tokens * 4). Rough only for grok2 mode."""
-    return max(0, int(tokens)) * BYTES_PER_TOKEN
-
-
-def estimate_image_tokens(image_count: int) -> int:
-    return max(0, int(image_count)) * IMAGE_TOKEN_ESTIMATE
 
 
 def count_tokens(text: Any) -> int:

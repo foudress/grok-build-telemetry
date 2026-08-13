@@ -1,8 +1,12 @@
 /* Charts: canvas, legend chips, cost toolbar, tooltips */
 
+.chart-wrap {
+  position: relative;
+}
+
 canvas {
   width: 100%;
-  height: 180px;
+  height: 240px;
   display: block;
   background: var(--bg-sunken);
   border-radius: var(--radius-md);
@@ -10,7 +14,7 @@ canvas {
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
 }
 
-.bars { height: 180px; }
+.bars { height: 240px; }
 
 /* ── Chart toolbar ──────────────────────────────────────────── */
 .chart-toolbar {

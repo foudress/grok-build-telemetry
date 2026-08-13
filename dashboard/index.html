@@ -21,33 +21,44 @@
       <span id="sessionPinHint" class="pin-hint" hidden>pinned</span>
     </div>
     <span id="sessionMeta" class="meta">—</span>
+    <span id="modelBadge" class="badge" hidden></span>
+    <span id="kvChip" class="badge kv" hidden></span>
     <span id="phaseMeta" class="meta"></span>
+    <div id="ctxPressure" class="ctx-pressure" hidden title="Context vs window · notch = 200k rate cliff">
+      <span id="ctxPressureFill"></span>
+      <span id="ctxPressureNotch" class="tier-notch"></span>
+    </div>
   </header>
+  <div id="statusBanner" class="status-banner" hidden></div>
 
   <main>
     <section class="cards">
       <div class="card accent">
         <div class="label">Context now (TUI)</div>
         <div class="value" id="ctxNow">—</div>
+        <div class="sub" id="ctxSub"></div>
         <div class="progress"><span id="ctxBar"></span></div>
       </div>
       <div class="card green">
         <div class="label">Session cost (official)</div>
         <div class="value" id="costOfficial">—</div>
+        <div class="sub" id="costOfficialSub"></div>
       </div>
       <div class="card amber">
         <div class="label">Session cost (estimate)</div>
         <div class="value" id="costEstimate">—</div>
+        <div class="sub" id="costEstimateSub"></div>
       </div>
       <div class="card rose">
         <div class="label">Last turn gen rate</div>
         <div class="value" id="genRate">—</div>
+        <div class="sub" id="genRateSub"></div>
       </div>
     </section>
 
     <section class="panel">
       <h2>Context tokens</h2>
-      <div style="position:relative">
+      <div class="chart-wrap">
         <canvas id="ctxChart" height="320"></canvas>
         <div id="ctxTip" class="chart-tip" role="tooltip"></div>
       </div>
@@ -66,25 +77,37 @@
         <button type="button" id="costDrillBack" hidden>← Back to rounds</button>
         <span id="costModeLabel" class="mode-pill"></span>
       </div>
-      <div style="position:relative">
+      <div class="chart-wrap">
         <canvas id="costChart" class="bars" height="320"></canvas>
         <div id="costTip" class="chart-tip" role="tooltip"></div>
       </div>
       <div id="costLegend" class="cost-legend" title="Click a category to hide/show it in the bars"></div>
     </section>
 
-    <section class="panel" style="grid-column:1/-1">
-      <h2>Round hierarchy</h2>
-      <div class="tree" id="roundTree"></div>
+    <section class="panel tree-panel">
+      <div class="panel-head">
+        <h2>Round hierarchy</h2>
+        <div class="tree-toolbar">
+          <span class="unit-toggle" role="group" aria-label="Tree density">
+            <button type="button" id="densStandard" class="unit-btn active" aria-pressed="true">Standard</button>
+            <button type="button" id="densExpert" class="unit-btn" aria-pressed="false">Expert</button>
+          </span>
+          <button type="button" id="treeCollapse" class="ghost-btn">Collapse</button>
+        </div>
+      </div>
+      <div class="tree density-standard" id="roundTree"></div>
     </section>
 
-    <section class="panel" style="grid-column:1/-1">
-      <h2>Session signals + pricing</h2>
+    <details class="panel meta-panel">
+      <summary>
+        <h2>Session signals + pricing</h2>
+        <span class="muted" id="metaSummary">rates · latency · formula</span>
+      </summary>
       <div class="split">
-        <div id="signalsBox" class="meta" style="line-height:1.7"></div>
-        <div id="pricingBox" class="meta" style="line-height:1.7"></div>
+        <div id="signalsBox" class="meta"></div>
+        <div id="pricingBox" class="meta"></div>
       </div>
-    </section>
+    </details>
   </main>
   <script type="module" src="js/main.js"></script>
 </body>

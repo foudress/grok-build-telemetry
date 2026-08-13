@@ -35,13 +35,9 @@ function renderHookNode(h) {
     : "";
   const gray = `${ev}${names ? " · " + names : ""}`;
   // Hooks never contribute to cost UI; keep a trailing muted cue only.
-  const trail = toUser
-    ? `<span class="muted">${slot === "user" || ev.toLowerCase().startsWith("user_prompt")
-      ? "· display"
-      : "→ user"}</span>`
-    : (h.tokens_est || h.tokens_in
-      ? `<span class="muted">· display</span>`
-      : `<span class="muted">· display</span>`);
+  const trail = toUser && slot !== "user" && !ev.toLowerCase().startsWith("user_prompt")
+    ? `<span class="muted">→ user</span>`
+    : `<span class="muted">· display</span>`;
   return `<div class="node hook-node" title="${esc(h.estimate_note || "hook_execution (not billed)")}">
     <span class="tag hook">hook</span>
     <span class="sum-gray" title="${esc(gray)}">${esc(gray)}</span>
@@ -356,9 +352,10 @@ function renderRoundTree(rounds) {
   const root = $("roundTree");
   if (!root) return;
   if (!rounds || !rounds.length) {
-    root.innerHTML = `<div class="muted" style="padding:8px">waiting for rounds… (restart dashboard if empty)</div>`;
+    root.innerHTML = `<div class="tree-empty">No rounds in this session yet. Follow an active session or pin one from the picker.</div>`;
     return;
   }
+  const prevScroll = root.scrollTop;
   // Preserve open/closed across live re-renders
   const openIds = new Set(
     [...root.querySelectorAll("details[data-rid][open]")].map(d => d.getAttribute("data-rid"))
@@ -810,15 +807,22 @@ function renderRoundTree(rounds) {
     const isNew = hadTree && !prevRids.has(rid);
     const enterCls = isNew ? " is-new" : "";
     const enterStyle = isNew ? ` style="--enter-i:${enterI++}"` : "";
-    const cardHtml = `<details class="round${enterCls}" data-rid="${rid}"${open}${enterStyle}>
+    const focusCls = (window.__focusedRound != null && String(window.__focusedRound) === rid)
+      ? " is-focus"
+      : "";
+    const cardHtml = `<details class="round${enterCls}${focusCls}" data-rid="${rid}"${open}${enterStyle}>
       <summary>
         <div class="round-head">
           <span class="title">Round ${r.index}</span>
-          ${livePill}
-          ${idleBit}
-          ${roundHeadParts}
-          ${rTotal != null ? totalPrice(rTotal) : ""}
-          <span class="muted">ctx ${fmtTokens(r.context_start)}${AR}${fmtTokens(r.context_end)}
+          <span class="round-meta">
+            ${livePill}
+            ${idleBit}
+          </span>
+          <span class="round-ledger">
+            ${roundHeadParts}
+            ${rTotal != null ? totalPrice(rTotal) : ""}
+          </span>
+          <span class="round-ctx muted">ctx ${fmtTokens(r.context_start)}${AR}${fmtTokens(r.context_end)}
             <span class="tok-cached">${fmtDelta(r.context_delta)}</span></span>
         </div>
       </summary>
@@ -912,7 +916,66 @@ function renderRoundTree(rounds) {
   }
 
   root.innerHTML = html;
+  root.scrollTop = prevScroll;
 }
 
+function _densityMode(mode) {
+  return mode === "expert" ? "expert" : "standard";
+}
 
-export { renderHookNode, compBar, renderChildNode, renderRoundTree };
+function setTreeDensity(mode) {
+  const m = _densityMode(mode);
+  window.__treeDensity = m;
+  try { localStorage.setItem("tt-tree-density", m); } catch { /* ignore */ }
+  const root = $("roundTree");
+  if (root) {
+    root.classList.remove("density-compact", "density-standard", "density-expert");
+    root.classList.add("density-" + m);
+  }
+  const map = { standard: "densStandard", expert: "densExpert" };
+  Object.entries(map).forEach(([key, id]) => {
+    const b = $(id);
+    if (!b) return;
+    const on = key === m;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-pressed", on ? "true" : "false");
+  });
+}
+
+function setRoundsOpen(open) {
+  const root = $("roundTree");
+  if (!root) return;
+  root.querySelectorAll("details.round").forEach((d) => { d.open = !!open; });
+}
+
+function revealRound(rid) {
+  if (rid == null || rid === "") return null;
+  const root = $("roundTree");
+  if (!root) return null;
+  const el = root.querySelector(`details.round[data-rid="${CSS.escape(String(rid))}"]`);
+  if (!el) return null;
+  el.open = true;
+  const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  el.scrollIntoView({ block: "nearest", behavior: reduce ? "auto" : "smooth" });
+  return el;
+}
+
+function focusRound(rid) {
+  if (rid == null || rid === "") return;
+  window.__focusedRound = String(rid);
+  const root = $("roundTree");
+  if (root) {
+    root.querySelectorAll("details.round.is-focus").forEach((el) => el.classList.remove("is-focus"));
+  }
+  const el = revealRound(rid);
+  if (el) el.classList.add("is-focus");
+}
+
+function clearRoundFocus() {
+  window.__focusedRound = null;
+  const root = $("roundTree");
+  if (!root) return;
+  root.querySelectorAll("details.round.is-focus").forEach((el) => el.classList.remove("is-focus"));
+}
+
+export { renderRoundTree, setTreeDensity, setRoundsOpen, focusRound, clearRoundFocus, revealRound };

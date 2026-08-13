@@ -11,6 +11,7 @@ import {
   joinParts,
   totalPrice,
 } from './fmt.js';
+import { focusRound, revealRound } from './tree.js';
 
 /* Canvas axis / empty-state palette — slightly higher contrast than raw muted */
 const CHART_AXIS = {
@@ -208,6 +209,25 @@ function drawLineChart(canvas, series, color, rounds) {
   }
   ctx.textAlign = "left";
 
+  const TIER_CLIFF = 200000;
+  if (TIER_CLIFF > min && TIER_CLIFF < max) {
+    const yCliff = yOf(TIER_CLIFF);
+    ctx.save();
+    ctx.strokeStyle = "rgba(240, 180, 41, 0.55)";
+    ctx.setLineDash([4, 4]);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(left, yCliff);
+    ctx.lineTo(w - right, yCliff);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#f0b429";
+    ctx.font = "9px system-ui, Segoe UI, sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText("200k", left + 4, yCliff - 4);
+    ctx.restore();
+  }
+
   // Line through call points only
   ctx.strokeStyle = color;
   ctx.lineWidth = 2;
@@ -331,7 +351,24 @@ function drawLineChart(canvas, series, color, rounds) {
       if (leftPx + tw > rect.width - 4) leftPx = mx - tw - 8;
       showChartTip(t, html, Math.max(4, leftPx), Math.max(4, my - 10));
     });
-    canvas.addEventListener("mouseleave", () => hideChartTip(tip()));
+    canvas.addEventListener("mouseleave", () => {
+      hideChartTip(tip());
+      canvas.style.cursor = "default";
+    });
+    canvas.addEventListener("click", (ev) => {
+      const list = canvas._ctxPts;
+      if (!list || !list.length) return;
+      const rect = canvas.getBoundingClientRect();
+      const mx = ev.clientX - rect.left;
+      const my = ev.clientY - rect.top;
+      let best = null, bestD = 14;
+      for (const p of list) {
+        if (p._x == null) continue;
+        const d = Math.hypot(mx - p._x, my - p._y);
+        if (d < bestD) { bestD = d; best = p; }
+      }
+      if (best && best.round != null) revealRound(best.round);
+    });
   }
 }
 
@@ -389,7 +426,7 @@ const COST_COLORS = {
   out: "#f07178",
   system: "#8ab4f8",
   user: "#5ccfe6",       /* same blue as message */
-  harness: "#e0a878",
+  harness: "#3ecf8e",     /* same green as In / tool results */
   residual: "#8fd3a8",
   thought: "#c4a5e8",
   reasoning: "#a78bfa",
@@ -1334,7 +1371,7 @@ function drawBars(canvas, turns, rounds) {
       lines.push(`<b>→ ${fmtCostAxis(p.total || 0, u)}</b>`);
       if (u === "usd" && p.official != null && !window.__costChart.hiddenLegend?.has("official"))
         lines.push(`<span class="muted">official ${fmtUsd(p.official)}</span>`);
-      if (p.kind === "turn") lines.push(`<span class="muted">click to drill LLM calls</span>`);
+      if (p.kind === "turn") lines.push(`<span class="muted">click: tree + drill calls</span>`);
       const html = lines.join("<br>");
       // Tooltip top-right of cursor (above + to the right) — keep existing placement
       const { tw, th } = measureChartTip(tipEl, html);
@@ -1358,6 +1395,7 @@ function drawBars(canvas, turns, rounds) {
       if (found.p.kind === "turn") {
         window.__costChart.drillTurn = found.p.index;
         drawBars(canvas, window.__costChart.turns, window.__costChart.rounds);
+        focusRound(found.p.index);
       }
     });
   }
@@ -1386,7 +1424,7 @@ function renderCostLegend(legendItems, hidden) {
     else if (String(key).startsWith("tool:") && !/in$/i.test(show))
       show = show; // green swatch = result
     const hid = hidden.has(key) || hidden.has(label);
-    return `<button type="button" class="leg-chip${hid ? " hid" : ""}" data-leg="${esc(key)}" title="${hid ? "Show" : "Hide"} ${esc(show)}">
+    return `<button type="button" class="leg-chip${hid ? " hid" : ""}" data-leg="${esc(key)}" aria-pressed="${hid ? "false" : "true"}" title="${hid ? "Show" : "Hide"} ${esc(show)}">
       <span class="leg-sw" style="background:${color}"></span>${esc(show)}
     </button>`;
   }).join("");
@@ -1410,6 +1448,7 @@ function renderCostLegend(legendItems, hidden) {
 
 function setCostUnit(unit) {
   window.__costChart.unit = unit === "tokens" ? "tokens" : "usd";
+  try { localStorage.setItem("tt-cost-unit", window.__costChart.unit); } catch { /* ignore */ }
   const usdBtn = $("costUnitUsd");
   const tokBtn = $("costUnitTok");
   const isUsd = window.__costChart.unit === "usd";

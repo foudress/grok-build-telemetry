@@ -31,6 +31,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 from token_telemetry.tokenizer import count_chars_as_tokens
+from token_telemetry.pricing import (
+    collect_model_hints,
+    detect_session_model,
+    normalize_model_id,
+    set_pricing_model,
+)
 
 from token_telemetry.hierarchy.cache_miss import (
     _apply_session_restart_cache_miss as _cm_apply_session_restart_cache_miss,
@@ -65,7 +71,6 @@ from token_telemetry.hierarchy.recap_compact import (
     _fill_compact_cost as _rc_fill_compact_cost,
     _on_compact as _rc_on_compact,
     _on_recap as _rc_on_recap,
-    _recap_prompt_info as _rc_recap_prompt_info,
 )
 from token_telemetry.hierarchy.text_metrics import (
     MAX_ROUNDS_RETAINED,
@@ -115,6 +120,10 @@ class HierarchyBuilder:
         self._enc_stamp_sig: Optional[tuple] = None
         self._tool_results_cache: Optional[dict[str, dict[str, Any]]] = None
         self._tool_results_mtime: Optional[float] = None
+        # Priced family (grok-4.5 / grok-4.6); None until a session id is seen
+        self._pricing_model: Optional[str] = None
+        self._models_raw: list[str] = []
+        self._priced_with: Optional[str] = None
 
     def _session_key(self) -> Optional[str]:
         """Stable id for the attached session dir (folder name)."""
@@ -137,6 +146,7 @@ class HierarchyBuilder:
         self._pending_hooks.clear()
         self._pending_recaps.clear()
         self._pending_compact = None
+        self._apply_detected_model(detect_session_model(self._session_dir))
 
     def reset(self) -> None:
         self.rounds.clear()
@@ -158,7 +168,47 @@ class HierarchyBuilder:
         self._reasonings_mtime = None
         self._reasonings_cursor = 0
         self._enc_stamp_sig = None
+        self._pricing_model = None
+        self._models_raw = []
+        self._priced_with = None
+        set_pricing_model(None)
         self.revision += 1
+
+    def _apply_detected_model(self, info: dict[str, Any]) -> None:
+        for mid in info.get("ids") or []:
+            if mid and mid not in self._models_raw:
+                self._models_raw.append(str(mid))
+        fam = info.get("family")
+        if fam and fam != self._pricing_model:
+            self._pricing_model = fam
+            set_pricing_model(fam)
+
+    def _note_model(self, raw: Any) -> None:
+        hints = collect_model_hints(raw)
+        if not hints:
+            return
+        prev = self._pricing_model
+        for mid in hints:
+            if mid and mid not in self._models_raw:
+                self._models_raw.append(str(mid))
+            fam = normalize_model_id(mid)
+            if fam and self._pricing_model is None:
+                self._pricing_model = fam
+                set_pricing_model(fam)
+            target = self._open
+            if isinstance(target, dict) and fam:
+                target["model_id"] = str(mid)
+                target["model_family"] = fam
+        # Late discovery (e.g. only modelUsage on turn_completed) after
+        # rounds were billed at the grok-4.5 default.
+        if (
+            self._pricing_model
+            and prev is None
+            and self._pricing_model != "grok-4.5"
+            and self.rounds
+        ):
+            self._reprice_completed_rounds()
+            self._priced_with = self._pricing_model
 
     def _bump(self) -> None:
         self.revision += 1
@@ -182,6 +232,7 @@ class HierarchyBuilder:
         kind = update.get("sessionUpdate")
         if not kind:
             return
+        self._note_model(raw)
         # Any applied update invalidates dashboard snapshot cache
         self._bump()
 
@@ -387,11 +438,6 @@ class HierarchyBuilder:
     def _on_recap(self, update: dict[str, Any], agent_ms: Any) -> None:
         return _rc_on_recap(self, update, agent_ms)
 
-    def _recap_prompt_info(
-        self, summary: str
-    ) -> tuple[int, str, Optional[str]]:
-        return _rc_recap_prompt_info(self, summary)
-
     def _on_compact(self, update: dict[str, Any], agent_ms: Any) -> None:
         return _rc_on_compact(self, update, agent_ms)
 
@@ -483,6 +529,8 @@ class HierarchyBuilder:
             "hooks": [],
             "user_hooks": [],
             "hooks_before_llm": [],
+            "model_id": self._models_raw[-1] if self._models_raw else None,
+            "model_family": self._pricing_model,
         }
         # Hooks buffered between turns (esp. user_prompt_submit before user_message)
         if self._pending_hooks:
@@ -865,15 +913,6 @@ class HierarchyBuilder:
 
     def _fill_compact_cost(self, r: dict[str, Any]) -> None:
         return _rc_fill_compact_cost(self, r)
-
-    def current_open(self) -> Optional[dict[str, Any]]:
-        if self._open is None:
-            return None
-        # Shallow structural copy only — finalize mutates a dedicated live snapshot
-        r = _shallow_round_copy(self._open)
-        self._finalize_round(r)
-        compact_round_inplace(r)
-        return r
 
     def _enc_stamp_signature(self) -> tuple:
         return _enc_stamp_signature(self)

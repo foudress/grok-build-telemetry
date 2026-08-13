@@ -43,18 +43,6 @@ function esc(s) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 }
-function kindClass(k) {
-  if (!k) return "";
-  if (k.includes("thought")) return "thought";
-  if (k.includes("hook")) return "hook";
-  if (k.includes("message") && k.includes("user")) return "user";
-  if (k.includes("message")) return "message";
-  if (k.includes("tool")) return "tool";
-  if (k.includes("turn")) return "turn";
-  if (k.includes("user")) return "user";
-  return "";
-}
-
 const AR = `<span class="arrow">→</span>`;
 
 /** Hide zero parts. Colors: in green · cached yellow · out red */
@@ -151,20 +139,6 @@ function shellInteresting(text) {
   if (mPy) s = "python " + compressCwdText(mPy[1]);
   if (s.length > 42) s = s.slice(0, 18) + "…" + s.slice(-18);
   return s;
-}
-
-function compressToolNames(list) {
-  const counts = new Map();
-  (list || []).forEach(t => {
-    const n = (t && t.name) || "tool";
-    counts.set(n, (counts.get(n) || 0) + 1);
-  });
-  return [...counts.entries()].map(([n, c]) => c > 1 ? `${n}×${c}` : n).join(", ");
-}
-
-function fmtChars(n) {
-  if (n == null || n === 0) return "";
-  return `${fmtTokens(n)} ch`;
 }
 
 /** Tokenizer token weight stamped on the node (prefer real count over chars//4). */
@@ -265,7 +239,6 @@ export {
   fmtIdleGap,
   fmtDelta,
   esc,
-  kindClass,
   AR,
   partIn,
   partCached,
@@ -276,8 +249,6 @@ export {
   shortPath,
   compressCwdText,
   shellInteresting,
-  compressToolNames,
-  fmtChars,
   pickTokenizerTokens,
   pickMetaChars,
   eolTokenizerMeta,

@@ -22,7 +22,7 @@ import argparse
 import json
 import sys
 from collections import defaultdict
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
@@ -94,9 +94,6 @@ STREAM_TYPES = frozenset(
         "user_message_chunk",
     }
 )
-
-TOOL_TYPES = frozenset({"tool_call", "tool_call_update"})
-
 
 def ms_to_iso(ms: Optional[int | float]) -> Optional[str]:
     if ms is None:
