@@ -38,7 +38,7 @@ python scripts/live_dashboard.py
 | Package entry / CLI | `token_telemetry/__main__.py`, `token_telemetry/live_dashboard.py` |
 | Hierarchy / bootstrap | `token_telemetry/hierarchy/` (`builder.py`, `bootstrap.py`, …) |
 | Pricing rates & reconstruct | `token_telemetry/pricing/` (`rates.py`, `reconstruct.py`) |
-| Session discovery & monitor | `token_telemetry/session/` (`discover.py`, `monitor.py`, `subagents.py`) |
+| Session discovery & monitor | `token_telemetry/session/` (`discover.py`, `monitor.py`, `subagents.py`, `aggregate.py`) |
 | HTTP API & static serving | `token_telemetry/server/http.py` |
 | Tokenizer weights | `token_telemetry/tokenizer.py` |
 | Dashboard UI | `dashboard/index.html`, `dashboard/css/*`, `dashboard/js/*` |
@@ -58,7 +58,8 @@ Import the package (`from token_telemetry.hierarchy import HierarchyBuilder`, et
 
 - Python 3.10+, type hints on new public functions.
 - No drive-by refactors in feature PRs; open a dedicated PR for structure moves.
-- Keep API routes stable: `/api/state`, `/api/sessions`, `/api/session`, `/api/health`.
+- Keep API routes stable: `/api/state`, `/api/sessions`, `/api/session`, `/api/health`, `/api/aggregate`.
+- Period aggregates: `pytest test/test_aggregate.py` (do not load hierarchy; skip `session_kind=subagent` in totals).
 
 ## License
 

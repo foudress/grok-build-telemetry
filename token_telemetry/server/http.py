@@ -7,8 +7,9 @@ import threading
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
+from token_telemetry.session.aggregate import build_aggregate
 from token_telemetry.session.discover import list_sessions_for_ui
 from token_telemetry.session.monitor import MONITOR
 
@@ -111,6 +112,21 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/health":
             self._send(200, b'{"ok":true}', "application/json")
+            return
+        if path == "/api/aggregate":
+            qs = parse_qs(urlparse(self.path).query)
+            period = (qs.get("period") or ["daily"])[0]
+            grain = (qs.get("grain") or ["day"])[0]
+            try:
+                offset = int((qs.get("offset") or ["0"])[0])
+            except ValueError:
+                offset = 0
+            try:
+                payload = build_aggregate(period, offset, grain)
+            except Exception as exc:  # noqa: BLE001
+                payload = {"error": f"{type(exc).__name__}: {exc}"}
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self._send(200, body, "application/json; charset=utf-8")
             return
         # Static assets: /css/*, /js/*, and other files under dashboard/
         if path.startswith("/css/") or path.startswith("/js/") or (

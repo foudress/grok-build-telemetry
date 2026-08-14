@@ -3,6 +3,15 @@ import { $, fmtTokens, fmtUsd, fmtMs, esc } from './fmt.js';
 import { renderRoundTree, setTreeDensity, setRoundsOpen, clearRoundFocus } from './tree.js';
 import { drawLineChart, drawBars, setCostUnit } from './charts.js';
 import { fillSessionSelect, switchSession, bindPoll } from './sessions.js';
+import {
+  bindPeriodPoll,
+  bindPeriodControls,
+  fetchPeriod,
+  isPeriodScope,
+  leavePeriodView,
+  redrawPeriod,
+  restoreScope,
+} from './period.js';
 
 const TIER_CLIFF = 200000;
 let _taskTab = "main";
@@ -145,6 +154,10 @@ function paintKvChip(rounds) {
 }
 
 function render(state) {
+  if (isPeriodScope()) return;
+  leavePeriodView();
+  const tree = $("roundTree");
+  if (tree) tree.classList.remove("sess-list");
   window.__lastState = state;
   if (!state || state.error) {
     $("liveBadge").textContent = "error";
@@ -324,6 +337,10 @@ async function poll() {
   if (_pollBusy) return;
   _pollBusy = true;
   try {
+    if (isPeriodScope()) {
+      await fetchPeriod();
+      return;
+    }
     const r = await fetch("/api/state?_=" + Date.now());
     if (!r.ok) throw new Error("HTTP " + r.status);
     const state = await r.json();
@@ -356,10 +373,13 @@ function restorePrefs() {
   } catch {
     setTreeDensity("standard");
   }
+  restoreScope();
 }
 
 bindPoll(poll);
+bindPeriodPoll(poll);
 restorePrefs();
+bindPeriodControls();
 
 $("sessionSelect")?.addEventListener("change", (ev) => {
   switchSession(ev.target.value || null);
@@ -387,6 +407,10 @@ $("treeCollapse")?.addEventListener("click", () => setRoundsOpen(false));
 poll();
 setInterval(poll, 1000);
 window.addEventListener("resize", () => {
+  if (isPeriodScope()) {
+    redrawPeriod();
+    return;
+  }
   const st = window.__lastState;
   if (!st) return;
   drawLineChart($("ctxChart"), st.context_series || [], "#3d9cf0", st.rounds || []);

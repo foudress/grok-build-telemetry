@@ -79,7 +79,26 @@ header h1 {
   gap: var(--space-2);
   flex: 1 1 280px;
   min-width: 200px;
-  max-width: 560px;
+  max-width: 640px;
+}
+
+#scopeSelect {
+  flex: 0 0 auto;
+  width: auto;
+  min-width: 7.5rem;
+}
+
+body.scope-period #sessionSelect,
+body.scope-period #sessionPinHint,
+body.scope-period #ctxPressure,
+body.scope-period #kvChip,
+body.scope-period #modelBadge,
+body.scope-period #phaseMeta {
+  display: none;
+}
+
+body.scope-period #sessionMeta code {
+  text-transform: none;
 }
 
 .session-picker label {

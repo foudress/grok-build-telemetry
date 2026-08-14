@@ -4,6 +4,37 @@
   position: relative;
 }
 
+#costChartWrap {
+  display: flex;
+  align-items: stretch;
+  overflow: hidden;
+  background: var(--bg-sunken);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-subtle);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
+}
+
+.chart-scroll {
+  width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+
+#costChartWrap .chart-scroll {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.chart-scroll::-webkit-scrollbar { height: 8px; }
+.chart-scroll::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: var(--radius-pill);
+}
+
 canvas {
   width: 100%;
   height: 240px;
@@ -16,7 +47,43 @@ canvas {
 
 .bars { height: 240px; }
 
+#costChartWrap canvas.bars {
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.cost-yaxis {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 56px;
+  height: 240px;
+  pointer-events: none;
+  z-index: 2;
+  background: var(--bg-sunken);
+  border-radius: var(--radius-md) 0 0 var(--radius-md);
+}
+
+#costChartWrap .cost-yaxis {
+  position: relative;
+  left: auto;
+  top: auto;
+  z-index: 1;
+  flex: 0 0 56px;
+  width: 56px;
+  height: 240px;
+  border-radius: 0;
+  border-right: 1px solid var(--border-subtle);
+}
+
 /* ── Chart toolbar ──────────────────────────────────────────── */
+[hidden],
+.chart-toolbar[hidden],
+.unit-toggle[hidden] {
+  display: none !important;
+}
+
 .chart-toolbar {
   display: flex;
   flex-wrap: wrap;

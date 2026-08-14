@@ -14,7 +14,12 @@
     <h1>Grok Token Telemetry</h1>
     <span id="liveBadge" class="badge">connecting…</span>
     <div class="session-picker">
-      <label for="sessionSelect">Session</label>
+      <select id="scopeSelect" title="Session or period aggregate" aria-label="View">
+        <option value="session">Session</option>
+        <option value="daily">Daily</option>
+        <option value="weekly">Weekly</option>
+        <option value="monthly">Monthly</option>
+      </select>
       <select id="sessionSelect" title="Active sessions + recent">
         <option value="">loading…</option>
       </select>
@@ -33,30 +38,30 @@
 
   <main>
     <section class="cards">
-      <div class="card accent">
-        <div class="label">Context now (TUI)</div>
+      <div class="card accent" id="kpi1">
+        <div class="label" id="kpi1Label">Context now (TUI)</div>
         <div class="value" id="ctxNow">—</div>
         <div class="sub" id="ctxSub"></div>
-        <div class="progress"><span id="ctxBar"></span></div>
+        <div class="progress" id="kpi1Progress"><span id="ctxBar"></span></div>
       </div>
-      <div class="card green">
-        <div class="label">Session cost (official)</div>
+      <div class="card green" id="kpi2">
+        <div class="label" id="kpi2Label">Session cost (official)</div>
         <div class="value" id="costOfficial">—</div>
         <div class="sub" id="costOfficialSub"></div>
       </div>
-      <div class="card amber">
-        <div class="label">Session cost (estimate)</div>
+      <div class="card amber" id="kpi3">
+        <div class="label" id="kpi3Label">Session cost (estimate)</div>
         <div class="value" id="costEstimate">—</div>
         <div class="sub" id="costEstimateSub"></div>
       </div>
-      <div class="card rose">
-        <div class="label">Last turn gen rate</div>
+      <div class="card rose" id="kpi4">
+        <div class="label" id="kpi4Label">Last turn gen rate</div>
         <div class="value" id="genRate">—</div>
         <div class="sub" id="genRateSub"></div>
       </div>
     </section>
 
-    <section class="panel">
+    <section class="panel" id="ctxPanel">
       <h2>Context tokens</h2>
       <div class="chart-wrap">
         <canvas id="ctxChart" height="320"></canvas>
@@ -64,10 +69,10 @@
       </div>
     </section>
 
-    <section class="panel">
-      <h2>Cost per round</h2>
+    <section class="panel" id="costPanel">
+      <h2 id="costPanelTitle">Cost per round</h2>
       <div id="taskTabs" class="task-tabs" hidden></div>
-      <div class="chart-toolbar">
+      <div class="chart-toolbar" id="sessionChartToolbar">
         <label title="Split each round by attribution (system/user/harness/thought/…)">
           <input type="checkbox" id="costDetailToggle" /> Detailed attribution
         </label>
@@ -78,8 +83,29 @@
         <button type="button" id="costDrillBack" hidden>← Back to rounds</button>
         <span id="costModeLabel" class="mode-pill"></span>
       </div>
-      <div class="chart-wrap">
-        <canvas id="costChart" class="bars" height="320"></canvas>
+      <div class="chart-toolbar" id="periodToolbar" hidden>
+        <button type="button" id="periodPrev" class="ghost-btn" title="Previous period">←</button>
+        <span id="periodLabel" class="mode-pill">—</span>
+        <button type="button" id="periodNext" class="ghost-btn" title="Next period">→</button>
+        <span class="unit-toggle" id="periodGrain" hidden title="Bar grain" role="group" aria-label="Period grain">
+          <button type="button" id="grainA" class="unit-btn" data-grain=""></button>
+          <button type="button" id="grainB" class="unit-btn" data-grain=""></button>
+        </span>
+        <span class="unit-toggle" title="Bar values" role="group" aria-label="Period chart mode">
+          <button type="button" id="aggModeTf" class="unit-btn active" aria-pressed="true">Timeframe</button>
+          <button type="button" id="aggModeCum" class="unit-btn" aria-pressed="false">Cumulative</button>
+        </span>
+        <span class="unit-toggle" title="Y-axis unit" role="group" aria-label="Period chart unit">
+          <button type="button" id="aggUnitUsd" class="unit-btn active" aria-pressed="true">$</button>
+          <button type="button" id="aggUnitTok" class="unit-btn" aria-pressed="false">Tok</button>
+        </span>
+        <span id="aggModeLabel" class="mode-pill">In / Cached / Out</span>
+      </div>
+      <div class="chart-wrap" id="costChartWrap" title="Scroll to zoom horizontal scale">
+        <canvas id="costYAxis" class="cost-yaxis" hidden></canvas>
+        <div class="chart-scroll" id="costChartScroll">
+          <canvas id="costChart" class="bars" height="320"></canvas>
+        </div>
         <div id="costTip" class="chart-tip" role="tooltip"></div>
       </div>
       <div id="costLegend" class="cost-legend" title="Click a category to hide/show it in the bars"></div>
@@ -87,7 +113,7 @@
 
     <section class="panel tree-panel">
       <div class="panel-head">
-        <h2>Round hierarchy</h2>
+        <h2 id="treeTitle">Round hierarchy</h2>
         <div class="tree-toolbar">
           <span class="unit-toggle" role="group" aria-label="Tree density">
             <button type="button" id="densStandard" class="unit-btn active" aria-pressed="true">Standard</button>

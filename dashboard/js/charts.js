@@ -146,18 +146,27 @@ function niceCtxYRange(vals) {
   return { min, max, step: STEP };
 }
 
-/** Cost Y: fine steps for early turns; axis max never below $0.01 */
+/** Cost Y ($): ~5–8 nice ticks (1-2-5). Old 0.5 steps explode on period totals. */
 function niceCostYMax(rawMax) {
   const m = Math.max(Number(rawMax) || 0, 0.01);
-  let step;
-  if (m <= 0.02) step = 0.005;
-  else if (m <= 0.05) step = 0.01;
-  else if (m <= 0.1) step = 0.02;
-  else if (m <= 0.25) step = 0.05;
-  else if (m <= 0.5) step = 0.1;
-  else if (m <= 2) step = 0.25;
-  else step = 0.5;
-  const max = Math.max(0.01, Math.ceil(m / step) * step);
+  const targetTicks = 6;
+  const rough = m / targetTicks;
+  const mag = Math.pow(10, Math.floor(Math.log10(Math.max(rough, 1e-6))));
+  const r = rough / mag;
+  let nice = 1;
+  if (r <= 1) nice = 1;
+  else if (r <= 2) nice = 2;
+  else if (r <= 2.5) nice = 2.5;
+  else if (r <= 5) nice = 5;
+  else nice = 10;
+  let step = nice * mag;
+  if (step < 0.005) step = 0.005;
+  let max = Math.max(0.01, Math.ceil(m / step) * step);
+  let ticks = Math.round(max / step);
+  if (ticks > 8) {
+    step = (Math.ceil(max / 6 / step) || 1) * step;
+    max = Math.max(step, Math.ceil(m / step) * step);
+  }
   return { min: 0, max: max || step, step };
 }
 
@@ -454,7 +463,15 @@ function costSegMetric(seg, unit) {
 }
 
 function fmtCostAxis(v, unit) {
-  return unit === "tokens" ? fmtTokens(v) : fmtUsd(v);
+  if (unit === "tokens") return fmtTokens(v);
+  const n = Number(v) || 0;
+  if (n === 0) return "$0";
+  const a = Math.abs(n);
+  if (a >= 100) return "$" + Math.round(n);
+  if (a >= 10) return "$" + n.toFixed(1);
+  if (a >= 1) return "$" + n.toFixed(2);
+  if (a >= 0.1) return "$" + n.toFixed(2);
+  return "$" + n.toFixed(3);
 }
 
 /** Token Y-axis: ~5–8 ticks (same Round overview + Drill — no dense 500-step grids). */
@@ -1142,16 +1159,195 @@ function compactCostBar(c, compactIndex) {
   };
 }
 
-function drawBars(canvas, turns, rounds) {
+const COST_Y_LEFT = 56;
+const PLOT_PAD_L = 6;
+const COST_CHART_H = 240;
+const COST_MIN_SLOT = 36;
+const COST_MAX_SLOT = 96;
+
+function zoomStore() {
+  if (document.body.classList.contains("scope-period")) {
+    if (!window.__aggChart) window.__aggChart = {};
+    return window.__aggChart;
+  }
+  return window.__costChart;
+}
+
+function resetCostCanvasFit(canvas) {
+  if (!canvas) return;
+  canvas.style.width = "100%";
+  const scroller = $("costChartScroll");
+  if (scroller) scroller.classList.remove("is-overflow");
+}
+
+function slotRange(viewW, barCount) {
+  const nSlots = Math.max(barCount, 5);
+  const plotAvail = Math.max(10, viewW - PLOT_PAD_L - 12);
+  const minSlot = plotAvail / nSlots;
+  return { nSlots, minSlot, maxSlot: COST_MAX_SLOT, plotAvail };
+}
+
+function layoutCostCanvas(canvas, barCount, { forceFit } = {}) {
+  const yAxis = $("costYAxis");
+  if (yAxis && barCount > 0) yAxis.hidden = false;
+  const scroller = $("costChartScroll");
+  let viewW = (scroller && scroller.clientWidth) || 0;
+  if (!viewW) viewW = (canvas.parentElement && canvas.parentElement.clientWidth) || 600;
+  let h = canvas.clientHeight;
+  if (!h || h < 80) h = COST_CHART_H;
+  const store = zoomStore();
+  const keepScroll = store._costUserZoom || store._costStickEnd === false;
+  const prevScroll = scroller
+    ? (store._scrollLeft != null ? store._scrollLeft : scroller.scrollLeft)
+    : 0;
+  const { nSlots, minSlot, maxSlot } = slotRange(viewW, barCount);
+  let slot = store.slotPx;
+  if (!(slot > 0)) slot = forceFit ? minSlot : COST_MIN_SLOT;
+  slot = Math.min(maxSlot, Math.max(minSlot, slot));
+  store.slotPx = slot;
+  const w = PLOT_PAD_L + 12 + nSlots * slot;
+  const overflow = w > viewW + 1;
+  if (overflow) canvas.style.width = w + "px";
+  else canvas.style.width = "100%";
+  if (scroller) scroller.classList.toggle("is-overflow", overflow);
   const dpr = window.devicePixelRatio || 1;
-  const w = canvas.clientWidth;
-  const h = canvas.clientHeight || 320;
-  canvas.width = Math.floor(w * dpr);
-  canvas.height = Math.floor(h * dpr);
+  canvas.width = Math.max(1, Math.floor(w * dpr));
+  canvas.height = Math.max(1, Math.floor(h * dpr));
   const ctx = canvas.getContext("2d");
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, h);
+  if (scroller) {
+    const max = Math.max(0, scroller.scrollWidth - scroller.clientWidth);
+    if (overflow && !keepScroll && store._costStickEnd !== false) {
+      scroller.scrollLeft = max;
+      store._scrollLeft = scroller.scrollLeft;
+    } else if (keepScroll) {
+      scroller.scrollLeft = Math.min(max, Math.max(0, prevScroll));
+      store._scrollLeft = scroller.scrollLeft;
+    }
+  }
+  if (scroller && !scroller._stickBound) {
+    scroller._stickBound = true;
+    scroller.addEventListener("scroll", () => {
+      const st = zoomStore();
+      st._scrollLeft = scroller.scrollLeft;
+      const max = scroller.scrollWidth - scroller.clientWidth;
+      st._costStickEnd = max > 0 && scroller.scrollLeft >= max - 12;
+    });
+  }
+  canvas._zoomBars = barCount;
+  bindCostZoom();
+  return { w, h, ctx, overflow, slot, nSlots, minSlot };
+}
 
+function redrawCostChart() {
+  const canvas = $("costChart");
+  if (!canvas) return;
+  if (document.body.classList.contains("scope-period")) {
+    const ag = window.__aggChart;
+    if (ag) drawAggBars(canvas, ag.buckets, ag);
+    return;
+  }
+  const st = window.__costChart;
+  if (st) drawBars(canvas, st.turns, st.rounds);
+}
+
+function bindCostZoom() {
+  const wrap = $("costChartWrap");
+  if (!wrap || wrap._zoomBound) return;
+  wrap._zoomBound = true;
+  wrap.addEventListener("wheel", (ev) => {
+    if (ev.shiftKey) return;
+    if (Math.abs(ev.deltaX) > Math.abs(ev.deltaY)) return;
+    const canvas = $("costChart");
+    const scroller = $("costChartScroll");
+    if (!canvas) return;
+    ev.preventDefault();
+    const barCount = canvas._zoomBars || 1;
+    const viewW = (scroller && scroller.clientWidth) || wrap.clientWidth || 600;
+    const { nSlots, minSlot, maxSlot } = slotRange(viewW, barCount);
+    const store = zoomStore();
+    const slot0 = store.slotPx > 0 ? store.slotPx : COST_MIN_SLOT;
+    const notches = ev.deltaY / (ev.deltaMode === 1 ? 3 : 80);
+    let next = slot0 * Math.pow(1.16, -notches);
+    next = Math.min(maxSlot, Math.max(minSlot, next));
+    if (next <= minSlot * 1.03) next = minSlot;
+    if (Math.abs(next - slot0) < 0.05) return;
+    const sl = scroller ? scroller.scrollLeft : 0;
+    const rect = (scroller || wrap).getBoundingClientRect();
+    const mx = ev.clientX - rect.left;
+    const oldW = PLOT_PAD_L + 12 + nSlots * slot0;
+    const newW = PLOT_PAD_L + 12 + nSlots * next;
+    const t = oldW > 0 ? (sl + mx) / oldW : 0;
+    store.slotPx = next;
+    store._costUserZoom = true;
+    store._costStickEnd = false;
+    redrawCostChart();
+    if (scroller) {
+      const max = Math.max(0, scroller.scrollWidth - scroller.clientWidth);
+      scroller.scrollLeft = Math.min(max, Math.max(0, t * newW - mx));
+      store._scrollLeft = scroller.scrollLeft;
+    }
+  }, { passive: false });
+}
+
+function drawCostYOverlay({ min, max, step, unit, top, bottom, h }) {
+  const yAxis = $("costYAxis");
+  if (!yAxis) return;
+  yAxis.hidden = false;
+  const dpr = window.devicePixelRatio || 1;
+  const w = COST_Y_LEFT;
+  yAxis.width = Math.max(1, Math.floor(w * dpr));
+  yAxis.height = Math.max(1, Math.floor(h * dpr));
+  yAxis.style.width = w + "px";
+  yAxis.style.height = h + "px";
+  const ctx = yAxis.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  let bg = "#121a24";
+  const plot = $("costChart");
+  if (plot) {
+    const cs = getComputedStyle(plot);
+    if (cs.backgroundColor && !cs.backgroundColor.includes("0, 0, 0, 0") && cs.backgroundColor !== "transparent")
+      bg = cs.backgroundColor;
+  }
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, w, h);
+  const plotH = Math.max(1, h - top - bottom);
+  const span = (max - min) || 1;
+  const yOf = (v) => top + plotH - ((v - min) / span) * plotH;
+  ctx.fillStyle = CHART_AXIS.label;
+  ctx.font = "11px system-ui, Segoe UI, sans-serif";
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+  eachCostYTick(min, max, step, unit, (v) => {
+    ctx.fillText(fmtCostAxis(v, unit), w - 8, yOf(v));
+  });
+}
+
+function eachCostYTick(yMin, max, step, unit, fn) {
+  if (!(step > 0) || !Number.isFinite(step) || !Number.isFinite(max)) {
+    fn(0);
+    return;
+  }
+  const span = Math.max(0, max - yMin);
+  const n = Math.max(1, Math.round(span / step));
+  const count = Math.min(8, n);
+  const seen = new Set();
+  for (let i = 0; i <= count; i++) {
+    let v = yMin + (span * i) / count;
+    v = Math.round(v / step) * step;
+    if (v < yMin - step * 0.01 || v > max + step * 0.01) continue;
+    if (unit === "tokens") v = Math.round(v);
+    const key = unit === "tokens" ? String(v) : v.toFixed(6);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    fn(v);
+  }
+  if (!seen.size) fn(yMin);
+}
+
+function drawBars(canvas, turns, rounds) {
   const st = window.__costChart;
   st.turns = turns || [];
   st.rounds = rounds || [];
@@ -1190,7 +1386,7 @@ function drawBars(canvas, turns, rounds) {
       }
     });
   } else {
-    const slice = (turns || []).slice(-16);
+    const slice = turns || [];
     // Separate System bar before Round 1 when bootstrap system exists
     const r1 = findRound(st.rounds, 1)
       || (st.rounds || []).find(r => r && r.system_prompt)
@@ -1240,8 +1436,12 @@ function drawBars(canvas, turns, rounds) {
   }
 
   if (!bars.length) {
+    resetCostCanvasFit(canvas);
+    const yAxis = $("costYAxis");
+    if (yAxis) yAxis.hidden = true;
+    const empty = layoutCostCanvas(canvas, 0, { forceFit: true });
     drawChartEmpty(
-      ctx, w, h,
+      empty.ctx, empty.w, empty.h,
       st.drillTurn != null ? "No LLM calls in this round" : "No completed rounds yet"
     );
     canvas._barHit = [];
@@ -1250,6 +1450,8 @@ function drawBars(canvas, turns, rounds) {
     hideChartTip(tip);
     return;
   }
+
+  const { w, h, ctx, overflow } = layoutCostCanvas(canvas, bars.length);
 
   if (!(st.hiddenLegend instanceof Set)) st.hiddenLegend = new Set();
   const unit = st.unit === "tokens" ? "tokens" : "usd";
@@ -1287,33 +1489,27 @@ function drawBars(canvas, turns, rounds) {
   const { min: yMin, max, step: yStep } = niceCostYMaxForUnit(rawMax, unit);
 
   // Legend lives in HTML below the canvas (wrap + scroll) — free plot top
-  const left = 48, right = 12, top = 12, bottom = 28;
+  const left = PLOT_PAD_L, right = 12, top = 12, bottom = 28;
   const plotW = w - left - right;
   const plotH = h - top - bottom;
   // Pad X to ≥5 slots so 1–2 early bars stay narrow; empty slots left blank
   const MIN_COST_SLOTS = 5;
   const nSlots = Math.max(bars.length, MIN_COST_SLOTS);
   const groupW = plotW / nSlots;
-  const bw = Math.min(40, Math.max(10, groupW * 0.55));
+  const bw = Math.max(1, Math.min(44, groupW * (groupW < 8 ? 0.9 : groupW < 18 ? 0.72 : 0.58)));
   const yOf = (v) => top + plotH - ((v - yMin) / (max - yMin)) * plotH;
-  const yStepPrec = unit === "tokens"
-    ? 1
-    : (yStep < 0.01 ? 10000 : 1000);
 
   ctx.strokeStyle = CHART_AXIS.grid;
   ctx.lineWidth = 1;
   ctx.fillStyle = CHART_AXIS.label;
   ctx.font = "10px system-ui, Segoe UI, sans-serif";
   ctx.textAlign = "right";
-  for (let v = yMin; v <= max + 1e-12; v = unit === "tokens"
-    ? v + yStep
-    : Math.round((v + yStep) * yStepPrec) / yStepPrec) {
+  eachCostYTick(yMin, max, yStep, unit, (v) => {
     const y = yOf(v);
-    ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(w - right, y); ctx.stroke();
-    ctx.fillText(fmtCostAxis(v, unit), left - 4, y + 3);
-    if (unit === "tokens" && v + yStep > max + 1e-9) break;
-  }
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w - right, y); ctx.stroke();
+  });
   ctx.textAlign = "left";
+  drawCostYOverlay({ min: yMin, max, step: yStep, unit, top, bottom, h });
 
   const hit = [];
   const legendMap = new Map();
@@ -1365,7 +1561,9 @@ function drawBars(canvas, turns, rounds) {
     ctx.fillStyle = p.kind === "subagent" ? COST_COLORS.sub : CHART_AXIS.labelDim;
     ctx.font = "10px system-ui, Segoe UI, sans-serif";
     ctx.textAlign = "center";
-    ctx.fillText(p.label || String(p.index), x0 + bw / 2, h - 8);
+    const xEvery = groupW < 8 ? 8 : groupW < 14 ? 4 : groupW < 22 ? 2 : 1;
+    if (i % xEvery === 0)
+      ctx.fillText(p.label || String(p.index), x0 + bw / 2, h - 8);
     ctx.textAlign = "left";
     // attach visible segs for tooltip
     const visTot = stack.reduce((a, s) => a + costSegMetric(s, unit), 0);
@@ -1443,6 +1641,8 @@ function drawBars(canvas, turns, rounds) {
       const tipEl = $("costTip");
       if (!tipEl || !canvas._barHit) return;
       const rect = canvas.getBoundingClientRect();
+      const wrap = $("costChartWrap");
+      const wrapRect = wrap ? wrap.getBoundingClientRect() : rect;
       const mx = ev.clientX - rect.left;
       const my = ev.clientY - rect.top;
       const found = canvas._barHit.find(b => mx >= b.x0 && mx <= b.x1 && my >= b.y0 && my <= b.y1);
@@ -1496,10 +1696,10 @@ function drawBars(canvas, turns, rounds) {
       const html = lines.join("<br>");
       // Tooltip top-right of cursor (above + to the right) — keep existing placement
       const { tw, th } = measureChartTip(tipEl, html);
-      let leftPx = mx + 12;
-      if (leftPx + tw > rect.width - 4) leftPx = Math.max(4, mx - tw - 8);
-      let topPx = my - th - 8;
-      if (topPx < 4) topPx = Math.min(rect.height - th - 4, my + 12);
+      let leftPx = ev.clientX - wrapRect.left + 12;
+      if (leftPx + tw > wrapRect.width - 4) leftPx = Math.max(4, ev.clientX - wrapRect.left - tw - 8);
+      let topPx = ev.clientY - wrapRect.top - th - 8;
+      if (topPx < 4) topPx = Math.min(wrapRect.height - th - 4, ev.clientY - wrapRect.top + 12);
       showChartTip(tipEl, html, leftPx, Math.max(4, topPx));
     });
     canvas.addEventListener("mouseleave", () => {
@@ -1562,11 +1762,20 @@ function renderCostLegend(legendItems, hidden) {
       if (!btn) return;
       const name = btn.getAttribute("data-leg");
       if (!name) return;
+      const canvas = $("costChart");
+      if (document.body.classList.contains("scope-period")) {
+        const ag = window.__aggChart || {};
+        if (!(ag.hiddenLegend instanceof Set)) ag.hiddenLegend = new Set();
+        if (ag.hiddenLegend.has(name)) ag.hiddenLegend.delete(name);
+        else ag.hiddenLegend.add(name);
+        window.__aggChart = ag;
+        if (canvas) drawAggBars(canvas, ag.buckets, ag);
+        return;
+      }
       const st = window.__costChart;
       if (!(st.hiddenLegend instanceof Set)) st.hiddenLegend = new Set();
       if (st.hiddenLegend.has(name)) st.hiddenLegend.delete(name);
       else st.hiddenLegend.add(name);
-      const canvas = $("costChart");
       if (canvas) drawBars(canvas, st.turns, st.rounds);
     });
   }
@@ -1586,14 +1795,212 @@ function setCostUnit(unit) {
     tokBtn.classList.toggle("active", !isUsd);
     tokBtn.setAttribute("aria-pressed", !isUsd ? "true" : "false");
   }
+  const aggUsd = $("aggUnitUsd");
+  const aggTok = $("aggUnitTok");
+  if (aggUsd) {
+    aggUsd.classList.toggle("active", isUsd);
+    aggUsd.setAttribute("aria-pressed", isUsd ? "true" : "false");
+  }
+  if (aggTok) {
+    aggTok.classList.toggle("active", !isUsd);
+    aggTok.setAttribute("aria-pressed", !isUsd ? "true" : "false");
+  }
+  if (document.body.classList.contains("scope-period")) {
+    const ag = window.__aggChart;
+    if (ag) drawAggBars($("costChart"), ag.buckets, ag);
+    return;
+  }
   const st = window.__costChart;
   if (st) drawBars($("costChart"), st.turns, st.rounds);
+}
+
+function _cumBuckets(buckets) {
+  const out = [];
+  let tin = 0, tc = 0, tout = 0, ci = 0, cc = 0, co = 0, tot = 0;
+  for (const b of buckets || []) {
+    tin += Number(b.tokens_in) || 0;
+    tc += Number(b.tokens_cached) || 0;
+    tout += Number(b.tokens_out) || 0;
+    ci += Number(b.cost_in_usd) || 0;
+    cc += Number(b.cost_cached_usd) || 0;
+    co += Number(b.cost_out_usd) || 0;
+    tot += Number(b.official_usd) || 0;
+    out.push({
+      ...b,
+      tokens_in: tin,
+      tokens_cached: tc,
+      tokens_out: tout,
+      tokens_all: tin + tc + tout,
+      cost_in_usd: ci,
+      cost_cached_usd: cc,
+      cost_out_usd: co,
+      official_usd: tot,
+    });
+  }
+  return out;
+}
+
+/** Stacked In / Cached / Out histogram for period views. */
+function drawAggBars(canvas, buckets, opts) {
+  if (!canvas) return;
+  const unit = (opts && opts.unit) || (window.__costChart && window.__costChart.unit) || "usd";
+  const cumulative = !!(opts && opts.cumulative);
+  const prev = window.__aggChart || {};
+  const hidden = prev.hiddenLegend instanceof Set ? prev.hiddenLegend : new Set();
+  const src = cumulative ? _cumBuckets(buckets) : (buckets || []);
+  window.__aggChart = {
+    buckets: buckets || [],
+    unit,
+    cumulative,
+    hiddenLegend: hidden,
+    slotPx: prev.slotPx,
+    _costUserZoom: prev._costUserZoom,
+    _costStickEnd: prev._costStickEnd,
+    _scrollLeft: prev._scrollLeft,
+  };
+
+  const tip = $("costTip");
+  const laid = layoutCostCanvas(canvas, Math.max(src.length, 1), {
+    forceFit: !prev._costUserZoom && src.length <= 36,
+  });
+  const { w, h, ctx } = laid;
+  const padL = PLOT_PAD_L;
+  const padR = 12;
+  const padT = 16;
+  const padB = 28;
+  const plotW = Math.max(10, w - padL - padR);
+  const plotH = Math.max(10, h - padT - padB);
+
+  const legendItems = [
+    ["In", { label: "In", color: COST_COLORS.in, k: "in" }],
+    ["Cached", { label: "Cached", color: COST_COLORS.cached, k: "cached" }],
+    ["Out", { label: "Out", color: COST_COLORS.out, k: "out" }],
+  ];
+  renderCostLegend(legendItems, hidden);
+
+  if (!src.length) {
+    const yAxis = $("costYAxis");
+    if (yAxis) yAxis.hidden = true;
+    drawChartEmpty(ctx, w, h, "No usage in this period");
+    hideChartTip(tip);
+    canvas.onmousemove = null;
+    canvas.onmouseleave = null;
+    return;
+  }
+
+  const segsOf = (b) => {
+    if (unit === "tokens") {
+      return [
+        { k: "in", label: "In", legendKey: "In", v: Number(b.tokens_in) || 0, color: COST_COLORS.in },
+        { k: "cached", label: "Cached", legendKey: "Cached", v: Number(b.tokens_cached) || 0, color: COST_COLORS.cached },
+        { k: "out", label: "Out", legendKey: "Out", v: Number(b.tokens_out) || 0, color: COST_COLORS.out },
+      ];
+    }
+    return [
+      { k: "in", label: "In", legendKey: "In", v: Number(b.cost_in_usd) || 0, color: COST_COLORS.in },
+      { k: "cached", label: "Cached", legendKey: "Cached", v: Number(b.cost_cached_usd) || 0, color: COST_COLORS.cached },
+      { k: "out", label: "Out", legendKey: "Out", v: Number(b.cost_out_usd) || 0, color: COST_COLORS.out },
+    ];
+  };
+  const visSegs = (b) => segsOf(b).filter((s) => {
+    if (!(s.v > 0)) return false;
+    return !hidden.has(s.legendKey) && !hidden.has(s.label) && !hidden.has(s.k);
+  });
+
+  let yMax = 0;
+  const bars = src.map((b) => {
+    const segs = visSegs(b);
+    const total = segs.reduce((a, s) => a + s.v, 0);
+    if (total > yMax) yMax = total;
+    return { b, segs, total };
+  });
+  if (yMax <= 0) yMax = unit === "tokens" ? 1000 : 0.01;
+  const y = niceCostYMaxForUnit(yMax, unit);
+  const max = y.max || 1;
+
+  ctx.strokeStyle = CHART_AXIS.grid;
+  ctx.lineWidth = 1;
+  ctx.fillStyle = CHART_AXIS.labelDim;
+  ctx.font = "10px system-ui, Segoe UI, sans-serif";
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+  eachCostYTick(0, max, y.step, unit, (v) => {
+    const yy = padT + plotH - (v / max) * plotH;
+    ctx.beginPath();
+    ctx.moveTo(0, yy);
+    ctx.lineTo(w - padR, yy);
+    ctx.stroke();
+  });
+  drawCostYOverlay({ min: 0, max, step: y.step, unit, top: padT, bottom: padB, h });
+
+  const n = bars.length;
+  const nSlots = Math.max(n, 1);
+  const groupW = plotW / nSlots;
+  const gap = Math.max(0, Math.min(6, groupW * 0.18));
+  const bw = Math.max(1, groupW - gap);
+  const hit = [];
+  const labelEvery = groupW < 8 ? 8 : groupW < 14 ? 4 : groupW < 22 ? 2 : 1;
+
+  bars.forEach((bar, i) => {
+    const x = padL + i * groupW + (groupW - bw) / 2;
+    let y0 = padT + plotH;
+    bar.segs.forEach((s) => {
+      if (!(s.v > 0)) return;
+      const bh = (s.v / max) * plotH;
+      y0 -= bh;
+      ctx.fillStyle = s.color;
+      ctx.fillRect(x, y0, bw, Math.max(1, bh));
+    });
+    hit.push({ x, y: padT, w: bw, h: plotH, bar });
+    ctx.fillStyle = CHART_AXIS.label;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    const lab = bar.b.label || "";
+    const show = i % labelEvery === 0;
+    if (show) {
+      ctx.save();
+      if (n > 12 && lab.length > 6) {
+        ctx.translate(x + bw / 2, h - padB + 4);
+        ctx.rotate(-0.45);
+        ctx.textAlign = "right";
+        ctx.fillText(lab, 0, 0);
+        ctx.restore();
+      } else {
+        ctx.fillText(lab, x + bw / 2, h - padB + 6);
+      }
+    }
+  });
+
+  canvas.onmousemove = (ev) => {
+    const r = canvas.getBoundingClientRect();
+    const mx = ev.clientX - r.left;
+    const my = ev.clientY - r.top;
+    const found = hit.find((h0) => mx >= h0.x && mx <= h0.x + h0.w && my >= h0.y && my <= h0.y + h0.h);
+    if (!found) {
+      hideChartTip(tip);
+      return;
+    }
+    const b = found.bar.b;
+    const html = `<b>${esc(b.label || "")}</b><br>
+      <span class="tok-in">In</span> ${fmtTokens(b.tokens_in)} · ${fmtUsd(b.cost_in_usd)}<br>
+      <span class="tok-cached">Cached</span> ${fmtTokens(b.tokens_cached)} · ${fmtUsd(b.cost_cached_usd)}<br>
+      <span class="tok-out">Out</span> ${fmtTokens(b.tokens_out)} · ${fmtUsd(b.cost_out_usd)}<br>
+      ${fmtUsd(b.official_usd)}`;
+    const tw = measureChartTip(tip, html);
+    let left = ev.clientX - r.left + 12;
+    let top = ev.clientY - r.top - tw.th - 8;
+    if (left + tw.tw > w) left = w - tw.tw - 4;
+    if (top < 0) top = ev.clientY - r.top + 16;
+    showChartTip(tip, html, left, top);
+  };
+  canvas.onmouseleave = () => hideChartTip(tip);
 }
 
 export {
   buildCtxPoints,
   drawLineChart,
   drawBars,
+  drawAggBars,
   renderCostLegend,
   setCostUnit,
   findRound,

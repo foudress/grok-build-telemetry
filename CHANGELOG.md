@@ -5,6 +5,31 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-08-14
+
+### Added
+
+- Header **Session / Daily / Weekly / Monthly** scope. Session view is unchanged (R1 / System frozen).
+- Period aggregates from official `turn_completed.usage` (no hierarchy load):
+  - Daily bars: **Hourly** or **15 min**
+  - Weekly bars: **Hourly** or **Daily**
+  - Monthly bars: **Daily** or **Weekly** (weeks clipped to the month)
+  - **Timeframe** vs **Cumulative**, **$** vs **Tok**, stacked **In / Cached / Out**
+- KPI cards in period mode: Total In / Cached / Out / All with $ under each.
+- Session list instead of the round tree: `Session N · title · In / Cached / Out → $` (click opens that session).
+- `GET /api/aggregate?period=&offset=&grain=` plus `token_telemetry/session/aggregate.py` (mtime cache).
+- Sub-agent dirs appear in the list (`↳`) but are **excluded from totals/buckets** (already inside the parent bill).
+- Horizontal **wheel zoom** on the cost chart (min scale = fit all bars; session and period keep separate scales).
+- Cost chart **horizontal scroll** when zoomed; Y-axis is a fixed column so bars clip at the axis, not under it.
+- `test/test_aggregate.py` — windows, hourly / 15‑min / weekly-hour buckets, sub-agent exclusion.
+
+### Changed
+
+- Period toolbar is hidden in Session (CSS `[hidden]` no longer overridden by `display: flex`).
+- Dollar Y-axis uses ~5–8 nice 1-2-5 ticks (no more $0.50 grids on large period totals).
+- In / Cached / Out legend chips work in period views; Y rescales to the visible stack.
+- Scroll position is preserved across period poll redraws (no snap back to the left).
+
 ## [0.3.1] — 2026-08-13
 
 ### Fixed

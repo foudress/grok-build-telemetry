@@ -179,6 +179,16 @@
 .card.amber::before { background: var(--amber); }
 .card.rose::before { background: var(--rose); }
 
+body.scope-period #kpi1.card::before { background: var(--green); }
+body.scope-period #kpi1 .value { color: var(--green); }
+body.scope-period #kpi2.card::before { background: var(--amber); }
+body.scope-period #kpi2 .value { color: var(--amber); }
+body.scope-period #kpi3.card::before { background: var(--rose); }
+body.scope-period #kpi3 .value { color: var(--rose); }
+body.scope-period #kpi4.card::before { background: var(--accent); }
+body.scope-period #kpi4 .value { color: var(--text); }
+body.scope-period #kpi1Progress { display: none; }
+
 .card.accent .value { color: var(--accent); }
 .card.green .value { color: var(--green); }
 .card.amber .value { color: var(--amber); }
@@ -228,6 +238,94 @@
 .panel.tree-panel,
 .panel.meta-panel {
   grid-column: 1 / -1;
+}
+
+body.scope-period #ctxPanel,
+body.scope-period #sessionChartToolbar,
+body.scope-period #taskTabs,
+body.scope-period .meta-panel,
+body.scope-period .tree-toolbar {
+  display: none !important;
+}
+
+body.scope-period #costPanel,
+body.scope-period .tree-panel {
+  grid-column: 1 / -1;
+}
+
+body.scope-period #costChart {
+  grid-column: 1 / -1;
+}
+
+/* Period session list (replaces round hierarchy) */
+.sess-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sess-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  gap: 4px 12px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  cursor: pointer;
+  font-size: var(--font-size-sm);
+  transition:
+    border-color var(--duration-fast) var(--ease-out),
+    background-color var(--duration-fast) var(--ease-out);
+}
+
+.sess-row:hover {
+  border-color: var(--border-strong);
+  background: var(--panel-hover);
+}
+
+.sess-row .sess-n {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  font-weight: var(--font-weight-semibold);
+  white-space: nowrap;
+}
+
+.sess-row .sess-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-weight: var(--font-weight-medium);
+}
+
+.sess-row .sess-ledger {
+  justify-self: end;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.sess-row .sess-price {
+  justify-self: end;
+  white-space: nowrap;
+}
+
+.sess-row.is-sub .sess-title { color: var(--muted); }
+
+.sess-empty {
+  color: var(--muted);
+  padding: var(--space-4) var(--space-2);
+  text-align: center;
+}
+
+@media (max-width: 900px) {
+  .sess-row {
+    grid-template-columns: auto 1fr;
+  }
+  .sess-row .sess-ledger,
+  .sess-row .sess-price { justify-self: start; }
 }
 
 .panel.meta-panel {
@@ -359,6 +457,12 @@
 }
 
 .ghost-btn:active { transform: scale(0.97); }
+
+.ghost-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+  pointer-events: none;
+}
 
 .meta-panel > summary {
   list-style: none;

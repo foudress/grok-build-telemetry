@@ -15,9 +15,10 @@ Live companion dashboard for **[Grok Build](https://x.ai)** sessions: exact toke
 - **Estimate $** from published xAI rates (≤200k / >200k); **model-aware cache** (4.5 vs 4.6)
 - **Round tree** — user / system / tools / thoughts with In · Cached · Out · $ (Standard / Expert density). Recap / Compact / System ledgers right-pad like Round heads
 - **System card** — history parts (system / user info / reminders / MCP) plus one **Tool definitions + Message** bucket so `System + R1 In = context_end` (not a hardcoded 8.2k, not official `Σ uncached`)
-- **Cost chart** — composition per round (drill into calls; harness In green). Sub-agent $ stacks on the parent round (violet); drill has a dedicated bar per agent
-- **Sub-agents** — child sessions are peeled out of the parent LLM-call math, then shown as tabs + Sub Agent N rows (In / Cached / Out / $)
-- **Context over time** chart (200k rate-cliff line)
+- **Cost chart** — composition per round (drill into calls; harness In green). Sub-agent $ stacks on the parent round (violet); drill has a dedicated bar per agent. Wheel-zoom the X scale; squeeze to fit all bars
+- **Daily / Weekly / Monthly** — header scope next to Session. Histogram (hourly / 15 min / daily / weekly), timeframe or cumulative, tokens or $. Cards: Total In / Cached / Out / All. Session list for the window (click to open). No context chart
+- **Sub-agents** — child sessions are peeled out of the parent LLM-call math, then shown as tabs + Sub Agent N rows (In / Cached / Out / $). Period totals skip child dirs (parent bill already includes them)
+- **Context over time** chart (200k rate-cliff line) — Session view only
 - Header **KV** chip (warm / stale idle / miss) + context pressure bar
 - Latency & tools from `signals.json`
 
@@ -129,7 +130,7 @@ token_telemetry/                 # installable package
   tokenizer.py                   # offline token weights
   hierarchy/                     # session reconstruction (bootstrap, builder, …)
   pricing/                       # list rates + usage reconstruct
-  session/                       # discovery + live tail/monitor
+  session/                       # discovery, live tail, period aggregate
   server/                        # local HTTP API + static files
 scripts/                         # thin shims → token_telemetry.* (legacy imports)
   extract_session_events.py      # offline batch extract
@@ -137,7 +138,7 @@ scripts/                         # thin shims → token_telemetry.* (legacy impo
 dashboard/                       # zero-build UI
   index.html
   css/                           # tokens, layout, components, charts
-  js/                            # main, tree, charts, sessions, fmt
+  js/                            # main, tree, charts, sessions, period, fmt
 vendor/grok-2-tokenizer/         # offline tokenizer assets (see vendor note)
 ```
 

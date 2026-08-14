@@ -17,6 +17,7 @@ out/
 !/test/test_model_rates.py
 !/test/test_subagent_peel.py
 !/test/test_system_window.py
+!/test/test_aggregate.py
 
 # Maintainer session notes (not required for install)
 .grok/
