@@ -76,7 +76,7 @@ function activeTaskView(state) {
         turns: sub.turns || [],
         live: sub.live || {},
         official_usd: sub.official_usd,
-        estimate_usd: sub.official_usd,
+        estimate_usd: sub.estimate_usd != null ? sub.estimate_usd : sub.official_usd,
         title: sub.title || sub.label,
       };
     }
@@ -288,8 +288,10 @@ function render(state) {
     "#3d9cf0",
     view.rounds || []
   );
-  drawBars($("costChart"), view.turns || [], view.rounds || []);
-  renderRoundTree(view.rounds || []);
+  const superAgent = view.kind === "sub"
+    || (state.session_kind === "subagent");
+  drawBars($("costChart"), view.turns || [], view.rounds || [], { superAgent });
+  renderRoundTree(view.rounds || [], { superAgent });
   document.querySelectorAll("[data-sub-tab]").forEach((el) => {
     el.addEventListener("click", () => {
       const id = el.getAttribute("data-sub-tab");

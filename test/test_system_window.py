@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from token_telemetry.hierarchy.bootstrap import (
+    _classify_bootstrap_message,
+    _is_compact_continuation,
+)
 from token_telemetry.hierarchy.finalize import (
     _inject_system_message_residual,
     _merge_bootstrap_into_breakdown,
@@ -100,9 +104,10 @@ def test_peel_start_equals_system_no_out():
     r["breakdown"]["output_tokens"] = 1381
     r["step_usage"]["breakdown"] = r["breakdown"]
     _merge_bootstrap_into_breakdown(_HB(), r)
-    assert r["context_start"] == 22516 - 10536
-    assert r["context_start"] == r["system_prompt"]["tokens_in"]
-    assert r["context_start"] + 10536 == 22516
+    # Round line is ctx 0 → end (nothing cached before Call 1).
+    assert r["context_start"] == 0
+    assert r["context_delta"] == 22516
+    assert r["system_prompt"]["tokens_in"] + 10536 == 22516
 
 
 def test_overshoot_history_zero_bucket():
@@ -128,3 +133,15 @@ def test_missing_context_end_no_invent():
     assert r["system_prompt"]["tokens_in"] == 1219 + 428 + 1663 + 99
     kinds = [p["kind"] for p in r["system_prompt"]["parts"]]
     assert "tool_definitions" not in kinds
+
+
+def test_compact_glue_not_user_or_other():
+    glue = (
+        "This session is being continued from a previous conversation "
+        "that ran out of context."
+    )
+    assert _is_compact_continuation(glue)
+    assert _classify_bootstrap_message("user", glue, None) is None
+    assert _classify_bootstrap_message("user", "<user_query>hello</user_query>", None) == (
+        "user_prompt"
+    )

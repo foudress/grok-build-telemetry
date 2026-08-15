@@ -18,6 +18,9 @@ out/
 !/test/test_subagent_peel.py
 !/test/test_system_window.py
 !/test/test_aggregate.py
+!/test/test_cache_reconstruct.py
+!/test/test_cache_miss_call1.py
+!/test/test_finalize_anchor.py
 
 # Maintainer session notes (not required for install)
 .grok/

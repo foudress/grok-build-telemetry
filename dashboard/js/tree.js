@@ -19,6 +19,11 @@ import {
   eolTokenizerMeta,
 } from './fmt.js';
 
+function eventMs(e) {
+  const n = Number(e && e.agent_ms);
+  return Number.isFinite(n) ? n : 0;
+}
+
 /** Always-visible hook row (display-only — not billed model In). */
 function renderHookNode(h) {
   if (!h) return "";
@@ -381,7 +386,8 @@ function renderChildNode(c, phaseKey) {
   return "";
 }
 
-function renderRoundTree(rounds) {
+function renderRoundTree(rounds, opts) {
+  const isSuper = !!(opts && opts.superAgent);
   const root = $("roundTree");
   if (!root) return;
   if (!rounds || !rounds.length) {
@@ -414,30 +420,30 @@ function renderRoundTree(rounds) {
       ? c.tokens_removed
       : (typeof before === "number" && typeof after === "number" ? Math.max(0, before - after) : null);
 
-    // Same order as Round: In / Cached / Out / Price / delta tok / absolute tok
-    const preTok = c.pre_read_tokens ?? before;
+    // In XOR Cached (miss vs hit) + Out (compressed history). Never both.
+    const miss = !!c.pre_read_cache_miss;
+    const preTok = Number(c.pre_read_tokens ?? before) || 0;
     const preCache = Number(c.pre_read_cached_tokens) || 0;
     const preUnc = Number(c.pre_read_uncached_tokens) || 0;
     const preCacheUsd = Number(c.pre_read_cached_usd) || 0;
     const preUncUsd = Number(c.pre_read_uncached_usd) || 0;
-    const defTok = Number(c.deferred_reload_tokens) || 0;
-    const defUsd = Number(c.deferred_reload_usd) || 0;
-    // In = pre-read uncached + reload tools/system
-    const inTok = preUnc + defTok;
-    const inUsd = preUncUsd + defUsd;
-    // Cached = pre-read cached (or full pre-read if split missing)
-    let cacheTok = preCache;
-    let cacheUsd = preCacheUsd;
-    if (!(cacheTok > 0 || cacheUsd > 0) && preTok > 0 && !(preUnc > 0)) {
-      cacheTok = Number(preTok) || 0;
-      cacheUsd = Number(c.pre_read_usd) || 0;
+    const outTok = Number(c.out_tokens) || 0;
+    const outUsd = Number(c.out_usd) || 0;
+    let inTok = 0, inUsd = 0, cacheTok = 0, cacheUsd = 0;
+    if (miss || (preUnc > 0 && !(preCache > 0))) {
+      inTok = preUnc || preTok;
+      inUsd = preUncUsd || Number(c.pre_read_usd) || 0;
+    } else {
+      cacheTok = preCache || preTok;
+      cacheUsd = preCacheUsd || Number(c.pre_read_usd) || 0;
     }
     const totalUsd = c.cost_usd != null
       ? c.cost_usd
-      : (Number(c.pre_read_usd) || 0) + defUsd;
+      : (Number(c.pre_read_usd) || 0) + outUsd;
     const headParts = joinParts([
       (inTok > 0 || inUsd > 0) ? partIn(inTok, inUsd) : null,
       (cacheTok > 0 || cacheUsd > 0) ? partCached(cacheTok, cacheUsd) : null,
+      (outTok > 0 || outUsd > 0) ? partOut(outTok, outUsd) : null,
     ].filter(Boolean));
     // delta = removed; absolute = after (new context floor)
     const deltaBit = removed != null
@@ -669,7 +675,7 @@ function renderRoundTree(rounds) {
     const userBlock = `
       <details class="step user-prompt-step" data-sid="${uid}"${uOpen}>
         <summary>
-          <span class="tag user">User [${esc(String(r.index))}]</span>
+          <span class="tag user">${isSuper ? "Super Agent" : "User"} [${esc(String(r.index))}]</span>
           ${joinParts([
             partIn(userHeadIn, userHeadInUsd),
             partCached(upCache, upCacheUsd),
@@ -690,7 +696,7 @@ function renderRoundTree(rounds) {
     if (rereadTok || rereadUsd)
       attrParts.push(`Reread${AR}LLM ${partIn(rereadTok, rereadUsd)}`);
     if (bd.user_in_tokens || bd.user_in_usd)
-      attrParts.push(`User${AR}LLM ${partIn(bd.user_in_tokens, bd.user_in_usd)}`);
+      attrParts.push(`${isSuper ? "Super Agent" : "User"}${AR}LLM ${partIn(bd.user_in_tokens, bd.user_in_usd)}`);
     // Harness→LLM = tools/hooks only — subtract LLM→Harness In (Out re-entry)
     // so the same tokens are not attributed twice.
     {
@@ -779,17 +785,22 @@ function renderRoundTree(rounds) {
       const apiCost = (lineSumUsd > 0 || growthIn || cacheTok || outTokLine)
         ? lineSumUsd
         : (s.cost_of_call_usd ?? s.estimate_usd ?? se.cost_of_call_usd ?? se.estimate_usd);
-      // Δctx = window growth (end−start), floor Out+unscaled harness when stream lags.
-      // Never use Call In / warm-scaled harness (those track official uncached bill).
-      const rawDelta = (typeof s.context_start === "number" && typeof s.context_end === "number")
-        ? Math.max(0, s.context_end - s.context_start)
-        : (typeof s.context_delta === "number" ? Math.max(0, s.context_delta) : null);
+      // Δctx = caused window (next prompt − this start). Last call skipped
+      // (no harness after it). Never use Call In / warm-scaled harness.
+      const skipCtx = !!s.skip_context;
+      const ctxA = s.display_context_start ?? s.context_start;
+      const ctxB = s.display_context_end ?? s.context_end;
+      const rawDelta = (!skipCtx && typeof ctxA === "number" && typeof ctxB === "number")
+        ? Math.max(0, ctxB - ctxA)
+        : (!skipCtx && typeof s.context_delta === "number" ? Math.max(0, s.context_delta) : null);
       const outTok = Number(s.tokens_out ?? se.output_tokens) || 0;
       const poolU = Number(
         s.harness_pool_unscaled ?? se.harness_pool_unscaled ?? s.harness_pool_tokens
       ) || 0;
-      let ctxGrowth = s.context_growth_est ?? se.context_growth_est;
-      if (ctxGrowth == null || ctxGrowth === "") {
+      let ctxGrowth = skipCtx ? 0 : (s.context_growth_est ?? se.context_growth_est);
+      if (skipCtx) {
+        ctxGrowth = null;
+      } else if (ctxGrowth == null || ctxGrowth === "") {
         if (rawDelta != null && rawDelta > 0) ctxGrowth = Math.max(rawDelta, outTok);
         else ctxGrowth = (outTok + poolU) || null;
       } else {
@@ -812,32 +823,46 @@ function renderRoundTree(rounds) {
       return `<details class="step" data-sid="${sid}"${sOpen}>
         <summary>
           <span class="tag">LLM call [${s.index}]</span>
-          ${callLine || `<span class="muted">ctx ${fmtTokens(s.context_start)}${AR}${fmtTokens(s.context_end)}</span>`}
+          ${callLine || (skipCtx ? "" : `<span class="muted">ctx ${fmtTokens(ctxA)}${AR}${fmtTokens(ctxB)}</span>`)}
           ${apiCost != null ? " " + totalPrice(apiCost) : ""}
-          ${ctxGrowth != null ? `<span class="muted" title="Context window growth for this call: official-share Input after peeling sub-agent bills. Stream totalTokens is a harness estimate."> · Δctx ${fmtDelta(ctxGrowth)}</span>` : ""}
+          ${ctxGrowth != null ? `<span class="muted" title="Window after this call's harness (next LLM prompt). Last call has no harness — its context is shown on the previous call."> · Δctx ${fmtDelta(ctxGrowth)}</span>` : ""}
         </summary>
         ${compBar(s.composition, se)}
         ${children || `<div class="node muted">—</div>`}
       </details>${subCards}`;
     }).join("");
 
-    // Newest-first: put compact_before / recaps_before *after* this card so
-    // they sit between R[n] and R[n-1] (events that happened before R[n]).
-    const compactBefore = renderCompactRow(
-      r.compact_before,
-      `between Round ${Math.max(0, (r.index || 1) - 1)} and Round ${r.index}`
-    );
-    const recapsBefore = (r.recaps_before || [])
-      .map(rec => renderRecapRow(rec, `before Round ${r.index} · after previous · fork`))
-      .join("");
-    // If this is the newest round and no later round exists yet, recaps that
-    // just fired after it still live on recaps_after — show *above* the card.
+    // Newest-first: between-round events sit *after* this card (toward older).
+    // Later events first so a recap triggered before compact stays closer to
+    // the previous round, not after the compact.
+    const whereBetween = `between Round ${Math.max(0, (r.index || 1) - 1)} and Round ${r.index}`;
+    const beforeItems = [];
+    for (const rec of (r.recaps_before || []))
+      beforeItems.push({ kind: "recap", ev: rec });
+    if (r.compact_before && r.compact_before.kind === "compaction")
+      beforeItems.push({ kind: "compact", ev: r.compact_before });
+    beforeItems.sort((a, b) => eventMs(b.ev) - eventMs(a.ev));
+    const betweenBefore = beforeItems.map((it) => (
+      it.kind === "compact"
+        ? renderCompactRow(it.ev, whereBetween)
+        : renderRecapRow(it.ev, `before Round ${r.index} · after previous · fork`)
+    )).join("");
+    // Newest round: events after it still live on *_after — show *above* the card.
     const hasNewer = (rounds || []).some(x => Number(x.index) === Number(r.index) + 1);
-    const recapsAbove = !hasNewer
-      ? (r.recaps_after || [])
-          .map(rec => renderRecapRow(rec, `after Round ${r.index} · fork (no session growth)`))
-          .join("")
-      : "";
+    let recapsAbove = "";
+    if (!hasNewer) {
+      const afterItems = [];
+      for (const rec of (r.recaps_after || []))
+        afterItems.push({ kind: "recap", ev: rec });
+      if (r.compact_after && r.compact_after.kind === "compaction")
+        afterItems.push({ kind: "compact", ev: r.compact_after });
+      afterItems.sort((a, b) => eventMs(b.ev) - eventMs(a.ev));
+      recapsAbove = afterItems.map((it) => (
+        it.kind === "compact"
+          ? renderCompactRow(it.ev, `after Round ${r.index}`)
+          : renderRecapRow(it.ev, `after Round ${r.index} · fork (no session growth)`)
+      )).join("");
+    }
 
     const idleMs = r.idle_gap_ms;
     const idleLabel = fmtIdleGap(idleMs);
@@ -907,7 +932,7 @@ function renderRoundTree(rounds) {
         if (!rest.length) return "";
         return rest.map(h => renderHookNode(h)).join("");
       })()}
-    </details>${recapsBefore}${compactBefore}`;
+    </details>${betweenBefore}`;
     // recapsAbove: newest recap sits above the newest completed round (no R[n+1] yet)
     return recapsAbove + cardHtml;
   }).join("");

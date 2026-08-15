@@ -97,7 +97,10 @@ function buildCtxPoints(rounds) {
     }
     steps.forEach((s, i) => {
       const li = s.index ?? (i + 1);
-      const v = s.context_start;
+      // Last call: no harness after it — skip. Call i plots next prompt
+      // (display_context_start). Call 1 opening lives on Sys / User.
+      if (s.skip_context) return;
+      const v = s.display_context_start ?? s.context_start;
       if (v == null || Number.isNaN(v)) return;
       const se = s.estimate || {};
       // Display In = caused (tree); cache/out from call bill
@@ -115,7 +118,7 @@ function buildCtxPoints(rounds) {
         kind: "call",
         round: ri,
         call: li,
-        context_end: s.context_end,
+        context_end: s.display_context_end ?? s.context_end,
         tokens_in: tokIn,
         tokens_cached: tokCache,
         tokens_out: tokOut,
@@ -766,7 +769,7 @@ function callCostParts(step, callIndex, round) {
     if (userU > 0 || userT > 0) {
       bottomExtra.push({
         k: "user",
-        label: "User",
+        label: (window.__costChart && window.__costChart.superAgent) ? "Super Agent" : "User",
         v: userU || 0,
         tok: userT || 0,
         color: COST_COLORS.user,
@@ -1120,22 +1123,37 @@ function attachSubagentSegsToTurn(turnBar, round) {
   return turnBar;
 }
 
+function eventMs(e) {
+  const n = Number(e && e.agent_ms);
+  return Number.isFinite(n) ? n : 0;
+}
+
 function compactCostBar(c, compactIndex) {
   if (!c || c.kind !== "compaction") return null;
   const segs = [];
-  // Same order as Round stack: In / Cached / (Out n/a) — reload folds into In
+  // In XOR Cached (miss vs hit) + Out (compressed history). Never both.
+  const miss = !!c.pre_read_cache_miss;
+  const preTok = Number(c.pre_read_tokens) || Number(c.tokens_before) || 0;
   const preUnc = Number(c.pre_read_uncached_usd) || 0;
-  const preCache = Number(c.pre_read_cached_usd) || Number(c.pre_read_usd) || 0;
-  const reload = Number(c.deferred_reload_usd) || 0;
+  const preCache = Number(c.pre_read_cached_usd) || 0;
   const preUncT = Number(c.pre_read_uncached_tokens) || 0;
-  const preCacheT = Number(c.pre_read_cached_tokens) || Number(c.pre_read_tokens) || Number(c.tokens_before) || 0;
-  const reloadT = Number(c.deferred_reload_tokens) || 0;
-  const inU = preUnc + reload;
-  const inT = preUncT + reloadT;
+  const preCacheT = Number(c.pre_read_cached_tokens) || 0;
+  const outU = Number(c.out_usd) || 0;
+  const outT = Number(c.out_tokens) || 0;
+  let inU = 0, inT = 0, cacheU = 0, cacheT = 0;
+  if (miss || (preUncT > 0 && !(preCacheT > 0))) {
+    inU = preUnc || Number(c.pre_read_usd) || 0;
+    inT = preUncT || preTok;
+  } else {
+    cacheU = preCache || Number(c.pre_read_usd) || 0;
+    cacheT = preCacheT || preTok;
+  }
   if (inU > 0 || inT > 0)
     segs.push({ k: "in", label: "In", v: inU, tok: inT, color: COST_COLORS.in });
-  if (preCache > 0 || preCacheT > 0)
-    segs.push({ k: "cached", label: "Cached", v: preCache, tok: preCacheT, color: COST_COLORS.cached });
+  if (cacheU > 0 || cacheT > 0)
+    segs.push({ k: "cached", label: "Cached", v: cacheU, tok: cacheT, color: COST_COLORS.cached });
+  if (outU > 0 || outT > 0)
+    segs.push({ k: "out", label: "Out", v: outU, tok: outT, color: COST_COLORS.out });
   const total = Number(c.cost_usd) != null && Number(c.cost_usd) > 0
     ? Number(c.cost_usd)
     : segs.reduce((a, s) => a + s.v, 0);
@@ -1159,11 +1177,44 @@ function compactCostBar(c, compactIndex) {
   };
 }
 
+function recapCostBar(c, recapIndex) {
+  if (!c || c.kind !== "session_recap") return null;
+  const segs = [];
+  const inU = Number(c.prompt_in_usd) || 0;
+  const inT = Number(c.prompt_tokens) || 0;
+  const cacheU = Number(c.pre_read_cached_usd) || 0;
+  const cacheT = Number(c.context_tokens ?? c.context_cached_tokens) || 0;
+  const outU = Number(c.out_usd) || 0;
+  const outT = Number(c.out_tokens) || 0;
+  if (inU > 0 || inT > 0)
+    segs.push({ k: "in", label: "In", v: inU, tok: inT, color: COST_COLORS.in });
+  if (cacheU > 0 || cacheT > 0)
+    segs.push({ k: "cached", label: "Cached", v: cacheU, tok: cacheT, color: COST_COLORS.cached });
+  if (outU > 0 || outT > 0)
+    segs.push({ k: "out", label: "Out", v: outU, tok: outT, color: COST_COLORS.out });
+  const total = Number(c.cost_usd) != null && Number(c.cost_usd) > 0
+    ? Number(c.cost_usd)
+    : segs.reduce((a, s) => a + s.v, 0);
+  const totalTok = segs.reduce((a, s) => a + (Number(s.tok) || 0), 0);
+  if (!(total > 0) && !(totalTok > 0) && !segs.length) return null;
+  return {
+    segs: segs.filter(s => s.v > 0 || s.tok > 0),
+    total: total || 0,
+    total_tok: totalTok,
+    index: "R" + recapIndex,
+    label: "Rec" + recapIndex,
+    kind: "recap",
+    official: null,
+    estimate_usd: total,
+  };
+}
+
 const COST_Y_LEFT = 56;
 const PLOT_PAD_L = 6;
 const COST_CHART_H = 240;
 const COST_MIN_SLOT = 36;
 const COST_MAX_SLOT = 96;
+const MIN_COST_SLOTS = 8;
 
 function zoomStore() {
   if (document.body.classList.contains("scope-period")) {
@@ -1181,7 +1232,7 @@ function resetCostCanvasFit(canvas) {
 }
 
 function slotRange(viewW, barCount) {
-  const nSlots = Math.max(barCount, 5);
+  const nSlots = Math.max(barCount, MIN_COST_SLOTS);
   const plotAvail = Math.max(10, viewW - PLOT_PAD_L - 12);
   const minSlot = plotAvail / nSlots;
   return { nSlots, minSlot, maxSlot: COST_MAX_SLOT, plotAvail };
@@ -1207,8 +1258,8 @@ function layoutCostCanvas(canvas, barCount, { forceFit } = {}) {
   store.slotPx = slot;
   const w = PLOT_PAD_L + 12 + nSlots * slot;
   const overflow = w > viewW + 1;
-  if (overflow) canvas.style.width = w + "px";
-  else canvas.style.width = "100%";
+  // Never CSS-stretch a narrower bitmap — that desyncs hit-test vs bars.
+  canvas.style.width = w + "px";
   if (scroller) scroller.classList.toggle("is-overflow", overflow);
   const dpr = window.devicePixelRatio || 1;
   canvas.width = Math.max(1, Math.floor(w * dpr));
@@ -1347,10 +1398,11 @@ function eachCostYTick(yMin, max, step, unit, fn) {
   if (!seen.size) fn(yMin);
 }
 
-function drawBars(canvas, turns, rounds) {
+function drawBars(canvas, turns, rounds, opts) {
   const st = window.__costChart;
   st.turns = turns || [];
   st.rounds = rounds || [];
+  if (opts && opts.superAgent != null) st.superAgent = !!opts.superAgent;
   const tip = $("costTip");
   const backBtn = $("costDrillBack");
   const modeLabel = $("costModeLabel");
@@ -1397,41 +1449,66 @@ function drawBars(canvas, turns, rounds) {
     bars = [];
     if (sysBar) bars.push(sysBar);
 
-    // Compaction counter is session-global (C1, C2, … chronological)
+    // Compaction / recap counters are session-global (chronological)
     const sliceIdx = new Set(slice.map(t => Number(t.index)));
     let compactN = 0;
+    let recapN = 0;
     const minSlice = slice.length
       ? Math.min(...slice.map(t => Number(t.index)))
       : Infinity;
     for (const r of (st.rounds || [])) {
       if (!r || Number(r.index) >= minSlice) break;
       if (r.compact_after && r.compact_after.kind === "compaction") compactN += 1;
+      recapN += (r.recaps_after || []).length;
     }
+    const pushBetween = (items) => {
+      items.sort((a, b) => eventMs(a.ev) - eventMs(b.ev));
+      for (const it of items) {
+        if (it.kind === "compact") {
+          compactN += 1;
+          const cb = compactCostBar(it.ev, compactN);
+          if (cb) bars.push(cb);
+        } else {
+          recapN += 1;
+          const rb = recapCostBar(it.ev, recapN);
+          if (rb) bars.push(rb);
+        }
+      }
+    };
     for (const t of slice) {
       const round = findRound(st.rounds, t.index);
       const peelSystem = !!(sysBar && Number(t.index) === Number(r1 && r1.index || 1));
-      // Compact *before* this round when previous round is outside the slice
-      // (same object as previous.compact_after — avoid double-draw / double-count).
+      // Events *before* this round when previous round is outside the slice
+      // (same objects as previous.*_after — avoid double-draw).
       const prevInSlice = sliceIdx.has(Number(t.index) - 1);
-      if (!prevInSlice && round && round.compact_before && round.compact_before.kind === "compaction") {
+      if (!prevInSlice && round) {
         const prevRound = findRound(st.rounds, Number(t.index) - 1);
-        if (!(prevRound && prevRound.compact_after && prevRound.compact_after.kind === "compaction")) {
-          compactN += 1; // not already counted in the pre-slice loop
+        const before = [];
+        const prevHasCompactAfter = !!(
+          prevRound && prevRound.compact_after && prevRound.compact_after.kind === "compaction"
+        );
+        if (round.compact_before && round.compact_before.kind === "compaction" && !prevHasCompactAfter) {
+          before.push({ kind: "compact", ev: round.compact_before });
         }
-        const cbBefore = compactCostBar(round.compact_before, compactN);
-        if (cbBefore) bars.push(cbBefore);
+        const prevAfterRecaps = new Set(prevRound && prevRound.recaps_after ? prevRound.recaps_after : []);
+        for (const rec of (round.recaps_before || [])) {
+          if (!prevAfterRecaps.has(rec)) before.push({ kind: "recap", ev: rec });
+        }
+        pushBetween(before);
       }
       bars.push(attachSubagentSegsToTurn(
         turnCostParts(t, round, { detail: st.detail, peelSystem }),
         round
       ));
-      // Compact after this round (between R[n] and R[n+1])
-      const c = round && round.compact_after;
-      if (c && c.kind === "compaction") {
-        compactN += 1;
-        const cb = compactCostBar(c, compactN);
-        if (cb) bars.push(cb);
+      // Events after this round (between R[n] and R[n+1]), chronological
+      const after = [];
+      if (round && round.compact_after && round.compact_after.kind === "compaction") {
+        after.push({ kind: "compact", ev: round.compact_after });
       }
+      for (const rec of (round && round.recaps_after) || []) {
+        after.push({ kind: "recap", ev: rec });
+      }
+      pushBetween(after);
     }
   }
 
@@ -1492,8 +1569,7 @@ function drawBars(canvas, turns, rounds) {
   const left = PLOT_PAD_L, right = 12, top = 12, bottom = 28;
   const plotW = w - left - right;
   const plotH = h - top - bottom;
-  // Pad X to ≥5 slots so 1–2 early bars stay narrow; empty slots left blank
-  const MIN_COST_SLOTS = 5;
+  // Pad X to ≥8 slots so few-round sessions stay readable (not stretched).
   const nSlots = Math.max(bars.length, MIN_COST_SLOTS);
   const groupW = plotW / nSlots;
   const bw = Math.max(1, Math.min(44, groupW * (groupW < 8 ? 0.9 : groupW < 18 ? 0.72 : 0.58)));
@@ -1613,7 +1689,7 @@ function drawBars(canvas, turns, rounds) {
     const lab = (meta && meta.label) || key;
     const k = (meta && meta.k) || "";
     const fixed = [
-      "System", "User", "user", "In", "in", "Cached", "cached",
+      "System", "User", "Super Agent", "user", "In", "in", "Cached", "cached",
       "thought", "reasoning", "message", "LLM Out→In", "llm_out_in",
       "Out", "out", "Sub", "sub", "official", "in residual", "reload", "pre-read", "pre-read In",
     ];
@@ -1660,9 +1736,10 @@ function drawBars(canvas, turns, rounds) {
         ? ("LLM call " + p.index)
         : (p.kind === "system" ? "System"
           : (p.kind === "compact" ? ("Compact " + p.label)
-            : (p.kind === "subagent"
-              ? ("Sub Agent " + String(p.label || "").replace(/^S/, "") + (p.title ? " · " + p.title : ""))
-              : ("Round " + p.index))));
+            : (p.kind === "recap" ? ("Recap " + p.label)
+              : (p.kind === "subagent"
+                ? ("Sub Agent " + String(p.label || "").replace(/^S/, "") + (p.title ? " · " + p.title : ""))
+                : ("Round " + p.index)))));
       const lines = [`<b>${esc(head)}</b>`];
       if (p.kind === "compact" && (p.tokens_before != null || p.tokens_after != null)) {
         lines.push(

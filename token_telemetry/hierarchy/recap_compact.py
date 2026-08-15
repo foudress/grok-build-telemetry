@@ -193,30 +193,33 @@ def _on_compact(hb: Any, update: dict[str, Any], agent_ms: Any) -> None:
         else None
     )
 
-    # Immediate estimate: FULL pre-compact context had to be in the prompt (tokens_before).
-    # At large windows this is mostly cache hits — use cache rate as lower bound until
-    # we refine from the last call of the previous round.
+    # Default: warm compact = full window as Cached + compressed Out.
+    # _fill_compact_cost flips Cached → In on a miss and prices Out.
     pre_read_usd = None
     pre_read_cache_usd = None
+    out_usd = None
+    out_tok = after_i if isinstance(after_i, int) and after_i > 0 else 0
     if isinstance(before_i, int) and before_i > 0:
         try:
             from token_telemetry.pricing import estimate_cost_usd
 
             e = estimate_cost_usd(
                 input_tokens=before_i,
-                output_tokens=0,
+                output_tokens=int(out_tok or 0),
                 cached_read_tokens=before_i,
                 peak_context_tokens=before_i,
                 model_calls=1,
             )
             pre_read_cache_usd = float(e["cost_usd"]["cached_input"])
             pre_read_usd = pre_read_cache_usd
+            out_usd = float(e["cost_usd"]["output"])
         except Exception:
             from token_telemetry.pricing import pick_tier
 
-            rate = pick_tier(before_i)["cached_input"]
-            pre_read_cache_usd = before_i * rate / 1_000_000.0
+            t = pick_tier(before_i)
+            pre_read_cache_usd = before_i * t["cached_input"] / 1_000_000.0
             pre_read_usd = pre_read_cache_usd
+            out_usd = int(out_tok or 0) * t["output"] / 1_000_000.0
 
     compact = {
         "kind": "compaction",
@@ -237,9 +240,12 @@ def _on_compact(hb: Any, update: dict[str, Any], agent_ms: Any) -> None:
         ),
         "pre_read_uncached_usd": 0.0 if isinstance(before_i, int) else None,
         "pre_read_usd": round(pre_read_usd, 8) if pre_read_usd is not None else None,
+        "pre_read_cache_miss": False,
+        "out_tokens": int(out_tok) if out_tok else None,
+        "out_usd": round(out_usd, 8) if out_usd is not None else None,
         "pre_read_note": (
-            "Read of the FULL pre-compact context (tokens_before) — what the model "
-            "had to hold/read before compact. Refined from last call cache split when known."
+            "Read of the FULL pre-compact context (tokens_before). "
+            "Cached on hit, In on miss — never both. Out = compressed history."
         ),
         # Filled once the next round runs (tools/system rehydration → next In)
         "deferred_reload_tokens": None,
@@ -248,10 +254,12 @@ def _on_compact(hb: Any, update: dict[str, Any], agent_ms: Any) -> None:
             "Post-compact prompt reload (tools/system/summary) paid as In on "
             "the next call(s); estimated after the following round starts."
         ),
-        "cost_usd": round(pre_read_usd, 8) if pre_read_usd is not None else None,
+        "cost_usd": round(
+            (pre_read_usd or 0) + (out_usd or 0), 8
+        ) if pre_read_usd is not None or out_usd is not None else None,
         "cost_note": (
-            "Compact $ = pre-read(full ctx before) + reload tools/system. "
-            "Kept-window re-read is on the next user prompt, not here."
+            "Compact $ = (Cached hit | In miss) of tokens_before + Out "
+            "(compressed history ≈ tokens_after)."
         ),
         "summary_preview": _preview(str(update.get("summary_preview") or ""), 80),
         "agent_ms": agent_ms,
@@ -333,11 +341,10 @@ def _fill_compact_cost(hb: Any, r: dict[str, Any]) -> None:
     """
     Compact bill (between-round card):
 
-      1) pre-read of FULL context before compact (tokens_before)
-      2) deferred reload (tools/system/summary snap-back) as uncached In
+      1) pre-read of FULL context: Cached on hit, In on miss (never both)
+      2) Out = compressed history (tokens_after − reload)
 
-    Kept-window re-read (tokens_after) is NOT here — it lands on the next
-    user-prompt row. total_usd = pre_read_usd + deferred_reload_usd
+    Reload tools/system stays next-round In. total = pre_read + out.
     """
     compact = r.get("compact_before")
     if not isinstance(compact, dict) or compact.get("kind") != "compaction":
@@ -388,34 +395,28 @@ def _fill_compact_cost(hb: Any, r: dict[str, Any]) -> None:
         cc = float(e["cost_usd"]["cached_input"])
         return cu, cc, cu + cc
 
-    def _split_from_est(total: int, est: dict[str, Any]) -> tuple[int, int]:
-        """Split total tokens into (uncached, cached) using an estimate's ratio."""
-        if total <= 0:
-            return 0, 0
-        log_cache = est.get("logical_cached_tokens")
-        log_in = est.get("logical_input_tokens")
-        paid_cache = est.get("cached_read_tokens")
-        paid_in = est.get("input_tokens")
-        if isinstance(log_cache, int) and isinstance(log_in, int) and log_in > 0:
-            frac = min(1.0, max(0.0, log_cache / max(log_in, 1)))
-            c = int(round(total * frac))
-            return max(0, total - c), c
-        if isinstance(paid_cache, int) and isinstance(paid_in, int) and paid_in > 0:
-            frac = min(1.0, max(0.0, paid_cache / max(paid_in, 1)))
-            c = int(round(total * frac))
-            return max(0, total - c), c
-        # Default: treat as fully cached (lower bound for large pre-compact windows)
-        return 0, total
-
-    # --- 1) Pre-read FULL context before compact (tokens_before) ---
+    # --- 1) Pre-read FULL context: Cached XOR In (never both) ---
+    # Last-call display cache is 0 by design — do not use that ratio.
+    # Compact is a warm re-read unless the previous round actually missed.
     pre_tok = max(0, before_i or 0)
+    miss = False
+    if isinstance(prev, dict):
+        up = prev.get("user_prompt") if isinstance(prev.get("user_prompt"), dict) else {}
+        bd_prev = prev.get("breakdown") if isinstance(prev.get("breakdown"), dict) else {}
+        miss = bool(
+            prev.get("session_restart")
+            or prev.get("cache_miss")
+            or prev.get("context_reread")
+            or up.get("session_restart")
+            or up.get("cache_miss")
+            or up.get("context_reread")
+            or bd_prev.get("context_reread")
+        )
     if pre_tok > 0:
-        prev_est: dict[str, Any] = {}
-        if prev:
-            psteps = prev.get("model_steps") or []
-            if psteps:
-                prev_est = (psteps[-1].get("estimate") or {}) if isinstance(psteps[-1], dict) else {}
-        pre_unc, pre_cache = _split_from_est(pre_tok, prev_est if isinstance(prev_est, dict) else {})
+        if miss:
+            pre_unc, pre_cache = pre_tok, 0
+        else:
+            pre_unc, pre_cache = 0, pre_tok
         u_usd, c_usd, pre_usd = _price(pre_unc, pre_cache, pre_tok)
         compact["pre_read_tokens"] = pre_tok
         compact["pre_read_uncached_tokens"] = pre_unc
@@ -423,13 +424,16 @@ def _fill_compact_cost(hb: Any, r: dict[str, Any]) -> None:
         compact["pre_read_uncached_usd"] = round(u_usd, 8)
         compact["pre_read_cached_usd"] = round(c_usd, 8)
         compact["pre_read_usd"] = round(pre_usd, 8)
+        compact["pre_read_cache_miss"] = bool(miss)
         compact["pre_read_note"] = (
-            "Read of the FULL pre-compact context (tokens_before) — the window "
-            "the model had to hold before compact fired."
+            "Cache miss: full tokens_before billed as In."
+            if miss
+            else "Cache hit: full tokens_before billed as Cached."
         )
     else:
         compact["pre_read_tokens"] = 0
         compact["pre_read_usd"] = 0.0
+        compact["pre_read_cache_miss"] = bool(miss)
 
     tier_after = max(0, after_i or 0) or pre_tok or 1
 
@@ -537,11 +541,39 @@ def _fill_compact_cost(hb: Any, r: dict[str, Any]) -> None:
         compact.setdefault("deferred_reload_tokens", None)
         compact.setdefault("deferred_reload_usd", None)
 
-    # --- Total compact cost (no kept re-read — that is next user prompt) ---
+    # --- 3) Out = compressed history the compact LLM wrote ---
+    # tokens_after is the new window (≈ summary + remaining system/tools).
+    # Reload is next-round In, not compact Out — subtract when known.
+    reload_tok = int(compact.get("deferred_reload_tokens") or 0)
+    out_tok = 0
+    if isinstance(after_i, int) and after_i > 0:
+        out_tok = max(1, after_i - max(0, reload_tok))
+    if out_tok > 0:
+        peak_out = max(after_i or out_tok, pre_tok, 1)
+        if estimate_cost_usd is None:
+            hi = peak_out > 200_000
+            ro = 12.0 if hi else 6.0
+            o_usd = out_tok * ro / 1e6
+        else:
+            e_out = estimate_cost_usd(
+                input_tokens=0,
+                output_tokens=int(out_tok),
+                cached_read_tokens=0,
+                peak_context_tokens=peak_out,
+                model_calls=1,
+            )
+            o_usd = float(e_out["cost_usd"]["output"])
+        compact["out_tokens"] = int(out_tok)
+        compact["out_usd"] = round(o_usd, 8)
+    else:
+        compact.setdefault("out_tokens", None)
+        compact.setdefault("out_usd", None)
+
+    # --- Total: XOR pre-read + compressed Out (reload stays next-round In) ---
     pre_usd = float(compact.get("pre_read_usd") or 0)
-    def_usd = float(compact.get("deferred_reload_usd") or 0)
-    compact["cost_usd"] = round(pre_usd + def_usd, 8)
+    out_usd = float(compact.get("out_usd") or 0)
+    compact["cost_usd"] = round(pre_usd + out_usd, 8)
     compact["cost_note"] = (
-        "Compact $ = pre-read(full ctx before) + reload tools/system. "
-        "Kept-window re-read appears on the next user prompt."
+        "Compact $ = (Cached hit | In miss) of tokens_before + Out "
+        "(compressed history). Reload tools/system is next-round In."
     )

@@ -13,11 +13,13 @@ Live companion dashboard for **[Grok Build](https://x.ai)** sessions: exact toke
 - **Context size** live (`_meta.totalTokens` + `signals.json`)
 - **Official $** from `costUsdTicks` (1 USD = 10¹⁰ ticks)
 - **Estimate $** from published xAI rates (≤200k / >200k); **model-aware cache** (4.5 vs 4.6)
-- **Round tree** — user / system / tools / thoughts with In · Cached · Out · $ (Standard / Expert density). Recap / Compact / System ledgers right-pad like Round heads
+- **Round tree** — user / system / tools / thoughts with In · Cached · Out · $ (Standard / Expert density). Recap / Compact / System ledgers right-pad like Round heads. Recaps and compacts sit in trigger order (`agent_ms`)
 - **System card** — history parts (system / user info / reminders / MCP) plus one **Tool definitions + Message** bucket so `System + R1 In = context_end` (not a hardcoded 8.2k, not official `Σ uncached`)
-- **Cost chart** — composition per round (drill into calls; harness In green). Sub-agent $ stacks on the parent round (violet); drill has a dedicated bar per agent. Wheel-zoom the X scale; squeeze to fit all bars
+- **Per-call cache** — last LLM call Cached = 0 (no harness after it). R1 ctx line is `0 → end`. R1 official Cached is shared across every call except last (Call 1 = System + User)
+- **Compact / Recap** — compact is Cached **or** In (miss) plus compressed **Out**; recaps and compacts keep trigger order. Compact continuation glue is not treated as the first user prompt
+- **Cost chart** — composition per round (drill into calls; harness In green). Sub-agent $ stacks on the parent round (violet); drill has a dedicated bar per agent. Wheel-zoom the X scale; minimum 8 slots so few-round sessions are not stretched
 - **Daily / Weekly / Monthly** — header scope next to Session. Histogram (hourly / 15 min / daily / weekly), timeframe or cumulative, tokens or $. Cards: Total In / Cached / Out / All. Session list for the window (click to open). No context chart
-- **Sub-agents** — child sessions are peeled out of the parent LLM-call math, then shown as tabs + Sub Agent N rows (In / Cached / Out / $). Period totals skip child dirs (parent bill already includes them)
+- **Sub-agents** — child sessions are peeled out of the parent LLM-call math, then shown as tabs + Sub Agent N rows (In / Cached / Out / $). First-round prompt is **Super Agent** (not User). Period totals skip child dirs (parent bill already includes them)
 - **Context over time** chart (200k rate-cliff line) — Session view only
 - Header **KV** chip (warm / stale idle / miss) + context pressure bar
 - Latency & tools from `signals.json`
@@ -78,7 +80,8 @@ List rates (docs.x.ai). Session model is read from `signals.modelsUsed` / `_meta
 - `$ ≈ uncached×input + cache×cache_rate + output×out`
 - **Tier** is per LLM call from `context_start` (not multi-call sum)
 - Reasoning is **not** billed on top of output (`totalTokens ≈ input+output` in logs)
-- Official server `$` (ticks) may differ slightly; both are shown
+- Attribution Out: `Reasoning Enc + LLM→Harness + LLM→User = official Out` (Thought TokZ is a summary line; leftover Out is inside Enc)
+- Official server `$` is `costUsdTicks / 10¹⁰`. List-rate estimate can diverge when the harness stamps a different internal scale; both cards are shown
 
 ## Data source
 

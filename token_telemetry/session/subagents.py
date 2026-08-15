@@ -144,6 +144,16 @@ def empty_usage() -> dict[str, int]:
     return {k: 0 for k in _USAGE_KEYS}
 
 
+def child_tier_context_tokens(usage: Optional[dict[str, Any]]) -> int:
+    """Single-prompt context for the ≤/>200k tier (never lifetime sums)."""
+    u = usage if isinstance(usage, dict) else {}
+    inn = _int(u.get("inputTokens") or u.get("input_tokens"))
+    calls = _int(u.get("modelCalls") or u.get("model_calls"))
+    if calls > 1:
+        return inn // max(1, calls)
+    return inn
+
+
 def price_child_usage(usage: Optional[dict[str, Any]]) -> dict[str, Any]:
     """In / Cached / Out tokens + list-rate $ for a child session bill."""
     u = usage if isinstance(usage, dict) else {}
@@ -155,8 +165,9 @@ def price_child_usage(usage: Optional[dict[str, Any]]) -> dict[str, Any]:
     unc = max(0, inn - cache)
     ticks = _int(u.get("costUsdTicks") or u.get("cost_usd_ticks"))
     official = ticks_to_usd(ticks) if ticks else None
-    peak = max(inn, _int(u.get("totalTokens") or u.get("total_tokens")), 0)
-    est = estimate_from_usage(u, peak_context_tokens=peak or None)
+    # inputTokens / totalTokens are API SUMs — do not use them as peak.
+    tier_ctx = child_tier_context_tokens(u)
+    est = estimate_from_usage(u, peak_context_tokens=tier_ctx or None)
     parts = est.get("cost_usd") or {}
     cin = float(parts.get("uncached_input") or 0)
     ccache = float(parts.get("cached_input") or 0)
@@ -177,6 +188,7 @@ def price_child_usage(usage: Optional[dict[str, Any]]) -> dict[str, Any]:
         "cost_out_usd": cout,
         "estimate_usd": est_tot,
         "official_usd": official if official is not None else est_tot,
+        "context_tokens_for_tier": tier_ctx,
     }
 
 
@@ -198,14 +210,63 @@ def sub_usage(base: dict[str, Any], peel: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def load_session_official_usage(session_dir: Optional[Path]) -> dict[str, int]:
-    """Sum every turn_completed.usage in a session's updates.jsonl."""
+def _usage_cache_key(session_dir: Path, cache_key: Optional[str] = None) -> str:
+    if cache_key:
+        return str(cache_key)
+    return str(session_dir)
+
+
+def _updates_jsonl_stat(path: Path) -> Optional[tuple[float, int]]:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (float(st.st_mtime), int(st.st_size))
+
+
+def _cache_usage_hit(
+    entry: Any, mtime: float, size: int
+) -> Optional[dict[str, int]]:
+    if not isinstance(entry, dict):
+        return None
+    if "usage" not in entry:
+        return None
+    if entry.get("mtime") != mtime or entry.get("size") != size:
+        return None
+    usage = entry.get("usage")
+    return usage if isinstance(usage, dict) else None
+
+
+def load_session_official_usage(
+    session_dir: Optional[Path],
+    cache: Optional[dict[str, Any]] = None,
+    *,
+    cache_key: Optional[str] = None,
+) -> dict[str, int]:
+    """Sum every turn_completed.usage in a session's updates.jsonl.
+
+    ``cache`` (if given) is keyed by ``str(session_dir)`` or ``cache_key``
+    (typically the session uid). Entries are
+    ``{"usage": acc, "mtime": float, "size": int}``. The file is re-read
+    only when mtime or size changed. Missing files are not stored, so a
+    later-created ``updates.jsonl`` is not stuck at an empty peel.
+    """
     acc = empty_usage()
     if session_dir is None:
         return acc
-    p = Path(session_dir) / "updates.jsonl"
+    root = Path(session_dir)
+    p = root / "updates.jsonl"
     if not p.is_file():
         return acc
+    stat = _updates_jsonl_stat(p)
+    if stat is None:
+        return acc
+    mtime, size = stat
+    key = _usage_cache_key(root, cache_key)
+    if cache is not None:
+        hit = _cache_usage_hit(cache.get(key), mtime, size)
+        if hit is not None:
+            return hit
     try:
         raw = p.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -221,15 +282,58 @@ def load_session_official_usage(session_dir: Optional[Path]) -> dict[str, int]:
         if upd.get("sessionUpdate") != "turn_completed":
             continue
         add_usage(acc, upd.get("usage") or {})
+    if cache is not None:
+        cache[key] = {"usage": acc, "mtime": mtime, "size": size}
     return acc
 
 
 def sibling_session_dir(parent_dir: Optional[Path], session_id: str) -> Optional[Path]:
-    if parent_dir is None or not session_id:
+    """Resolve a child session dir.
+
+    Grok writes each cwd under a different folder
+    (``~/.grok/sessions/<encoded-cwd>/<id>``). A parent in ``C:\\Users\\…``
+    can spawn children whose cwd is a project path — they are *not* next
+    to the parent. Search the parent's sibling first, then every cwd
+    folder under the sessions root.
+    """
+    if not session_id:
         return None
-    cand = Path(parent_dir).parent / session_id
-    if cand.is_dir():
-        return cand
+    sid = str(session_id).strip()
+    if not sid:
+        return None
+
+    def _ok(p: Path) -> bool:
+        return p.is_dir() and (p / "updates.jsonl").is_file()
+
+    if parent_dir is not None:
+        cand = Path(parent_dir).parent / sid
+        if _ok(cand):
+            return cand
+        # Encoded-cwd folder itself named like the id (rare)
+        named = Path(parent_dir).parent / sid
+        if _ok(named):
+            return named
+
+    try:
+        from token_telemetry.session.discover import SESSIONS_ROOT
+    except ImportError:
+        SESSIONS_ROOT = Path.home() / ".grok" / "sessions"
+    root = SESSIONS_ROOT
+    if not root.is_dir():
+        return None
+    try:
+        kids = list(root.iterdir())
+    except OSError:
+        return None
+    sid_l = sid.lower()
+    for folder in kids:
+        if not folder.is_dir():
+            continue
+        cand = folder / sid
+        if _ok(cand):
+            return cand
+        if folder.name.lower() == sid_l and _ok(folder):
+            return folder
     return None
 
 
@@ -270,15 +374,62 @@ def collect_child_ids_from_round(round_: dict[str, Any]) -> list[str]:
     return out
 
 
+def child_ids_to_peel(round_: dict[str, Any]) -> list[str]:
+    """Ids billed on this parent wait-round (get_command only).
+
+    Spawn-only rounds return [] — do not peel lifetime child usage before
+    the parent turn that includes the child's official bill.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def _add(uid: Any) -> None:
+        if not uid:
+            return
+        s = str(uid).strip().lower()
+        if not UUID_RE.fullmatch(s) or s in seen:
+            return
+        seen.add(s)
+        out.append(s)
+
+    for step in round_.get("model_steps") or []:
+        if not isinstance(step, dict):
+            continue
+        for t in step.get("tools") or []:
+            if not isinstance(t, dict):
+                continue
+            name = str(t.get("name") or "")
+            if name != "get_command_or_subagent_output":
+                continue
+            _add(t.get("subagent_id"))
+            for uid in t.get("subagent_ids") or []:
+                _add(uid)
+            for uid in extract_task_ids(t.get("raw_input") or t.get("rawInput")):
+                _add(uid)
+            for uid in extract_ids_from_text(
+                t.get("result_preview"),
+                t.get("title"),
+            ):
+                _add(uid)
+    return out
+
+
 def peel_round_usage(
     usage: Optional[dict[str, Any]],
     *,
     parent_dir: Optional[Path],
     child_ids: Iterable[str],
-    cache: Optional[dict[str, dict[str, int]]] = None,
+    cache: Optional[dict[str, Any]] = None,
+    already_peeled: Optional[dict[str, dict]] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """
     Return (peeled_usage, peel_meta).
+
+    Subtract only the increment since ``already_peeled[uid]`` (lifetime
+    snapshot from an earlier parent wait-round). After a peel, the caller
+    should record ``already_peeled[uid] = current_child_usage``.
+
+    ``cache`` is mtime-aware (see ``load_session_official_usage``).
 
     ``peel_meta`` lists each child and the subtracted counters. Empty peel
     leaves usage unchanged.
@@ -287,15 +438,22 @@ def peel_round_usage(
     peel = empty_usage()
     children: list[dict[str, Any]] = []
     for uid in child_ids:
-        if cache is not None and uid in cache:
-            cu = cache[uid]
-        else:
-            d = sibling_session_dir(parent_dir, uid)
-            cu = load_session_official_usage(d)
-            if cache is not None:
-                cache[uid] = cu
+        d = sibling_session_dir(parent_dir, uid)
+        cu = load_session_official_usage(d, cache=cache, cache_key=str(uid))
+        prior = empty_usage()
+        if already_peeled is not None:
+            prev = already_peeled.get(uid)
+            if isinstance(prev, dict):
+                if isinstance(prev.get("usage"), dict) and (
+                    "mtime" in prev or "size" in prev
+                ):
+                    prior = prev["usage"]
+                else:
+                    prior = prev
+            already_peeled[uid] = dict(cu)
+        delta = sub_usage(cu, prior)
         priced = price_child_usage(cu)
-        if _int(cu.get("inputTokens")) <= 0 and _int(cu.get("modelCalls")) <= 0:
+        if _int(delta.get("inputTokens")) <= 0 and _int(delta.get("modelCalls")) <= 0:
             children.append(
                 {
                     "session_id": uid,
@@ -305,8 +463,8 @@ def peel_round_usage(
                 }
             )
             continue
-        add_usage(peel, cu)
-        summary = read_session_summary(sibling_session_dir(parent_dir, uid))
+        add_usage(peel, delta)
+        summary = read_session_summary(d)
         children.append(
             {
                 "session_id": uid,

@@ -20,6 +20,7 @@ from token_telemetry.tokenizer import (
 )
 
 from token_telemetry.hierarchy.bootstrap import (
+    _is_compact_continuation,
     inject_tool_definitions_into_bootstrap,
     load_chat_history_reasonings,
     load_chat_history_tool_results,
@@ -28,6 +29,65 @@ from token_telemetry.hierarchy.bootstrap import (
 )
 from token_telemetry.hierarchy.compact_out import compact_round_inplace
 from token_telemetry.hierarchy.tools_meta import _tool_seq_from_id
+
+
+_DROP_SYS_PARTS = frozenset(
+    {"message", "hooks", "tool_definitions", "tool_defs_message"}
+)
+
+
+def _prefer_real_user_preview(*cands: Any) -> str:
+    """Keep the live user query; never show compact continuation glue."""
+    kept: list[str] = []
+    for c in cands:
+        s = str(c or "").strip()
+        if not s or _is_compact_continuation(s):
+            continue
+        kept.append(s)
+    return kept[0] if kept else ""
+
+
+def _bootstrap_hist_tokens(boot: dict[str, Any]) -> int:
+    """System-card history tokens (exclude tool_definitions / message / hooks)."""
+    return sum(
+        int(p.get("tokens") or 0)
+        for p in (boot.get("parts") or [])
+        if isinstance(p, dict) and p.get("kind") not in _DROP_SYS_PARTS
+    )
+
+
+def _estimate_tooldef_message_bucket(
+    r: dict[str, Any],
+    boot: dict[str, Any],
+    steps: list[dict[str, Any]],
+) -> int:
+    """Call-1 reconstruct bump: context_end − user − harness − history."""
+    hist = _bootstrap_hist_tokens(boot)
+    try:
+        user = int(boot.get("user_tokens") or 0)
+    except (TypeError, ValueError):
+        user = 0
+    harness_est = sum(
+        int(s.get("harness_pool_tokens") or 0)
+        for s in (steps or [])
+        if isinstance(s, dict)
+    )
+    end = r.get("context_end")
+    if isinstance(end, int) and end > 0:
+        return max(0, int(end) - int(user) - int(harness_est) - int(hist))
+    return 0
+
+
+def _stamp_stream_window(step: dict[str, Any]) -> None:
+    """Save harness snaps before reconstruct / F bump. Never overwrite."""
+    if not isinstance(step, dict):
+        return
+    cs = step.get("context_start")
+    ce = step.get("context_end")
+    if isinstance(cs, int) and step.get("stream_context_start") is None:
+        step["stream_context_start"] = cs
+    if isinstance(ce, int) and step.get("stream_context_end") is None:
+        step["stream_context_end"] = ce
 
 
 def _finalize_round(hb: Any, r: dict[str, Any]) -> None:
@@ -96,57 +156,43 @@ def _finalize_round(hb: Any, r: dict[str, Any]) -> None:
 
     # Session bootstrap (first round only): System card + full user prompt
     # from chat_history (user_query + skill_information), not stream chars.
-    # Tool definitions (API tools channel, ~8.2k) are absent from history —
-    # inject into System and bump call-1 context_start so R1 cache/input fit.
+    # Silent ToolDef+Message is the window remainder (not a hardcoded 8.2k).
+    # Bump call-1 stream_context_start by that bucket for reconstruct weights;
+    # keep the raw harness snap in stream_context_raw for display.
     is_first = prior is None and len(hb.rounds) == 0
     if is_first and isinstance(first_cs, int) and first_cs > 0:
-        stream_cs = int(first_cs)
-        # Already applied on a prior finalize of the same live snapshot?
         s0 = kept_steps[0] if kept_steps else None
-        already = (
-            isinstance(s0, dict)
-            and isinstance(s0.get("tool_definitions_tokens"), int)
-            and s0.get("tool_definitions_tokens", 0) > 0
-        )
-        if already and isinstance(s0.get("stream_context_start"), int):
-            stream_cs = int(s0["stream_context_start"])
-            tool_defs = {
-                "kind": "tool_definitions",
-                "tokens": int(s0["tool_definitions_tokens"]),
-                "count": int(s0.get("tool_definitions_count") or 0),
-                "source": s0.get("tool_definitions_source") or "step",
-            }
-        else:
-            tool_defs = resolve_tool_definitions(hb._session_dir)
-            tool_tok = int(tool_defs.get("tokens") or 0)
-            if tool_tok > 0 and isinstance(s0, dict):
+        stream_cs = int(first_cs)
+        if isinstance(s0, dict) and isinstance(s0.get("stream_context_raw"), int):
+            stream_cs = int(s0["stream_context_raw"])
+        if isinstance(s0, dict):
+            s0["stream_context_raw"] = stream_cs
+            if s0.get("stream_context_start") is None:
                 s0["stream_context_start"] = stream_cs
-                s0["context_start"] = stream_cs + tool_tok
-                s0["tool_definitions_tokens"] = tool_tok
-                s0["tool_definitions_count"] = int(tool_defs.get("count") or 0)
-                s0["tool_definitions_source"] = tool_defs.get("source")
-                # Round-level start often mirrors first stream snap
-                if r.get("context_start") == stream_cs:
-                    r["context_start"] = stream_cs + tool_tok
-                first_cs = stream_cs + tool_tok
-                # Recompute round delta with corrected start
-                end = r.get("context_end")
-                if isinstance(end, int):
-                    r["context_delta"] = end - int(r.get("context_start") or first_cs)
-            else:
-                tool_tok = 0
 
-        # Scale history messages to *stream* start only (no tools in history)
+        tool_defs = resolve_tool_definitions(hb._session_dir)
+        # Scale history messages to *raw* stream start only (no tools in history)
         boot = parse_session_bootstrap(
             hb._session_dir,
             target_tokens=stream_cs,
             hooks=hb._bootstrap_hooks,
         )
         boot = inject_tool_definitions_into_bootstrap(boot, tool_defs)
+        bucket = _estimate_tooldef_message_bucket(r, boot, kept_steps)
+        if isinstance(s0, dict):
+            s0["stream_context_raw"] = stream_cs
+            s0["stream_context_start"] = stream_cs + bucket
+            s0["tool_definitions_tokens"] = bucket
+            s0["tool_definitions_count"] = int(tool_defs.get("count") or 0)
+            s0["tool_definitions_source"] = tool_defs.get("source")
+            # Display window stays on the raw harness snap
+            s0["context_start"] = stream_cs
+        first_cs = stream_cs
+
         hb._session_bootstrap = boot
         r["session_bootstrap"] = boot
         r["tool_definitions"] = {
-            "tokens": int(tool_defs.get("tokens") or 0),
+            "tokens": int(bucket),
             "count": int(tool_defs.get("count") or 0),
             "source": tool_defs.get("source"),
         }
@@ -169,13 +215,13 @@ def _finalize_round(hb: Any, r: dict[str, Any]) -> None:
         true_first = (
             int(kept_steps[0]["context_start"])
             if kept_steps and isinstance(kept_steps[0].get("context_start"), int)
-            else stream_cs + int(tool_defs.get("tokens") or 0)
+            else stream_cs
         )
         r["user_prompt"] = {
             "kind": "user_prompt",
-            "preview": boot.get("user_preview")
-            or r.get("user_preview")
-            or "",
+            "preview": _prefer_real_user_preview(
+                r.get("user_preview"), boot.get("user_preview")
+            ),
             "chars": int(boot.get("user_chars") or user_chars),
             "prior_context": None,
             "context_at_first_call": true_first,
@@ -189,8 +235,8 @@ def _finalize_round(hb: Any, r: dict[str, Any]) -> None:
             "note": (
                 "Prompt index 0: <user_query> + <skill_information> "
                 "(full skill load), sized from chat_history JSON. "
-                "True first prompt also includes silent tool definitions "
-                f"({int(tool_defs.get('tokens') or 0)} tok)."
+                "True first prompt also includes silent ToolDef+Message "
+                f"({int(bucket)} tok window remainder)."
             ),
         }
     else:
@@ -231,10 +277,6 @@ def _finalize_round(hb: Any, r: dict[str, Any]) -> None:
         hb._apply_session_restart_cache_miss(r)
         hb._attach_prev_llm_answer(r)
         hb._merge_bootstrap_into_breakdown(r)
-
-_DROP_SYS_PARTS = frozenset(
-    {"message", "hooks", "tool_definitions", "tool_defs_message"}
-)
 
 
 def _r1_tree_in_tokens(r: dict[str, Any]) -> int:
@@ -402,16 +444,13 @@ def _merge_bootstrap_into_breakdown(hb: Any, r: dict[str, Any]) -> None:
         bd["tree_in_tokens"] = int(user_tok) + harness_tok
         bd["tree_in_usd"] = float(user_usd) + harness_usd
     if cold:
-        # R1: System + R1 In = context_end. Last LLM Out is next-round In
-        # (already inside later-call In). Leave model_steps[*].context_start
-        # alone (cache reconstruct).
+        # R1 window starts at 0 (no prior call). System lives on its own card.
+        # Do not peel context_start to System size — that hid ctx 0→end.
         end = r.get("context_end")
-        tree = bd.get("tree_in_tokens")
-        if isinstance(end, int) and isinstance(tree, int):
-            peeled = max(0, int(end) - int(tree))
-            r["context_start"] = peeled
-            r["context_delta"] = int(end) - peeled
-            bd["context_start_peeled_system"] = True
+        r["context_start"] = 0
+        if isinstance(end, int):
+            r["context_delta"] = int(end)
+        bd["context_start_peeled_system"] = False
         # R1 white total = tree In + Cached + Out (System has its own card).
         # Do not keep full API bill (System + round) on estimate_usd.
         api_tot = float(
@@ -436,6 +475,11 @@ def _merge_bootstrap_into_breakdown(hb: Any, r: dict[str, Any]) -> None:
         r["estimate_usd"] = round_tot
         bd["total_usd"] = round_tot
         bd["round_total_peeled_system"] = True
+        # Session KPI = System card + peeled R1 (no System twice, no missing System).
+        sys_usd = float(bd.get("system_in_usd") or 0)
+        if isinstance(sys_p, dict):
+            sys_usd = float(sys_p.get("cost_in_usd") or sys_usd or 0)
+        bd["api_total_usd"] = float(sys_usd) + float(round_tot)
     r["breakdown"] = bd
     r["tree_in_tokens"] = bd.get("tree_in_tokens")
     r["cost_tree_in_usd"] = bd.get("tree_in_usd")
@@ -572,9 +616,9 @@ def _enrich_session_thoughts(hb: Any) -> None:
     Map chat_history reasoning items (encrypted_content + summary) onto
     model_steps across the whole session.
 
-    chat_history often has fewer reasoning rows than stream model_steps
-    (over-split streams). Spread reasonings evenly so late rounds still get
-    encrypted_chars for the Reasoning UI line.
+    chat_history items map 1:1 onto model_steps in order. Extra rows merge
+    into the last step. Reconstruct still splits official Enc residual
+    across calls that thought when a stamp is missing.
     """
     if not hb._session_dir:
         return
@@ -601,25 +645,20 @@ def _enrich_session_thoughts(hb: Any) -> None:
         s["thought_full_json_chars"] = 0
 
     r_n, s_n = len(reasonings), len(steps_flat)
-    # Unique step indices for each reasoning (spread when s_n > r_n)
-    targets: list[int] = []
-    used: set[int] = set()
-    for i in range(r_n):
-        if r_n >= s_n:
-            idx = min(i, s_n - 1)
+    # 1:1 chronological. Extra reasonings merge into the last step.
+    # Reconstruct still splits official Enc residual by thought when a
+    # step has no history stamp — do not even-spread (that skips calls).
+    for i, rs in enumerate(reasonings):
+        if i < s_n:
+            hb._stamp_step_reasoning(steps_flat[i], rs)
         else:
-            idx = int(i * s_n / r_n)
-        while idx in used and idx < s_n - 1:
-            idx += 1
-        if idx in used:
-            break
-        used.add(idx)
-        targets.append(idx)
-
-    for i, idx in enumerate(targets):
-        if i >= r_n or idx >= s_n:
-            break
-        hb._stamp_step_reasoning(steps_flat[idx], reasonings[i])
+            last = steps_flat[-1]
+            last["thought_encrypted_chars"] = int(
+                last.get("thought_encrypted_chars") or 0
+            ) + int(rs.get("encrypted_chars") or 0)
+            last["thought_encrypted_tokens"] = int(
+                last.get("thought_encrypted_tokens") or 0
+            ) + int(rs.get("encrypted_tokens") or 0)
 
 def _patch_reasoning_chars_on_trees(hb: Any) -> None:
     """Push step thought_encrypted/summary chars+TokZ onto existing LLM children."""
@@ -748,13 +787,21 @@ def _price_bootstrap_prompts(hb: Any, r: dict[str, Any]) -> None:
             hb._session_bootstrap["priced"] = True
         return
 
-    # Later rounds: user uncached (new) + prior cache
+    # Later rounds: user uncached (new) + continuity cache.
+    # Prefer reconstruct's user_cache_share so user + Σ call cache == official.
     user_log = int(up.get("uncached_est") or up.get("tokens_in") or 0)
     try:
         cache_log = int(up.get("cached_est") or up.get("tokens_cached") or 0)
     except (TypeError, ValueError):
         cache_log = 0
-    if isinstance(up.get("prior_context"), int) and cache_log <= 0:
+    bd0 = r.get("breakdown") if isinstance(r.get("breakdown"), dict) else {}
+    try:
+        share = int(bd0.get("user_cache_share_tokens") or 0)
+    except (TypeError, ValueError):
+        share = 0
+    if share > 0:
+        cache_log = share
+    elif isinstance(up.get("prior_context"), int) and cache_log <= 0:
         cache_log = int(up["prior_context"] or 0)
     tier_ctx = int(
         tier_ctx
@@ -807,6 +854,7 @@ def _price_bootstrap_prompts(hb: Any, r: dict[str, Any]) -> None:
 def _finalize_step(hb: Any, step: dict[str, Any]) -> None:
     s0 = step.get("context_start")
     s1 = step.get("context_end")
+    _stamp_stream_window(step)
     if isinstance(s0, int) and isinstance(s1, int):
         # Compact / totalTokens noise can briefly drop end below start —
         # never show a negative window growth on the call line.
@@ -887,49 +935,36 @@ def _finalize_step(hb: Any, step: dict[str, Any]) -> None:
     tt_tools_sum = sum(int(t.get("tt_delta_observed") or 0) for t in cleaned)
     # Tokenizer result weights (history when stamped; else stream envelope)
     content_sum = sum(int(t.get("result_tokens_est") or 0) for t in cleaned)
-    # Weight signal: max(content, observed tt) so short "ok" results don't zero out
-    # tools that clearly moved the counter (common for search_replace).
-    weight_sum = sum(
-        max(int(t.get("result_tokens_est") or 0), int(t.get("tt_delta_observed") or 0))
-        for t in cleaned
-    )
 
-    # --- Attribute harness growth per tool (avoid last-tool steal + late=last tool) ---
-    ambiguous = False
+    # --- One tool-In estimator: tokenizer result weights + late into tools ---
+    ambiguous = len(cleaned) > 1
     attribution = "token_counter"
-    late_display = late
     late_absorbed = 0
+
+    def _raw_tool_weight(t: dict[str, Any]) -> int:
+        # ch_result_tokens preferred; stamp already copied into result_tokens_est
+        content = max(
+            0,
+            int(t.get("ch_result_tokens") or 0)
+            or int(t.get("result_tokens_est") or 0),
+        )
+        tt = max(0, int(t.get("tt_delta_observed") or 0))
+        # Status-only / empty payload but counter moved → tt is the signal
+        if content < 48 and tt > max(content * 3, 32):
+            return tt
+        if content > 0:
+            return content
+        return tt
 
     def _weights_for(tools: list[dict[str, Any]]) -> list[int]:
         """
-        Split harness pool by **tokenizer result tokens** (not raw chars, not args).
+        Split harness pool by tokenizer result tokens (not args).
 
-        Prefer result_tokens_est after chat_history stamp (Grok-2 BPE on
-        tool_result.content). Stream envelope is fallback when history is
-        missing (in-flight). Do NOT use max(content, tt): serial totalTokens
-        lag parks most Δ on the first tool. Do NOT use arg_chars/arg_tokens
-        (tool request Out, not harness In).
-
-        Fallback to tt only for status-only tools ("ok" / tiny payload) that
-        still moved the counter (search_replace, etc.).
+        Prefer ch_result_tokens / result_tokens_est. Fallback to tt only
+        for status-only tools ("ok" / tiny payload) that still moved the
+        counter (search_replace, etc.). Never use arg_chars/arg_tokens.
         """
-        ws: list[int] = []
-        for t in tools:
-            # ch_result_tokens preferred; stamp already copied into result_tokens_est
-            content = max(
-                0,
-                int(t.get("ch_result_tokens") or 0)
-                or int(t.get("result_tokens_est") or 0),
-            )
-            tt = max(0, int(t.get("tt_delta_observed") or 0))
-            # Status-only / empty payload but counter moved → tt is the signal
-            if content < 48 and tt > max(content * 3, 32):
-                w = tt
-            elif content > 0:
-                w = content
-            else:
-                w = tt
-            ws.append(max(0, w))
+        ws = [_raw_tool_weight(t) for t in tools]
         if sum(ws) <= 0:
             return [1] * len(tools)
         return [max(1, w) if w > 0 else 0 for w in ws]
@@ -941,7 +976,6 @@ def _finalize_step(hb: Any, step: dict[str, Any]) -> None:
                 t["attribution"] = attr
             return
         weights = _weights_for(tools)
-        # If some tools have 0 weight, give residual only to weighted ones
         wsum = sum(weights) or 1
         allocated = 0
         last_i = max((i for i, w in enumerate(weights) if w > 0), default=len(tools) - 1)
@@ -958,109 +992,19 @@ def _finalize_step(hb: Any, step: dict[str, Any]) -> None:
             t["context_delta"] = max(0, d)
             t["attribution"] = attr
 
-    # Serial skew: one tool ate ≥85% of observed Δ while others have signal
-    serial_skewed = False
-    if len(cleaned) > 1 and tt_tools_sum > 0:
-        max_tt = max(int(t.get("tt_delta_observed") or 0) for t in cleaned)
-        tools_with_signal = sum(
-            1
-            for t in cleaned
-            if int(t.get("result_tokens_est") or 0) > 0
-            or int(t.get("tt_delta_observed") or 0) > 0
-        )
-        if max_tt >= tt_tools_sum * 0.85 and tools_with_signal >= 2:
-            serial_skewed = True
-
-    # Re-split when multi-tool, lag, skew, or weight signal disagrees with serial
-    use_split = bool(cleaned) and weight_sum > 0 and (
-        len(cleaned) > 1
-        or serial_skewed
-        or content_sum > tt_tools_sum * 1.2
-        or weight_sum > tt_tools_sum * 1.2
-        or (late > 0 and weight_sum >= max(1, tt_tools_sum))
-    )
-
-    if cleaned and use_split:
-        ambiguous = len(cleaned) > 1
-        # Base pool = token-counter Δ (+ late when lagging). Floor by full
-        # result JSON sizes so tools aren't under-billed vs real payload.
-        pool = tt_tools_sum
-        if late > 0 and (
-            content_sum > tt_tools_sum
-            or weight_sum > tt_tools_sum
-            or serial_skewed
-            or late >= max(1, int(tt_tools_sum * 0.25))
-        ):
-            pool = tt_tools_sum + late
-            late_absorbed = late
-            late_display = 0
-            attribution = "weighted_incl_late"
-        else:
-            attribution = "weighted_split"
-        if pool <= 0 and late > 0:
-            pool = late
-            late_absorbed = late
-            late_display = 0
-            attribution = "weighted_incl_late"
-        # Content floor: tokenizer result sizes (history when available)
-        # beat a lagging totalTokens serial cursor as lower bound.
-        if content_sum > pool:
-            pool = content_sum
-            attribution = (
-                "weighted_tokenizer_floor"
-                if late_absorbed <= 0
-                else "weighted_tokenizer_floor_incl_late"
-            )
-        _allocate_pool(cleaned, max(0, pool), attribution)
-    elif cleaned:
-        attribution = "token_counter"
-        for t in cleaned:
-            tt_d = max(0, int(t.get("tt_delta_observed") or 0))
-            cont = max(0, int(t.get("result_tokens_est") or 0))
-            # Floor single-tool / serial path by payload size
-            t["context_delta"] = max(tt_d, cont)
-            t["attribution"] = (
-                "token_counter_content_floor" if cont > tt_d else attribution
-            )
-        # late often = last tool payload that only shows at next stream start
-        # Remaining late always merges into tools (no late residual UI/node)
-        if late_display > 0:
-            last = cleaned[-1]
-            last["context_delta"] = int(last.get("context_delta") or 0) + late_display
-            last["attribution"] = "late_merged_to_tool"
-            late_absorbed = int(late_absorbed or 0) + late_display
-            late_display = 0
-    else:
-        # No tools: fold late into step harness pool only (never a residual node)
+    if cleaned:
+        signal = sum(_raw_tool_weight(t) for t in cleaned)
+        pool = int(signal)
         if late > 0:
+            pool += late
             late_absorbed = late
-        late_display = 0
-
-    # Force: any leftover late_display redistributes into tools by weight
-    if cleaned and late_display > 0:
-        weights = _weights_for(cleaned)
-        wsum = sum(weights) or 1
-        extra = int(late_display)
-        allocated = 0
-        last_i = max(
-            (i for i, w in enumerate(weights) if w > 0),
-            default=len(cleaned) - 1,
-        )
-        for i, t in enumerate(cleaned):
-            if weights[i] <= 0 and i != last_i:
-                continue
-            if i == last_i:
-                d = max(0, extra - allocated)
-            else:
-                d = int(round(extra * weights[i] / wsum))
-                allocated += d
-            t["context_delta"] = int(t.get("context_delta") or 0) + max(0, d)
-            prev_attr = str(t.get("attribution") or "")
-            t["attribution"] = (
-                prev_attr + "+late" if prev_attr else "late_merged_to_tool"
-            )
-        late_absorbed = int(late_absorbed or 0) + extra
-        late_display = 0
+            attribution = "weighted_incl_late"
+        elif signal > 0:
+            attribution = "weighted_split"
+        _allocate_pool(cleaned, max(0, pool), attribution)
+    elif late > 0:
+        # No tools: fold late into step (never a residual UI node)
+        late_absorbed = late
 
     harness_pool = sum(int(t.get("context_delta") or 0) for t in cleaned)
 
@@ -1396,16 +1340,25 @@ def _attach_step_estimates(hb: Any, r: dict[str, Any]) -> None:
         if is_session_first:
             prior = None
 
-    # Warm R2+: floor call1 context_start at real prior (prev end), never a
-    # stale under-count (~10k). User prompt growth sits on top as uncached.
+    # Warm R2+: mild stream under-count only (start still ≥ half of prior).
+    # Never rewrite stream_context_start / raw — reconstruct + miss detect
+    # need the harness snap. A collapse (start < 0.5×prior) is compact /
+    # new window, not a floor-to-prior.
     if isinstance(prior, int) and prior > 0 and steps:
         s0 = steps[0]
         if isinstance(s0, dict):
             cs0 = s0.get("context_start")
-            if not isinstance(cs0, int) or cs0 < prior:
+            floor_lo = int(prior * 0.5)
+            if not isinstance(cs0, int):
                 s0["context_start"] = int(prior)
-            # If stream start equals prior, keep it; uncached = user growth
-            # is handled by reconstruct via prior_context_tokens.
+            elif floor_lo <= cs0 < prior:
+                s0["context_start"] = int(prior)
+
+    # Stamp harness snaps before reconstruct so cache weights see the raw window.
+    # R1 F may already have bumped stream_context_start; do not overwrite.
+    for s in steps:
+        if isinstance(s, dict):
+            _stamp_stream_window(s)
 
     # Detect full-context re-read before pricing so harness is not scaled
     # to the re-billed prior mass.
@@ -1429,23 +1382,32 @@ def _attach_step_estimates(hb: Any, r: dict[str, Any]) -> None:
         if isinstance(cs0, int) and cs0 > prior:
             user_unc = max(0, int(cs0) - int(prior))
 
-    # Peel child-session official usage out of the parent turn bill (R2+).
-    # R1/System stays frozen — never rewrite that official dict.
-    # Always peel from the unpeeled original so reprice is idempotent.
+    # Peel child-session official usage out of the parent turn bill
+    # (including R1). get_command wait-round only. Always peel from the
+    # unpeeled original so reprice is idempotent.
     # Late import: session.__init__ pulls monitor → hierarchy (cycle).
     from token_telemetry.session.subagents import (
         attach_subagents_after_steps,
-        collect_child_ids_from_round,
+        child_ids_to_peel,
         peel_round_usage,
     )
 
-    if usage and not is_session_first and r.get("system_prompt") is None:
-        child_ids = collect_child_ids_from_round(r)
+    if usage:
+        child_ids = child_ids_to_peel(r)
         if child_ids:
             cache = getattr(hb, "_child_usage_cache", None)
             if cache is None:
                 cache = {}
                 hb._child_usage_cache = cache
+            already: dict[str, Any] = {}
+            if r in hb.rounds:
+                prevs = hb.rounds[: hb.rounds.index(r)]
+            else:
+                prevs = list(hb.rounds)
+            for prev in prevs:
+                snap = prev.get("child_usage_at_peel")
+                if isinstance(snap, dict):
+                    already.update(snap)
             src = r.get("usage_raw_unpeeled")
             if not isinstance(src, dict) or not src:
                 src = dict(usage)
@@ -1454,9 +1416,15 @@ def _attach_step_estimates(hb: Any, r: dict[str, Any]) -> None:
                 parent_dir=getattr(hb, "_session_dir", None),
                 child_ids=child_ids,
                 cache=cache,
+                already_peeled=dict(already),
             )
             r["usage_raw_unpeeled"] = dict(src)
             r["subagent_peel"] = peel_meta
+            r["child_usage_at_peel"] = {
+                c["session_id"]: c.get("usage")
+                for c in (peel_meta.get("children") or [])
+                if isinstance(c, dict) and c.get("session_id") and c.get("usage")
+            }
             if peel_meta.get("peeled"):
                 usage = peeled
                 r["usage_raw"] = peeled
@@ -1464,6 +1432,19 @@ def _attach_step_estimates(hb: Any, r: dict[str, Any]) -> None:
 
     fam = r.get("model_family") or getattr(hb, "_pricing_model", None)
     with pricing_model_scope(fam):
+        # Finalize System window (ToolDef+Message bucket) before cache split
+        # so C1 Cached = System In + User [1] uses the card size.
+        hb._inject_system_message_residual(r, {})
+        sys0 = r.get("system_prompt") if isinstance(r.get("system_prompt"), dict) else {}
+        try:
+            sys_unc = int(sys0.get("tokens_in") or sys0.get("logical_tokens") or 0)
+        except (TypeError, ValueError):
+            sys_unc = 0
+        end_tok = r.get("context_end")
+        try:
+            end_tok_i = int(end_tok) if end_tok is not None else None
+        except (TypeError, ValueError):
+            end_tok_i = None
         recon = reconstruct_model_step_usage(
             steps,
             official_usage=usage,
@@ -1471,6 +1452,8 @@ def _attach_step_estimates(hb: Any, r: dict[str, Any]) -> None:
             context_reread=bool(reread),
             reread_uncached_tokens=int(reread["reread_tokens"]) if reread else 0,
             user_uncached_tokens=int(user_unc),
+            system_uncached_tokens=int(sys_unc),
+            context_end_tokens=end_tok_i,
         )
         r["model_steps"] = recon["steps"]
         r["step_usage"] = {
@@ -1500,76 +1483,117 @@ def _attach_step_estimates(hb: Any, r: dict[str, Any]) -> None:
         # Compact cost = re-read(kept ctx) + deferred reload (tools/system)
         hb._fill_compact_cost(r)
 
-        # R2+: show per-call context from official-share Input, not harness
-        # char/4 totalTokens. Stream snaps kept as stream_context_*.
-        if not is_session_first and r.get("system_prompt") is None:
-            _anchor_call_context_to_input(r)
+        # Displayed call window stays on the harness stream snap (all rounds,
+        # including R1). Reconstructed Input is stored as api_input_tokens.
+        _anchor_call_context_to_input(r)
+        # Last call has no harness after it — skip its ctx point and shift
+        # each earlier call to the *next* prompt window (Call 1 no longer
+        # plots the opening; System/User already have that).
+        _apply_caused_context_display(r)
 
 
 def _anchor_call_context_to_input(r: dict[str, Any]) -> None:
-    """Align displayed LLM-call context with that call's reconstructed Input."""
+    """Keep displayed call context on the harness stream window.
+
+    Never overwrite context_start with reconstructed Input. Store the API
+    prompt on the step as api_input_tokens. stream_context_raw (when set)
+    is the true harness snap; stream_context_start may be the F-bumped
+    reconstruct weight for R1 call-1.
+    """
     steps = [s for s in (r.get("model_steps") or []) if isinstance(s, dict)]
     if not steps:
         return
-    inputs: list[int] = []
+
     for s in steps:
+        if isinstance(s.get("context_start"), int) and s.get("stream_context_start") is None:
+            s["stream_context_start"] = s["context_start"]
+        if isinstance(s.get("context_end"), int) and s.get("stream_context_end") is None:
+            s["stream_context_end"] = s["context_end"]
+
         se = s.get("estimate") if isinstance(s.get("estimate"), dict) else {}
         inp = se.get("input_tokens")
         if inp is None:
             inp = int(s.get("tokens_cached") or 0) + int(s.get("paid_at_start_tokens") or 0)
         try:
-            inputs.append(max(0, int(inp or 0)))
+            inp_i = max(0, int(inp or 0))
         except (TypeError, ValueError):
-            inputs.append(0)
-    session_end = None
-    last = steps[-1]
-    for key in ("context_end", "stream_context_end", "context_peak"):
-        v = last.get(key)
-        if isinstance(v, int) and v > 0:
-            session_end = v if session_end is None else max(session_end, v)
-    rend = r.get("context_end")
-    if isinstance(rend, int) and rend > 0:
-        session_end = rend if session_end is None else max(session_end, rend)
+            inp_i = 0
+        s["api_input_tokens"] = inp_i
 
-    for i, s in enumerate(steps):
-        if isinstance(s.get("context_start"), int) and s.get("stream_context_start") is None:
-            s["stream_context_start"] = s["context_start"]
-        if isinstance(s.get("context_end"), int) and s.get("stream_context_end") is None:
-            s["stream_context_end"] = s["context_end"]
-        se = s.get("estimate") if isinstance(s.get("estimate"), dict) else {}
-        cache_t = 0
-        try:
-            cache_t = int(s.get("tokens_cached") or se.get("cached_read_tokens") or 0)
-        except (TypeError, ValueError):
-            cache_t = 0
-        inp = inputs[i]
+        raw = s.get("stream_context_raw")
         stream_start = s.get("stream_context_start")
         stream_end = s.get("stream_context_end")
-        last = i == len(steps) - 1
-        # Last call Cached=0 by design — its reconstructed Input is uncached
-        # only, not the window. Keep the stream snap so ctx cannot collapse.
-        if last or cache_t <= 0 or inp <= 0:
-            if isinstance(stream_start, int) and stream_start > 0:
-                s["context_start"] = stream_start
-            ce = stream_end if isinstance(stream_end, int) else s.get("context_end")
+        if isinstance(raw, int):
+            start = raw
+        elif isinstance(stream_start, int):
+            start = stream_start
         else:
-            s["context_start"] = inp
-            if i + 1 < len(steps) and inputs[i + 1] > 0 and cache_t > 0:
-                ce = max(inp, inputs[i + 1])
-            elif isinstance(stream_end, int) and stream_end >= inp:
-                ce = stream_end
-            else:
-                ce = inp + max(0, int(s.get("context_growth_est") or s.get("tokens_out") or 0))
-        if not isinstance(s.get("context_start"), int):
+            start = s.get("context_start")
+        end = stream_end if isinstance(stream_end, int) else s.get("context_end")
+        if not isinstance(start, int):
             continue
-        if not isinstance(ce, int):
-            ce = s["context_start"]
-        if isinstance(session_end, int) and session_end > 0:
-            ce = min(ce, session_end)
-            if s["context_start"] > session_end:
-                s["context_start"] = session_end
-        s["context_end"] = max(s["context_start"], ce)
+        s["context_start"] = start
+        if not isinstance(end, int):
+            end = start
+        s["context_end"] = max(start, end)
         s["context_delta"] = max(0, s["context_end"] - s["context_start"])
+
+
+def _own_stream_window(s: dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
+    raw = s.get("stream_context_raw")
+    start = raw if isinstance(raw, int) else s.get("context_start")
+    end = s.get("context_end")
+    if not isinstance(start, int):
+        return None, end if isinstance(end, int) else None
+    if not isinstance(end, int):
+        end = start
+    return int(start), int(end)
+
+
+def _apply_caused_context_display(r: dict[str, Any]) -> None:
+    """Skip last-call context (no harness after it) and shift the rest +1.
+
+    Call i (i < last) displays call i+1's stream window — the prompt after
+    this call's Out+tools. Cold Call 1 starts at 0 so System + User/Super
+    Agent prompt are inside that first window. n==1 keeps its own window.
+    """
+    steps = [s for s in (r.get("model_steps") or []) if isinstance(s, dict)]
+    n = len(steps)
+    if n == 0:
+        return
+    cold = isinstance(r.get("system_prompt"), dict) and (
+        r["system_prompt"].get("kind") == "system_prompt"
+    )
+    owns = [_own_stream_window(s) for s in steps]
+    for i, s in enumerate(steps):
+        own_s, own_e = owns[i]
+        s["own_context_start"] = own_s
+        s["own_context_end"] = own_e
+        if n < 2:
+            s["skip_context"] = False
+            s["display_context_start"] = 0 if cold else own_s
+            s["display_context_end"] = own_e
+            continue
+        if i == n - 1:
+            s["skip_context"] = True
+            s["display_context_start"] = None
+            s["display_context_end"] = None
+            s["context_growth_est"] = 0
+            s["context_growth_raw"] = 0
+            continue
+        nxt_s, nxt_e = owns[i + 1]
+        s["skip_context"] = False
+        # Cold Call 1: window includes System + first user / Super Agent prompt.
+        start = 0 if (cold and i == 0) else nxt_s
+        s["display_context_start"] = start
+        s["display_context_end"] = nxt_s if (cold and i == 0) else (
+            nxt_e if nxt_e is not None else nxt_s
+        )
+        base = 0 if (cold and i == 0) else own_s
+        if isinstance(nxt_s, int) and isinstance(base, int):
+            s["context_growth_est"] = max(0, int(nxt_s) - int(base))
+            s["context_growth_raw"] = max(0, int(nxt_s) - int(base))
+
 
 def _enc_stamp_signature(hb: Any) -> tuple:
     """Fingerprint of encrypted_content stamps across completed rounds."""
@@ -1593,6 +1617,10 @@ def _reprice_completed_rounds(hb: Any) -> None:
             pass
         try:
             hb._apply_session_restart_cache_miss(rr)
+        except Exception:
+            pass
+        try:
+            hb._attach_prev_llm_answer(rr)
         except Exception:
             pass
         try:

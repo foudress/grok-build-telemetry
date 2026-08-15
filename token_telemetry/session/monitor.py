@@ -108,6 +108,43 @@ def _enrich_system_prompt(sp: Optional[dict[str, Any]]) -> Optional[dict[str, An
     return out
 
 
+def _round_api_bill(rr: dict) -> float:
+    """Full list-rate bill for one turn (R1 includes System)."""
+    if not isinstance(rr, dict):
+        return 0.0
+    bd = rr.get("breakdown") if isinstance(rr.get("breakdown"), dict) else {}
+    api_tot = bd.get("api_total_usd")
+    if api_tot is None:
+        su = rr.get("step_usage") if isinstance(rr.get("step_usage"), dict) else {}
+        tot = su.get("totals") if isinstance(su.get("totals"), dict) else {}
+        api_tot = tot.get("api_cost_usd")
+    if api_tot is not None:
+        try:
+            return float(api_tot)
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        return float(rr.get("estimate_usd") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _sum_rounds_estimate(rounds: list) -> float:
+    """Σ per-turn list-rate bills + fork recaps (same as parent session KPI)."""
+    est = 0.0
+    for rr in rounds or []:
+        if not isinstance(rr, dict):
+            continue
+        est += _round_api_bill(rr)
+        for rec in rr.get("recaps_after") or []:
+            if isinstance(rec, dict) and rec.get("cost_usd") is not None:
+                try:
+                    est += float(rec["cost_usd"])
+                except (TypeError, ValueError):
+                    pass
+    return est
+
+
 # RAM guards
 MAX_TURNS = 40
 MAX_CONTEXT_POINTS = 200
@@ -168,6 +205,7 @@ class _ChildWatch:
         summary = read_session_summary(self.session_dir)
         official = sum(float(t.get("official_usd") or 0) for t in self.turns)
         rounds_all = self.hierarchy.snapshot_rounds(include_open=True)
+        estimate = _sum_rounds_estimate(rounds_all)
         rounds_raw = rounds_all[-API_ROUNDS:] if len(rounds_all) > API_ROUNDS else rounds_all
         rounds = [enrich_round(r) for r in rounds_raw]
         title = (
@@ -183,6 +221,7 @@ class _ChildWatch:
             "title": title,
             "label": title,
             "official_usd": round(official, 6),
+            "estimate_usd": round(estimate, 6),
             "turns": list(self.turns),
             "rounds": rounds,
             "live": dict(self.live),
@@ -342,6 +381,9 @@ class SessionMonitor:
 
         usage = round_.get("usage_raw") or {}
         peak = round_.get("context_peak")
+        end = round_.get("context_end")
+        if isinstance(peak, int) and isinstance(end, int) and end > 0 and peak > 2 * end:
+            peak = None
         steps = list(round_.get("model_steps") or [])
         # Ensure per-step estimates exist (open rounds / older builders)
         step_usage = round_.get("step_usage")
@@ -723,6 +765,9 @@ class SessionMonitor:
             last_round = self.hierarchy.rounds[-1] if self.hierarchy.rounds else None
             if last_round:
                 peak = last_round.get("context_peak") or peak
+            ce = (last_round or {}).get("context_end")
+            if isinstance(peak, int) and isinstance(ce, int) and ce > 0 and peak > 2 * ce:
+                peak = None
             est = estimate_from_usage(
                 usage,
                 peak_context_tokens=peak,
@@ -1013,32 +1058,10 @@ class SessionMonitor:
             ctx = self.live.get("context_tokens")
             rounds_all = self.hierarchy.snapshot_rounds(include_open=True)
 
-            def _round_api_bill(rr: dict) -> float:
-                """Full list-rate bill for one turn (R1 includes System)."""
-                bd = rr.get("breakdown") if isinstance(rr.get("breakdown"), dict) else {}
-                api_tot = bd.get("api_total_usd")
-                if api_tot is None:
-                    su = rr.get("step_usage") if isinstance(rr.get("step_usage"), dict) else {}
-                    tot = su.get("totals") if isinstance(su.get("totals"), dict) else {}
-                    api_tot = tot.get("api_cost_usd")
-                if api_tot is not None:
-                    return float(api_tot)
-                return float(rr.get("estimate_usd") or 0)
-
             # Session Cost estimate over *all* rounds (not the wire-truncated slice).
             # R1 white UI total is peeled; session sum uses full API bill per turn
             # so we never do peeled_rounds + System (double) or peeled-only (short).
-            est = 0.0
-            for rr in rounds_all:
-                # Light enrich path for totals: hierarchy already priced completed rounds
-                est += _round_api_bill(rr if isinstance(rr, dict) else {})
-                # Fork recaps (isolated) — billed but not in round tree growth
-                for rec in (rr.get("recaps_after") or []) if isinstance(rr, dict) else []:
-                    if isinstance(rec, dict) and rec.get("cost_usd") is not None:
-                        try:
-                            est += float(rec["cost_usd"])
-                        except (TypeError, ValueError):
-                            pass
+            est = _sum_rounds_estimate(rounds_all)
 
             # Only last N rounds over the wire (browser tree)
             rounds_raw = rounds_all
@@ -1060,10 +1083,14 @@ class SessionMonitor:
                         for k in ("cache_note", "in_note", "method", "cost_usd"):
                             est_s.pop(k, None)
 
+            kind = None
+            if self.session_dir is not None:
+                kind = (read_session_summary(self.session_dir) or {}).get("session_kind")
             payload = {
                 "watching": self.bootstrapped and self.error is None,
                 "error": self.error,
                 "session_id": self.session_id,
+                "session_kind": kind,
                 "pinned_session_id": self.pinned_session_id,
                 "follow_active": self.pinned_session_id is None,
                 "sessions": sessions,

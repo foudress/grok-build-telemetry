@@ -5,6 +5,66 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] — 2026-08-15
+
+Partial reconstruct / cache / sub-agent / compact-recap pass. Round 1 System
+**card** identity is unchanged (`System + R1 In = context_end`). Call-level
+cache, last-call skip, and the R1 ctx line are no longer treated as frozen.
+
+### Changed
+
+- **Per-call Cached** is `Input − Uncached` at that prompt. Last LLM call
+  (no harness after it) has **Cached = 0**; its official slice is *not*
+  dumped onto Call 1. `Σ display + last_omitted = official cachedRead`.
+- **R1 ctx line** is `0 → context_end` (nothing billed as prior cache before
+  Call 1). System still lives on its own card.
+- **R1 Cached** (official `cachedReadTokens`) is shared across every LLM
+  call except last. Call 1 = System In + User [1]; later non-last calls take
+  the remainder.
+- **Output attribution:** `Reasoning Enc + LLM→Harness + LLM→User = official
+  Out`. Leftover Out (including Thought mass) is spread onto Encrypted
+  pro-rata Enc TokZ. Thought stays a summary line.
+- **Session estimate** for R1 is `System $ + peeled R1` (`api_total_usd`),
+  not peeled-only and not System counted twice.
+- **Sub-agent tabs** use their own list-rate estimate on the estimate card
+  (official ticks stay on the official card). First-round prompt is labeled
+  **Super Agent** (not User). Parent-task text is not duplicated as System
+  **Other**.
+- **Recap vs compact** between rounds is ordered by `agent_ms`. Recaps
+  triggered before a compact stay before it (tree + cost chart).
+- **Compact bar:** Cached **or** In (hit vs miss), never both, plus **Out**
+  = compressed history (`tokens_after`). Compact glue is not treated as the
+  first user prompt or System Other.
+- **Cost chart:** minimum **8** slots; canvas is not CSS-stretched, so
+  tooltips stay above the bars.
+
+### Fixed
+
+- Last-call Cached no longer sits on the last call while Call 1 looks empty.
+- Sub-agent sessions were not found when the child cwd folder differs from
+  the parent (`~/.grok/sessions/*/<id>`).
+- Sub-agent Super Agent header / prompt line dropped tok and $ after Other
+  was removed from System — parent task tokens now land on Super Agent [1].
+- Encrypted reasoning stacked on one LLM call when `chat_history` stamps
+  were sparse.
+- Compact rewrite (`This session is being continued…`) overwrote User [1]
+  and System Other.
+- Child session estimate card showed official ticks instead of list-rate.
+
+### Added
+
+- `test/test_cache_reconstruct.py` — last=0, Call 1 prefix, official-cache
+  share, Enc leftover identity.
+- `test/test_cache_miss_call1.py` — first-call reread vs compact collapse.
+- `test/test_finalize_anchor.py` — stream-window anchor, last-call skip,
+  cold Call 1 ctx starts at 0, compact XOR + Out.
+
+### Notes
+
+- Official `$` is still `costUsdTicks / 10¹⁰`. On recent `grok-4.6-build`
+  turns those ticks sit at ~0.17× published list; the estimate card stays
+  on docs.x.ai rates. That is a harness stamp, not a new divisor.
+
 ## [0.4.0] — 2026-08-14
 
 ### Added

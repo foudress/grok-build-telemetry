@@ -20,6 +20,39 @@ from token_telemetry.hierarchy.text_metrics import (
 )
 
 
+_COMPACT_GLUE = (
+    "this session is being continued",
+    "ran out of context",
+    "conversation is summarized below",
+    "previous conversation that ran out",
+    "compaction/segment_",
+)
+
+
+def _is_compact_continuation(text: str) -> bool:
+    """True for compact rewrite glue (not the real first user prompt)."""
+    low = (text or "").lower()
+    if not low.strip():
+        return False
+    return any(m in low for m in _COMPACT_GLUE)
+
+
+def _session_is_subagent(session_dir: Optional[Path]) -> bool:
+    if session_dir is None:
+        return False
+    sm = Path(session_dir) / "summary.json"
+    if not sm.is_file():
+        return False
+    try:
+        data = json.loads(sm.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    kind = data.get("session_kind") or (data.get("info") or {}).get("session_kind")
+    return str(kind or "").lower() == "subagent"
+
+
 def _classify_bootstrap_message(role: str, text: str, syn: Any) -> Optional[str]:
     """Map a chat_history message to system-card / user buckets."""
     if role in ("system",):
@@ -35,6 +68,8 @@ def _classify_bootstrap_message(role: str, text: str, syn: Any) -> Optional[str]
         if "mcp servers" in low or "mcp server" in low:
             return "mcp"
         return "reminders"
+    if _is_compact_continuation(text):
+        return None
     if "<user_query>" in text or "<skill_information>" in text:
         return "user_prompt"
     return "other"
@@ -288,6 +323,19 @@ def parse_session_bootstrap(
     # Hooks are NOT part of the prompt — never add to system card tokens.
     _ = hooks  # call-site may still pass bootstrap hooks; ignore
 
+    # Sub-agent parent task is Super Agent [1], not System Other.
+    if _session_is_subagent(session_dir) and "other" in buckets:
+        oth = buckets.pop("other")
+        if "user_prompt" in buckets:
+            upb = buckets["user_prompt"]
+            upb["chars"] = int(upb.get("chars") or 0) + int(oth.get("chars") or 0)
+            upb["tok_w"] = int(upb.get("tok_w") or 0) + int(oth.get("tok_w") or 0)
+            upb["messages"] = int(upb.get("messages") or 0) + int(oth.get("messages") or 0)
+        else:
+            buckets["user_prompt"] = oth
+            if not user_preview:
+                user_preview = str(oth.get("preview") or "")
+
     # System-card kinds (everything before the indexed user prompt)
     system_order = ["system", "user_info", "reminders", "mcp", "other"]
     sys_chars = sum(int(buckets[k]["chars"]) for k in system_order if k in buckets)
@@ -386,9 +434,10 @@ def parse_session_bootstrap(
 
 
 # Host / MCP tool *schemas* are sent on the API tools channel — not as
-# chat_history messages. Grok context budget reports them separately
-# (e.g. "Tool definitions 8.2k · 25 tools"). Override via env if needed.
-DEFAULT_TOOL_DEFINITION_TOKENS = 8200
+# chat_history messages. Default size is 0 (no hardcoded 8.2k). Override
+# via env or session tool_definitions.json. The System-card remainder is
+# computed in finalize (context_end − user − harness − history).
+DEFAULT_TOOL_DEFINITION_TOKENS = 0
 DEFAULT_TOOL_DEFINITION_COUNT = 25
 
 
@@ -401,13 +450,13 @@ def resolve_tool_definitions(
     Order:
       1. env GROK_TOOL_DEFINITION_TOKENS / GROK_TOOL_DEFINITION_COUNT
       2. session file tool_definitions.json {tokens, count}
-      3. defaults from xAI context budget (8.2k / 25 tools)
+      3. defaults: 0 tokens / 25 tools (count is a label only)
     """
     import os
 
     tokens = DEFAULT_TOOL_DEFINITION_TOKENS
     count = DEFAULT_TOOL_DEFINITION_COUNT
-    source = "default_xai_context_budget"
+    source = "default"
 
     env_t = os.environ.get("GROK_TOOL_DEFINITION_TOKENS")
     env_c = os.environ.get("GROK_TOOL_DEFINITION_COUNT")
@@ -457,9 +506,8 @@ def inject_tool_definitions_into_bootstrap(
 ) -> dict[str, Any]:
     """Append Tool definitions as a provisional System-card part.
 
-    Finalize replaces this with the window remainder (ToolDef+Message =
-    context_end − R1 In − history). The hardcoded default is only a
-    call-1 context_start bump for cache reconstruct, not the card total.
+    No-op when tokens<=0 (default is 0; hardcoded 8.2k is gone).
+    Finalize computes the System-card remainder (ToolDef+Message).
     """
     tok = int(tool_defs.get("tokens") or 0)
     if tok <= 0:

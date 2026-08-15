@@ -232,20 +232,20 @@ def _attach_prev_llm_answer(hb: Any, r: dict[str, Any]) -> None:
 
 def _detect_context_reread(hb: Any, r: dict[str, Any]) -> Optional[dict[str, Any]]:
     """
-    Detect when a warm round re-bills prior context as uncached Input.
+    Detect a CALL-1 KV miss: first call re-bills prior as Input.
 
-    Common shapes after idle / KV drop / partial prefix miss:
-      A) classic: cachedRead ≈ 0 and uncached ≈ prior (full miss)
-      B) full re-bill: uncached ≈ prior, tiny window growth (even if
-         multi-call Σ cache is large from later warm calls)
-      C) residual re-bill: window grew with real tools/user, but
-         off_unc − growth still carries ~prior. Turn Σ cache can stay
-         large (later calls re-hit); first call often shows cache drop.
-         Without C, harness warm-scale absorbs the re-read mass.
-      D) soft idle: long gap + large extra, moderate growth
+    Fire only when prior >= 1000, official usage is present, and the
+    first-call window still holds prior (not a compact / new window).
 
-    Without detection, user row keeps prior as Cached and harness
-    absorbs re-read via warm scale → In mis-dispatch + cache double-count.
+    Signals (any one):
+      A) classic_cache_miss: cachedRead tiny, uncached ≈ prior
+      B) full_context_reread: uncached ≈ prior, tiny growth, window holds
+      C) first_call_reread: window still ≈ prior, extra ≈ prior, later
+         calls may stay warm (Σ cache large)
+      D) idle_context_reread: long idle + large extra, window not collapsed
+
+    Do not use off_unc − growth alone, and do not use first-call
+    tokens_cached (usually unset before reconstruct).
     """
     if not r.get("completed"):
         return None
@@ -287,8 +287,25 @@ def _detect_context_reread(hb: Any, r: dict[str, Any]) -> Optional[dict[str, Any
 
     extra = max(0, off_unc - growth)
 
-    # First-call cache stamp (raw or post-reconstruct) — optional signal
     steps = [s for s in (r.get("model_steps") or []) if isinstance(s, dict)]
+    c0_start: Optional[int] = None
+    if steps:
+        raw_start = steps[0].get("stream_context_start")
+        if not isinstance(raw_start, int):
+            raw_start = steps[0].get("context_start")
+        if isinstance(raw_start, int):
+            c0_start = raw_start
+    if not isinstance(c0_start, int):
+        raw_start = r.get("stream_context_start")
+        if not isinstance(raw_start, int):
+            raw_start = r.get("context_start")
+        if isinstance(raw_start, int):
+            c0_start = raw_start
+    # Compact / new window: start0 << prior is not a cache miss.
+    if isinstance(c0_start, int) and c0_start < int(prior * 0.5):
+        return None
+
+    # Optional first-call cache stamp (metadata only; not a signal)
     c0_cache: Optional[int] = None
     c0_drop = 0
     if steps:
@@ -301,56 +318,40 @@ def _detect_context_reread(hb: Any, r: dict[str, Any]) -> Optional[dict[str, Any
         if isinstance(c0_cache, int) and c0_cache >= 0:
             c0_drop = max(0, int(prior) - int(c0_cache))
 
+    window_holds = isinstance(c0_start, int) and c0_start >= int(prior * 0.85)
     classic = off_cache < int(prior * 0.15) and off_unc >= int(prior * 0.5)
-    # Full re-bill: uncached ≈ prior, tiny real window growth (even if
-    # multi-call Σ cache is large from later warm calls in the same turn).
-    full_reread = off_unc >= int(prior * 0.85) and growth < int(prior * 0.15)
-    # Residual: tools/user grew the window, but uncached still carries
-    # ~prior beyond growth. Σ cachedRead can stay large (later calls).
-    # Guard with moderate growth so post-compact multi-call blow-ups
-    # (tiny prior, huge tool growth, huge extra) do not false-positive.
-    residual_reread = (
-        extra >= int(prior * 0.7)
+    # Full re-bill: uncached ≈ prior, tiny growth, prefix still in window.
+    full_reread = (
+        off_unc >= int(prior * 0.85)
+        and growth < int(prior * 0.15)
+        and window_holds
+    )
+    # Call-1 re-bill while later calls stay warm (Σ cache can be large).
+    first_call = (
+        window_holds
+        and extra >= int(prior * 0.7)
         and off_unc >= int(prior * 0.7)
         and growth < int(prior * 0.4)
-    )
-    # First-call partial miss + large extra: allow slightly higher growth
-    # when the opening call clearly dropped a material prior cache slice.
-    c0_partial = (
-        isinstance(c0_cache, int)
-        and c0_cache > 0
-        and c0_drop >= max(800, int(prior * 0.12))
-        and c0_cache < int(prior * 0.88)
-    )
-    partial_first_call = (
-        c0_partial
-        and extra >= int(prior * 0.5)
-        and off_unc >= int(prior * 0.5)
-        and growth < int(prior * 0.75)
     )
     idle_long = isinstance(idle, int) and idle >= 20 * 60 * 1000
     soft = (
         idle_long
         and extra >= int(prior * 0.5)
         and growth < int(prior * 0.3)
+        and isinstance(c0_start, int)
+        and c0_start >= int(prior * 0.5)
     )
-    if not (classic or full_reread or residual_reread or partial_first_call or soft):
+    if not (classic or full_reread or first_call or soft):
         return None
 
     # Continuity re-read ≈ prior (not the whole round uncached / tools).
     reread_tokens = max(0, min(int(prior), extra))
-    # Prefer first-call drop when it is the only partial signal and
-    # extra overshoots (multi-call tax); still cap at prior.
-    if partial_first_call and not (classic or full_reread or residual_reread):
-        # Attribute at least the observed prefix drop; keep extra if larger
-        # but still prior-capped (extra already used above).
-        reread_tokens = max(0, min(int(prior), max(int(extra), int(c0_drop))))
     if classic:
         kind = "classic_cache_miss"
     elif full_reread:
         kind = "full_context_reread"
-    elif residual_reread or partial_first_call:
-        kind = "residual_context_reread"
+    elif first_call:
+        kind = "first_call_reread"
     else:
         kind = "idle_context_reread"
 
@@ -471,6 +472,8 @@ def _apply_session_restart_cache_miss(hb: Any, r: dict[str, Any]) -> None:
 
     if kind == "classic_cache_miss":
         warn = "Session Restart, no cache hit"
+    elif kind == "first_call_reread":
+        warn = "Context re-read (first-call cache miss)"
     elif kind in ("residual_context_reread", "partial_first_call_miss"):
         warn = "Context re-read (partial cache miss)"
     else:

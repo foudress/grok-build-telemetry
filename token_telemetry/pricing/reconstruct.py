@@ -22,100 +22,58 @@ from token_telemetry.pricing.rates import (
 )
 
 
-def reconstruct_model_step_usage(
-    steps: list[dict[str, Any]],
-    *,
-    official_usage: Optional[dict[str, Any]] = None,
-    prior_context_tokens: Optional[int] = None,
-    context_reread: bool = False,
-    reread_uncached_tokens: int = 0,
-    user_uncached_tokens: int = 0,
-) -> dict[str, Any]:
-    """
-    Tokenizer-weighted per-call reconstruction (simple + fair).
-
-    Sources:
-      - updates `_meta.totalTokens` → context_start / context_end (totalinput)
-      - chat_history / tool payloads → tokenized weights (xai-token-estimation
-        bytes/4, or GROK_TOKENIZER=tiktoken)
-      - turn_completed.usage → official input / cache / output / reasoning
-
-    Rules (keep UI fields identical to previous versions):
-      1. Cached per LLM call from totalinput (context_start):
-           multi: Cached[i] = context_start[i] for i < last; last = 0
-           single warm: Cached = prior; single cold: 0
-           then scale Σ to official cachedReadTokens when present
-         (no attempt to match In/Out growth under harness compression)
-         context_reread: do NOT force prior into call0 cache (it was re-billed)
-      2. Uncached In (paid@start): pro-rate official Input−Cache by tokenized
-         *input growth* weights (user/bootstrap on call0, then prior Out+tools)
-      3. Tree Call In = Harness In = LLM Out (re-enter) + tool results (+ hooks).
-         Intermediate calls: Out_i is first harness line → next-call uncached In.
-         Final call: Out goes to user (no Out→In); tools only.
-         Warm scale: Σ harness ≈ off_unc − user_uncached − reread
-         (User In is reserved — never absorbed into call/tool pool).
-         Out line keeps Out mass off tools → healthier tokZ/tokF on tools.
-      4. Out: Thought/Message/ToolReq = exact TokZ; Reasoning[enc] =
-         residual of full output (pure+reason API buckets) after those TokZ,
-         pro-rata by enc tokZ. Attr: LLM→User=Msg · Reasoning=Enc · LLM→Harness=ΣToolReq.
-      5. Δctx (context_growth_est): window growth only —
-           raw>0 → max(end−start, Out); raw==0 → Out + unscaled harness pool.
-           Never warm-scaled Call In / off_unc (multi-call API bill ≠ window Δ).
-    """
-    n = len(steps)
-    bootstrap_residual_tokens = 0
-    phys_raw: list[int] = []
-    empty_totals = {
-        "input": 0,
-        "cached_read": 0,
-        "uncached_input": 0,
-        "output": 0,
-        "cost_usd": 0.0,
-        "cost_in_usd": 0.0,
-        "cost_cached_usd": 0.0,
-        "cost_out_usd": 0.0,
-    }
-    if n == 0:
-        return {
-            "steps": [],
-            "method": "empty",
-            "calibrated": False,
-            "totals": empty_totals,
-            "breakdown": {},
-            "bootstrap_residual_tokens": 0,
-            "prior_context_tokens": prior_context_tokens,
-        }
-
-    def _tok_from_chars(chars: int) -> float:
-        return float(count_chars_as_tokens(max(0, int(chars or 0))))
-
-    def _step_total_input(step: dict[str, Any]) -> int:
-        """totalinput for this LLM call = context_start (stream totalTokens)."""
-        cs = step.get("context_start")
-        if isinstance(cs, int) and cs >= 0:
-            return int(cs)
-        for key in ("stream_context_start", "context_peak", "context_end"):
-            v = step.get(key)
-            if isinstance(v, int) and v >= 0:
-                return int(v)
+def _step_stream_start(step: dict[str, Any]) -> int:
+    """Prompt size at stream start. Prefer stream_context_start over context_start."""
+    if not isinstance(step, dict):
         return 0
+    for key in ("stream_context_start", "context_start", "context_peak", "context_end"):
+        v = step.get(key)
+        if isinstance(v, int) and v >= 0:
+            return int(v)
+    return 0
 
-    def _tool_result_w(t: dict[str, Any]) -> float:
-        """Harness In weight: tokenizer result tokens (chat_history first). Never args."""
-        for key in ("ch_result_tokens", "result_tokens_est"):
-            est = int(t.get(key) or 0)
-            if est > 0:
-                return float(est)
-        chars = int(t.get("ch_result_chars") or t.get("result_chars") or 0)
-        return _tok_from_chars(chars)
 
-    def _tool_arg_w(t: dict[str, Any]) -> float:
-        est = int(t.get("arg_tokens_est") or 0)
+def _step_stream_end(step: dict[str, Any]) -> int:
+    """Prompt size at stream end. Prefer stream_context_end over context_end."""
+    if not isinstance(step, dict):
+        return 0
+    for key in ("stream_context_end", "context_end", "context_peak"):
+        v = step.get(key)
+        if isinstance(v, int) and v >= 0:
+            return int(v)
+    return 0
+
+
+def _step_total_input(step: dict[str, Any]) -> int:
+    """totalinput for this LLM call = stream start (stream_context_start first)."""
+    return _step_stream_start(step)
+
+
+def _tok_from_chars(chars: int) -> float:
+    return float(count_chars_as_tokens(max(0, int(chars or 0))))
+
+
+def _tool_result_w(t: dict[str, Any]) -> float:
+    """Harness In weight: tokenizer result tokens (chat_history first). Never args."""
+    for key in ("ch_result_tokens", "result_tokens_est"):
+        est = int(t.get(key) or 0)
         if est > 0:
             return float(est)
-        return _tok_from_chars(int(t.get("arg_chars") or 0))
+    chars = int(t.get("ch_result_chars") or t.get("result_chars") or 0)
+    return _tok_from_chars(chars)
 
-    total_inputs: list[int] = []
+
+def _tool_arg_w(t: dict[str, Any]) -> float:
+    est = int(t.get("arg_tokens_est") or 0)
+    if est > 0:
+        return float(est)
+    return _tok_from_chars(int(t.get("arg_chars") or 0))
+
+
+def _collect_step_weights(steps: list[dict[str, Any]]) -> dict[str, Any]:
+    """Starts/ends + tokenizer Out / harness / tool weights for each LLM call."""
+    starts: list[int] = []
+    ends: list[int] = []
     raw_out_thought: list[float] = []
     raw_out_enc: list[float] = []
     raw_out_emit: list[float] = []
@@ -124,10 +82,9 @@ def reconstruct_model_step_usage(
     tool_ws: list[list[float]] = []
 
     for step in steps:
-        ti = _step_total_input(step)
-        total_inputs.append(ti)
+        starts.append(_step_stream_start(step))
+        ends.append(_step_stream_end(step))
 
-        # Prefer Grok-2 token weights when hierarchy stamped them; else chars//4
         th_tok_w = step.get("thought_summary_tokens")
         if th_tok_w is not None and int(th_tok_w) > 0:
             th_w = float(int(th_tok_w))
@@ -161,7 +118,6 @@ def reconstruct_model_step_usage(
         raw_out_message.append(msg_w)
 
         tw = [_tool_result_w(t) for t in tools]
-        # Stream-faithful pool; tokenizer only splits within it.
         pool = int(step.get("harness_pool_tokens") or 0)
         if pool <= 0:
             pool = sum(max(0, int(t.get("context_delta") or 0)) for t in tools)
@@ -175,6 +131,658 @@ def reconstruct_model_step_usage(
         else:
             harness_w.append(float(sum(tw)) if tw else 0.0)
 
+    return {
+        "starts": starts,
+        "ends": ends,
+        "raw_out_thought": raw_out_thought,
+        "raw_out_enc": raw_out_enc,
+        "raw_out_emit": raw_out_emit,
+        "raw_out_message": raw_out_message,
+        "harness_w": harness_w,
+        "tool_ws": tool_ws,
+    }
+
+
+def _clamp_paid_to_inputs(inputs: list[int], paid_uncached: list[int]) -> list[int]:
+    """paid_uncached[i] <= inputs[i]; leftover unc goes to later/last calls."""
+    n = len(inputs)
+    paid = [int(paid_uncached[i]) if i < len(paid_uncached) else 0 for i in range(n)]
+    leftover = 0
+    for i in range(n):
+        if paid[i] > inputs[i]:
+            leftover += paid[i] - inputs[i]
+            paid[i] = int(inputs[i])
+    if leftover > 0:
+        for i in range(n - 1, -1, -1):
+            room = int(inputs[i]) - paid[i]
+            if room <= 0:
+                continue
+            take = min(room, leftover)
+            paid[i] += take
+            leftover -= take
+            if leftover <= 0:
+                break
+    return paid
+
+
+def _reconstruct_inputs_and_cache(
+    *,
+    n: int,
+    starts: list[int],
+    ends: list[int],
+    harness_w: list[float],
+    raw_out_thought: list[float],
+    raw_out_enc: list[float],
+    raw_out_emit: list[float],
+    raw_out_message: list[float],
+    off_in: Optional[int],
+    off_unc: Optional[int],
+    cold: bool,
+    prior_i: int,
+    context_reread: bool,
+    reread_uncached_tokens: int,
+    user_uncached_tokens: int,
+    system_uncached_tokens: int = 0,
+    context_end_tokens: Optional[int] = None,
+) -> tuple[list[int], list[int], list[int], int]:
+    """
+    Input = scale(stream_start) to official inputTokens.
+    paid_uncached = scale(growth weights) to official Input−Cache.
+    Cache at call i = Input_i − Unc_i (prefix of *this* prompt).
+
+    Last call (n>=2) has no harness after it → Cached=0. Its official
+    cache slice is *not* dumped on Call 1. Call caches stay
+    representative of that call's prompt; Σ display + last_omitted
+    = official cachedRead.
+
+    Call 1 keeps its own prefix (no user_share peel that zeros it).
+    user_cache_share is still reported for the User-row continuity card.
+
+    Returns (inputs, display_caches, paid_uncached, user_cache_share,
+    last_cache_omitted).
+    """
+    if n <= 0:
+        return [], [], [], 0, 0
+
+    input_w = [float(max(0, int(starts[i]) if i < len(starts) else 0)) for i in range(n)]
+    if off_in is not None:
+        if sum(input_w) > 0:
+            inputs = _scale_ints(input_w, int(off_in))
+        else:
+            inputs = [0] * n
+            inputs[0] = int(off_in)
+    else:
+        inputs = [int(max(0, round(w))) for w in input_w]
+
+    paid_w: list[float] = []
+    for i in range(n):
+        start_i = int(starts[i]) if i < len(starts) else 0
+        if i == 0:
+            if cold:
+                # First prompt uncached = user (+ first harness), not the
+                # whole start window (System lives on the System card).
+                # Using start_i here zeroed Call 1 Cached.
+                user_u = max(0, int(user_uncached_tokens or 0))
+                small = float(harness_w[0]) if harness_w else 0.0
+                paid_w.append(float(max(1, user_u, small)))
+            elif context_reread:
+                reread = max(0, int(reread_uncached_tokens or 0))
+                user_u = max(0, int(user_uncached_tokens or 0))
+                paid_w.append(float(max(1, reread + user_u, start_i)))
+            else:
+                growth = max(0, start_i - int(prior_i))
+                user_u = max(0, int(user_uncached_tokens or 0))
+                small = float(harness_w[0]) if harness_w else 0.0
+                paid_w.append(float(max(1, growth, user_u, small)))
+        else:
+            prev_end = int(ends[i - 1]) if i - 1 < len(ends) else 0
+            prev_out = (
+                (raw_out_thought[i - 1] if i - 1 < len(raw_out_thought) else 0.0)
+                + (raw_out_enc[i - 1] if i - 1 < len(raw_out_enc) else 0.0)
+                + (raw_out_emit[i - 1] if i - 1 < len(raw_out_emit) else 0.0)
+                + (raw_out_message[i - 1] if i - 1 < len(raw_out_message) else 0.0)
+            )
+            h_prev = float(harness_w[i - 1]) if i - 1 < len(harness_w) else 0.0
+            h_cur = float(harness_w[i]) if i < len(harness_w) else 0.0
+            paid_w.append(
+                float(max(1.0, start_i - prev_end, prev_out + h_prev, h_cur))
+            )
+
+    if off_unc is not None and sum(paid_w) > 0:
+        paid_uncached = _scale_ints(paid_w, int(off_unc))
+    elif off_unc is not None:
+        paid_uncached = [0] * n
+        paid_uncached[0] = int(off_unc)
+    else:
+        paid_uncached = [max(0, int(round(w))) for w in paid_w]
+
+    paid_uncached = _clamp_paid_to_inputs(inputs, paid_uncached)
+    caches = [int(inputs[i]) - int(paid_uncached[i]) for i in range(n)]
+
+    # Last call is not re-fed (no harness). Drop its cache; do not move
+    # that slice onto Call 1 — Call 1 keeps only *its* prompt prefix.
+    last_cache_omitted = 0
+    if n >= 2:
+        last_cache_omitted = int(caches[n - 1])
+        caches[n - 1] = 0
+
+    if cold:
+        caches, last_cache_omitted = _apply_cold_r1_caches(
+            n=n,
+            caches=caches,
+            off_cache=int(off_in - off_unc) if (off_in is not None and off_unc is not None) else None,
+            system_tokens=int(system_uncached_tokens or 0),
+            user_tokens=int(user_uncached_tokens or 0),
+            context_end=int(context_end_tokens) if context_end_tokens else None,
+            ends=ends,
+        )
+
+    user_cache_share = 0
+    if not cold and prior_i > 0 and not context_reread:
+        user_cache_share = min(int(prior_i), int(caches[0]) if caches else 0)
+
+    # Call 1 display = cache at that moment (full prefix). Do not peel
+    # user_share off it — that made Call 1 look empty.
+    display_caches = list(caches)
+
+    return inputs, display_caches, paid_uncached, user_cache_share, last_cache_omitted
+
+
+def _apply_cold_r1_caches(
+    *,
+    n: int,
+    caches: list[int],
+    off_cache: Optional[int],
+    system_tokens: int,
+    user_tokens: int,
+    context_end: Optional[int],
+    ends: list[int],
+) -> tuple[list[int], int]:
+    """R1 Cached (official) is shared by every call except last. C1 = System+User."""
+    if n <= 0:
+        return list(caches), 0
+    pool = int(off_cache or 0)
+    if pool <= 0:
+        return list(caches), 0
+    out = [0] * n
+    c1 = max(0, int(system_tokens) + int(user_tokens))
+    if n == 1:
+        out[0] = pool
+    elif n == 2:
+        out[0] = pool
+        out[1] = 0
+    else:
+        out[0] = min(c1, pool) if c1 > 0 else 0
+        rem = max(0, pool - out[0])
+        mid = n - 2
+        if mid > 0 and rem > 0:
+            w = [
+                float(max(1, int(ends[i]) if i < len(ends) else 1))
+                for i in range(1, n - 1)
+            ]
+            share = _scale_ints(w, rem)
+            for i, s in enumerate(share):
+                out[i + 1] = int(s)
+        out[n - 1] = 0
+    omitted = max(0, pool - int(sum(out)))
+    return out, omitted
+
+
+def _enc_tokz_weights(n: int, enc_w: list[float], th_w_list: list[float]) -> list[float]:
+    """Weights for leftover Out → Encrypted. Prefer Enc TokZ; thought only if none."""
+    w = [float(enc_w[i]) if i < len(enc_w) else 0.0 for i in range(n)]
+    if sum(w) > 0:
+        return w
+    w = [float(th_w_list[i]) if i < len(th_w_list) else 0.0 for i in range(n)]
+    if sum(w) > 0:
+        return w
+    return [1.0] * n if n > 0 else []
+
+
+def _reconstruct_output(
+    n: int,
+    raw_out_thought: list[float],
+    raw_out_enc: list[float],
+    raw_out_emit: list[float],
+    raw_out_message: list[float],
+    off_out: Optional[int],
+    off_reason: Optional[int],
+) -> dict[str, Any]:
+    """Message/ToolReq = exact TokZ. Enc = leftover official Out, pro-rata Enc TokZ.
+
+    Attribution identity: Reasoning + LLM→Harness + LLM→User = official Out.
+    Thought TokZ stays on the Thought line (summary) but its mass is inside Enc.
+    """
+    th_w_list = [max(0.0, float(raw_out_thought[i])) for i in range(n)]
+    em_w_list = [max(0.0, float(raw_out_emit[i])) for i in range(n)]
+    msg_w_list = [max(0.0, float(raw_out_message[i])) for i in range(n)]
+    enc_w = [max(0.0, float(raw_out_enc[i])) for i in range(n)]
+
+    out_thought = [max(0, int(round(th_w_list[i]))) for i in range(n)]
+    out_message = [max(0, int(round(msg_w_list[i]))) for i in range(n)]
+    out_emit = [max(0, int(round(em_w_list[i]))) for i in range(n)]
+    th_sum = int(sum(out_thought))
+    msg_sum = int(sum(out_message))
+    em_sum = int(sum(out_emit))
+    # Fixed billed buckets that stay out of Enc: ToolReq + Message only.
+    fixed_sum = int(msg_sum + em_sum)
+
+    if off_out is not None:
+        total_out_sum = max(0, int(off_out))
+    else:
+        total_out_sum = max(
+            fixed_sum + max(0, int(round(sum(enc_w)))),
+            fixed_sum,
+            1,
+        )
+
+    if off_reason is not None:
+        target_r_official = min(max(0, int(off_reason)), total_out_sum)
+    else:
+        target_r_official = max(0, em_sum + max(0, int(round(sum(enc_w)))))
+        target_r_official = min(target_r_official, total_out_sum)
+
+    if fixed_sum > total_out_sum and fixed_sum > 0:
+        scaled_fixed = _scale_ints(
+            [
+                float(out_message[i] + out_emit[i])
+                for i in range(n)
+            ],
+            total_out_sum,
+        )
+        for i in range(n):
+            bag = int(scaled_fixed[i])
+            if bag <= 0:
+                out_message[i] = out_emit[i] = 0
+                continue
+            parts = _scale_ints(
+                [
+                    float(out_message[i]),
+                    float(out_emit[i]),
+                ],
+                bag,
+            )
+            out_message[i], out_emit[i] = int(parts[0]), int(parts[1])
+        msg_sum = int(sum(out_message))
+        em_sum = int(sum(out_emit))
+        fixed_sum = int(msg_sum + em_sum)
+    elif total_out_sum <= 0:
+        out_thought = [0] * n
+        out_message = [0] * n
+        out_emit = [0] * n
+        th_sum = msg_sum = em_sum = fixed_sum = 0
+
+    enc_pool = max(0, int(total_out_sum) - int(fixed_sum))
+    # Leftover official Out (incl. Thought mass) → Encrypted, pro-rata Enc TokZ.
+    enc_scale = _enc_tokz_weights(n, enc_w, th_w_list)
+    out_reasoning = (
+        _scale_ints(enc_scale, enc_pool) if enc_pool > 0 and sum(enc_scale) > 0 else [0] * n
+    )
+
+    got_fixed_enc = int(
+        sum(out_thought) + sum(out_message) + sum(out_emit) + sum(out_reasoning)
+    )
+    if total_out_sum > 0 and got_fixed_enc != total_out_sum:
+        need = total_out_sum - got_fixed_enc
+        if need > 0:
+            extra = (
+                _scale_ints(enc_scale, need)
+                if sum(enc_scale) > 0
+                else [0] * n
+            )
+            if sum(extra) == 0:
+                extra = [0] * n
+                extra[-1] = need
+            for i in range(n):
+                out_reasoning[i] = int(out_reasoning[i]) + int(extra[i])
+        else:
+            need = -need
+            for bag in (out_reasoning, out_emit, out_message):
+                if need <= 0:
+                    break
+                for i in sorted(range(n), key=lambda j: bag[j], reverse=True):
+                    if need <= 0:
+                        break
+                    take = min(int(bag[i]), need)
+                    bag[i] -= take
+                    need -= take
+
+    target_r = int(sum(out_emit) + sum(out_reasoning))
+    pure_out = max(0, int(sum(out_message)))
+
+    outputs = [0] * n
+    for i in range(n):
+        # Call Out = Enc + ToolReq + Message (Thought mass lives in Enc)
+        outputs[i] = (
+            int(out_reasoning[i])
+            + int(out_emit[i])
+            + int(out_message[i])
+        )
+    out_got = int(sum(outputs))
+    if total_out_sum > 0 and out_got != total_out_sum:
+        d = total_out_sum - out_got
+        if d > 0:
+            extra = (
+                _scale_ints(enc_scale, d) if sum(enc_scale) > 0 else [0] * n
+            )
+            if sum(extra) == 0:
+                extra = [0] * n
+                extra[-1] = d
+            for i in range(n):
+                out_reasoning[i] = int(out_reasoning[i]) + int(extra[i])
+                outputs[i] = int(outputs[i]) + int(extra[i])
+        else:
+            need = -d
+            for i in range(n - 1, -1, -1):
+                for bag in (out_reasoning, out_emit, out_message):
+                    if need <= 0:
+                        break
+                    take = min(int(bag[i]), need)
+                    bag[i] -= take
+                    outputs[i] -= take
+                    need -= take
+
+    return {
+        "out_thought": out_thought,
+        "out_message": out_message,
+        "out_emit": out_emit,
+        "out_reasoning": out_reasoning,
+        "outputs": outputs,
+        "enc_w": enc_w,
+        "th_w_list": th_w_list,
+        "em_w_list": em_w_list,
+        "msg_w_list": msg_w_list,
+        "total_out_sum": total_out_sum,
+        "target_r": target_r,
+        "pure_out": pure_out,
+        "target_r_official": target_r_official,
+    }
+
+
+def _rescale_warm_harness(
+    annotated: list[dict[str, Any]],
+    steps: list[dict[str, Any]],
+    *,
+    off_unc: int,
+    prior_i: int,
+    user_uncached_tokens: int,
+    reread_uncached_tokens: int,
+    context_reread: bool,
+    tot_harness_in: int,
+    tot_harness_in_usd: float,
+    tot_out_to_harness_in: int,
+    tot_out_to_harness_in_usd: float,
+) -> dict[str, Any]:
+    """Warm: scale harness/tools to off_unc − user − reread. Out→In stays fixed."""
+    warm_in_scaled = False
+    warm_user_est = 0
+    reread_i = max(0, int(reread_uncached_tokens or 0)) if context_reread else 0
+    user_i = max(0, int(user_uncached_tokens or 0))
+    if not annotated or off_unc is None:
+        return {
+            "warm_in_scaled": False,
+            "warm_user_est": 0,
+            "user_i": user_i,
+            "reread_i": reread_i,
+            "tot_harness_in": tot_harness_in,
+            "tot_harness_in_usd": tot_harness_in_usd,
+            "tot_out_to_harness_in": tot_out_to_harness_in,
+            "tot_out_to_harness_in_usd": tot_out_to_harness_in_usd,
+        }
+    if prior_i > 0 and steps:
+        cs0 = _step_stream_start(steps[0])
+        if cs0 > prior_i:
+            warm_user_est = max(0, int(cs0) - prior_i)
+    if user_i <= 0 and warm_user_est > 0:
+        user_i = int(warm_user_est)
+    target_h = max(0, int(off_unc) - int(user_i) - int(reread_i))
+
+    out_fixed_per: list[int] = []
+    tools_w_per: list[float] = []
+    for s in annotated:
+        o_fix = 0
+        t_w = 0.0
+        for ch in s.get("children") or []:
+            if ch.get("kind") != "phase_harness":
+                continue
+            for sub in ch.get("children") or []:
+                if sub.get("to_user"):
+                    continue
+                ck = sub.get("kind")
+                tin = int(sub.get("tokens_in") or sub.get("context_delta") or 0)
+                if ck == "llm_to_in":
+                    o_fix += tin
+                elif ck in ("tool", "late_context", "hook") or sub.get("name"):
+                    t_w += float(max(0, tin))
+        if o_fix <= 0:
+            o_fix = int(s.get("llm_out_in_tokens") or 0)
+        if t_w <= 0:
+            t_w = float(max(0, int(s.get("harness_in_tokens") or 0) - o_fix))
+        out_fixed_per.append(int(o_fix))
+        tools_w_per.append(float(t_w))
+
+    out_fixed_sum = int(sum(out_fixed_per))
+    tools_target = max(0, int(target_h) - out_fixed_sum)
+    tools_sum = sum(tools_w_per)
+    h_sum = out_fixed_sum + tools_sum
+
+    if h_sum > 0 and (
+        target_h != int(round(h_sum))
+        or (context_reread and reread_i > 0)
+        or (tools_sum > 0 and tools_target != int(round(tools_sum)))
+    ):
+        if tools_sum > 0:
+            scaled_tools = _scale_ints(tools_w_per, tools_target)
+        else:
+            scaled_tools = [0] * len(annotated)
+        tot_harness_in = 0
+        tot_harness_in_usd = 0.0
+        tot_out_to_harness_in = 0
+        tot_out_to_harness_in_usd = 0.0
+        for si, s in enumerate(annotated):
+            o_fix = int(out_fixed_per[si])
+            new_tools = int(scaled_tools[si]) if si < len(scaled_tools) else 0
+            new_h = int(o_fix) + int(new_tools)
+            tctx = step_tier_ctx(s, fallback=max(new_h, 1))
+            new_h_usd = float(_price_in(new_h, tctx)) if new_h > 0 else 0.0
+            children = list(s.get("children") or [])
+            for ch in children:
+                if ch.get("kind") != "phase_harness":
+                    continue
+                sub = list(ch.get("children") or [])
+                tool_kids = [
+                    c
+                    for c in sub
+                    if not c.get("to_user")
+                    and c.get("kind") != "llm_to_in"
+                    and (
+                        c.get("kind") in ("tool", "late_context", "hook")
+                        or c.get("name")
+                    )
+                ]
+                for c in sub:
+                    if c.get("kind") != "llm_to_in":
+                        continue
+                    c["tokens_in"] = int(o_fix)
+                    c["context_delta"] = int(o_fix)
+                    c["cost_in_usd"] = (
+                        float(_price_in(o_fix, tctx)) if o_fix > 0 else 0.0
+                    )
+                    c["estimate_usd"] = float(c["cost_in_usd"])
+                if tool_kids:
+                    kw = [
+                        float(
+                            max(
+                                0,
+                                int(
+                                    c.get("tokens_in")
+                                    or c.get("context_delta")
+                                    or 0
+                                ),
+                            )
+                        )
+                        for c in tool_kids
+                    ]
+                    if sum(kw) <= 0:
+                        kw = [1.0] * len(tool_kids)
+                    if new_tools > 0:
+                        ks = _scale_ints(kw, new_tools)
+                        for c, kt in zip(tool_kids, ks):
+                            c["tokens_in"] = int(kt)
+                            c["context_delta"] = int(kt)
+                            c["cost_in_usd"] = float(_price_in(int(kt), tctx))
+                            c["estimate_usd"] = float(
+                                float(c.get("cost_in_usd") or 0)
+                                + float(c.get("cost_cached_usd") or 0)
+                                + float(c.get("cost_out_usd") or 0)
+                            )
+                    else:
+                        for c in tool_kids:
+                            c["tokens_in"] = 0
+                            c["context_delta"] = 0
+                            c["cost_in_usd"] = 0.0
+                ch["tokens_in"] = new_h
+                ch["cost_in_usd"] = new_h_usd
+                ch["estimate_usd"] = new_h_usd
+                ch["llm_out_in_tokens"] = int(o_fix)
+                ch["llm_out_in_usd"] = (
+                    float(_price_in(o_fix, tctx)) if o_fix > 0 else 0.0
+                )
+                ch["children"] = sub
+            s["children"] = children
+            s["tokens_in"] = new_h
+            s["cost_in_usd"] = new_h_usd
+            s["harness_in_tokens"] = new_h
+            s["harness_in_usd"] = new_h_usd
+            s["llm_out_in_tokens"] = int(o_fix)
+            s["llm_out_in_usd"] = (
+                float(_price_in(o_fix, tctx)) if o_fix > 0 else 0.0
+            )
+            cache_usd = float(s.get("cost_cached_usd") or 0)
+            out_usd = float(s.get("cost_out_usd") or 0)
+            line_usd = float(new_h_usd + cache_usd + out_usd)
+            s["cost_of_call_usd"] = line_usd
+            s["estimate_usd"] = line_usd
+            est = dict(s.get("estimate") or {})
+            est["uncached_input_tokens"] = new_h
+            est["logical_uncached_tokens"] = new_h
+            est["cost_in_usd"] = new_h_usd
+            est["estimate_usd"] = line_usd
+            est["cost_of_call_usd"] = line_usd
+            s["estimate"] = est
+            tools_scaled: list[dict[str, Any]] = []
+            for ch in children:
+                if ch.get("kind") == "phase_harness":
+                    for sub in ch.get("children") or []:
+                        if sub.get("kind") == "tool":
+                            tools_scaled.append(sub)
+                elif ch.get("kind") == "tool":
+                    tools_scaled.append(ch)
+            s["tools"] = tools_scaled
+            comp = dict(s.get("composition") or {})
+            comp["harness_results"] = int(new_h)
+            comp["harness_tools_only"] = int(new_tools)
+            comp["llm_out_to_in"] = int(o_fix)
+            s["composition"] = comp
+            s["harness_scaled_to_official_unc"] = True
+            s["harness_raw_tokens"] = int(out_fixed_per[si] + tools_w_per[si])
+            tot_harness_in += new_h
+            tot_harness_in_usd += new_h_usd
+            tot_out_to_harness_in += int(o_fix)
+            tot_out_to_harness_in_usd += (
+                float(_price_in(o_fix, tctx)) if o_fix > 0 else 0.0
+            )
+        warm_in_scaled = not bool(context_reread and reread_i > 0)
+    elif h_sum > 0:
+        warm_in_scaled = not bool(context_reread and reread_i > 0)
+
+    return {
+        "warm_in_scaled": bool(warm_in_scaled),
+        "warm_user_est": int(warm_user_est),
+        "user_i": int(user_i),
+        "reread_i": int(reread_i),
+        "tot_harness_in": tot_harness_in,
+        "tot_harness_in_usd": tot_harness_in_usd,
+        "tot_out_to_harness_in": tot_out_to_harness_in,
+        "tot_out_to_harness_in_usd": tot_out_to_harness_in_usd,
+    }
+
+
+def reconstruct_model_step_usage(
+    steps: list[dict[str, Any]],
+    *,
+    official_usage: Optional[dict[str, Any]] = None,
+    prior_context_tokens: Optional[int] = None,
+    context_reread: bool = False,
+    reread_uncached_tokens: int = 0,
+    user_uncached_tokens: int = 0,
+    system_uncached_tokens: int = 0,
+    context_end_tokens: Optional[int] = None,
+) -> dict[str, Any]:
+    """
+    Tokenizer-weighted per-call reconstruction (simple + fair).
+
+    Sources:
+      - stream_context_start / context_start (prefer stream) as prompt-size weights
+      - chat_history / tool payloads → tokenized weights (xai-token-estimation
+        bytes/4, or GROK_TOKENIZER=tiktoken)
+      - turn_completed.usage → official input / cache / output / reasoning
+        (SUM across modelCalls; Input−Cache = paid uncached)
+
+    Rules (keep UI fields identical to previous versions):
+      1. Input[i] = scale(stream_start[i]) to official inputTokens.
+         Cached[i] = Input[i] − paid_uncached[i] (last call included).
+         user_cache_share = min(prior, caches[0]) is a UI partition only:
+         displayed Cached[0] = Cached[0] − share so user + Σ call == official cache.
+      2. Uncached In (paid@start): pro-rate official Input−Cache by growth
+         weights (cold start0; warm start0−prior / reread; later
+         start−prev_end / Out+tools). Clamp paid ≤ input; leftover to last.
+      3. Tree Call In = Harness In = LLM Out (re-enter) + tool results (+ hooks).
+         Intermediate calls: Out_i is first harness line → next-call uncached In.
+         Final call: Out goes to user (no Out→In); tools only. Cached stays.
+         Warm scale: Σ harness ≈ off_unc − user_uncached − reread
+         (User In is reserved — never absorbed into call/tool pool).
+         Out line keeps Out mass off tools → healthier tokZ/tokF on tools.
+      4. Out: Thought/Message/ToolReq = exact TokZ; Reasoning[enc] =
+         residual of full output (pure+reason API buckets) after those TokZ,
+         pro-rata by enc tokZ. Attr: LLM→User=Msg · Reasoning=Enc · LLM→Harness=ΣToolReq.
+      5. Δctx (context_growth_est): window growth only —
+           raw>0 → max(end−start, Out); raw==0 → Out + unscaled harness pool.
+           Prefer stream_context_start/end. Never warm-scaled Call In / off_unc.
+    """
+    n = len(steps)
+    bootstrap_residual_tokens = 0
+    phys_raw: list[int] = []
+    empty_totals = {
+        "input": 0,
+        "cached_read": 0,
+        "uncached_input": 0,
+        "output": 0,
+        "cost_usd": 0.0,
+        "cost_in_usd": 0.0,
+        "cost_cached_usd": 0.0,
+        "cost_out_usd": 0.0,
+    }
+    if n == 0:
+        return {
+            "steps": [],
+            "method": "empty",
+            "calibrated": False,
+            "totals": empty_totals,
+            "breakdown": {},
+            "bootstrap_residual_tokens": 0,
+            "prior_context_tokens": prior_context_tokens,
+        }
+
+    wts = _collect_step_weights(steps)
+    total_inputs = list(wts["starts"])
+    stream_ends = list(wts["ends"])
+    raw_out_thought = list(wts["raw_out_thought"])
+    raw_out_enc = list(wts["raw_out_enc"])
+    raw_out_emit = list(wts["raw_out_emit"])
+    raw_out_message = list(wts["raw_out_message"])
+    harness_w = list(wts["harness_w"])
+    tool_ws = list(wts["tool_ws"])
     phys_raw = list(total_inputs)
 
     off = official_usage or {}
@@ -207,81 +815,27 @@ def reconstruct_model_step_usage(
     elif off_in is not None:
         off_unc = off_in
 
-    # Cached from totalinput (context_start)
-    caches = [0] * n
-    if n >= 2:
-        for i in range(n - 1):
-            caches[i] = max(0, int(total_inputs[i]))
-        caches[n - 1] = 0
-        # Warm continuity: prior was served as cache — unless full re-read
-        if not cold and prior_i > 0 and not context_reread:
-            caches[0] = max(caches[0], prior_i)
-    elif n == 1:
-        if not cold and prior_i > 0 and not context_reread:
-            caches[0] = prior_i
-        else:
-            caches[0] = 0
-
-    # User-prompt continuity Cached is part of official cachedRead — not on top.
-    # Reserve prior for the user row; scale LLM-call caches to the remainder so
-    # user_cached + Σ call_cached == official cachedRead.
-    user_cache_share = 0
-    if (
-        not cold
-        and prior_i > 0
-        and not context_reread
-        and off_cache is not None
-        and int(off_cache) > 0
-    ):
-        user_cache_share = min(int(prior_i), int(off_cache))
-
-    if off_cache is not None:
-        off_c = int(off_cache)
-        call_cache_target = max(0, off_c - int(user_cache_share))
-        if n >= 2:
-            head = [float(max(0, caches[i])) for i in range(n - 1)]
-            if sum(head) > 0:
-                scaled = _scale_ints(head, call_cache_target)
-                for i in range(n - 1):
-                    caches[i] = int(scaled[i])
-            elif call_cache_target > 0:
-                caches[0] = call_cache_target
-            caches[n - 1] = 0
-            drift = call_cache_target - sum(caches[: n - 1])
-            if drift != 0 and n >= 2:
-                caches[n - 2] = max(0, caches[n - 2] + drift)
-            caches[n - 1] = 0
-        else:
-            # Single call: remainder after user continuity (often 0 on pure warm)
-            caches[0] = call_cache_target
-
-    # Paid uncached pro-rata (tokenized input growth)
-    paid_w: list[float] = []
-    for i in range(n):
-        if i == 0:
-            if cold:
-                paid_w.append(float(max(1, total_inputs[0], caches[0] + 1)))
-            else:
-                growth = max(0, total_inputs[0] - prior_i)
-                paid_w.append(float(max(1, growth, harness_w[0])))
-        else:
-            prev_out_w = (
-                raw_out_thought[i - 1]
-                + raw_out_enc[i - 1]
-                + raw_out_emit[i - 1]
-                + raw_out_message[i - 1]
-            )
-            paid_w.append(float(max(1.0, prev_out_w + harness_w[i - 1], harness_w[i])))
-
-    if off_unc is not None and sum(paid_w) > 0:
-        paid_uncached = _scale_ints(paid_w, int(off_unc))
-    elif off_unc is not None:
-        paid_uncached = [0] * n
-        paid_uncached[0] = int(off_unc)
-    else:
-        paid_uncached = [max(0, int(round(w))) for w in paid_w]
-
-    inputs = [int(caches[i] + paid_uncached[i]) for i in range(n)]
+    inputs, caches, paid_uncached, user_cache_share, last_cache_omitted = (
+        _reconstruct_inputs_and_cache(
+        n=n,
+        starts=total_inputs,
+        ends=stream_ends,
+        harness_w=harness_w,
+        raw_out_thought=raw_out_thought,
+        raw_out_enc=raw_out_enc,
+        raw_out_emit=raw_out_emit,
+        raw_out_message=raw_out_message,
+        off_in=off_in,
+        off_unc=off_unc,
+        cold=cold,
+        prior_i=prior_i,
+        context_reread=context_reread,
+        reread_uncached_tokens=int(reread_uncached_tokens or 0),
+        user_uncached_tokens=int(user_uncached_tokens or 0),
+        system_uncached_tokens=int(system_uncached_tokens or 0),
+        context_end_tokens=context_end_tokens,
+        )
+    )
     logical_inputs = list(inputs)
     logical_caches = list(caches)
     logical_uncached = list(paid_uncached)
@@ -300,135 +854,21 @@ def reconstruct_model_step_usage(
     # Reasoning[encrypted] = residual of the *full* official output pool
     # (pure Out + reasoningTokens API buckets) after those TokZ, pro-rata by
     # encrypted tokZ. Enc thus absorbs leftover pure Out as well as reason.
-    th_w_list = [max(0.0, float(raw_out_thought[i])) for i in range(n)]
-    em_w_list = [max(0.0, float(raw_out_emit[i])) for i in range(n)]
-    msg_w_list = [max(0.0, float(raw_out_message[i])) for i in range(n)]
-    enc_w = [max(0.0, float(raw_out_enc[i])) for i in range(n)]
-
-    out_thought = [max(0, int(round(th_w_list[i]))) for i in range(n)]
-    out_message = [max(0, int(round(msg_w_list[i]))) for i in range(n)]
-    out_emit = [max(0, int(round(em_w_list[i]))) for i in range(n)]
-    th_sum = int(sum(out_thought))
-    msg_sum = int(sum(out_message))
-    em_sum = int(sum(out_emit))
-    fixed_sum = int(th_sum + msg_sum + em_sum)
-
-    if off_out is not None:
-        total_out_sum = max(0, int(off_out))
-    else:
-        # proxy: fixed TokZ + enc signal
-        total_out_sum = max(
-            fixed_sum + max(0, int(round(sum(enc_w)))),
-            fixed_sum,
-            1,
-        )
-
-    # Official reason bucket (informational / clamp reference only)
-    if off_reason is not None:
-        target_r_official = min(max(0, int(off_reason)), total_out_sum)
-    else:
-        target_r_official = max(0, em_sum + max(0, int(round(sum(enc_w)))))
-        target_r_official = min(target_r_official, total_out_sum)
-
-    # If Thought+Message+ToolReq TokZ exceed full output, scale them jointly
-    if fixed_sum > total_out_sum and fixed_sum > 0:
-        scaled_fixed = _scale_ints(
-            [
-                float(out_thought[i] + out_message[i] + out_emit[i])
-                for i in range(n)
-            ],
-            total_out_sum,
-        )
-        for i in range(n):
-            bag = int(scaled_fixed[i])
-            if bag <= 0:
-                out_thought[i] = out_message[i] = out_emit[i] = 0
-                continue
-            parts = _scale_ints(
-                [
-                    float(out_thought[i]),
-                    float(out_message[i]),
-                    float(out_emit[i]),
-                ],
-                bag,
-            )
-            out_thought[i], out_message[i], out_emit[i] = (
-                int(parts[0]),
-                int(parts[1]),
-                int(parts[2]),
-            )
-        th_sum = int(sum(out_thought))
-        msg_sum = int(sum(out_message))
-        em_sum = int(sum(out_emit))
-        fixed_sum = int(th_sum + msg_sum + em_sum)
-    elif total_out_sum <= 0:
-        out_thought = [0] * n
-        out_message = [0] * n
-        out_emit = [0] * n
-        th_sum = msg_sum = em_sum = fixed_sum = 0
-
-    # Enc residual = full output − Thought − Message − ToolReq
-    # (covers leftover pure Out + official reason − those TokZ)
-    enc_pool = max(0, int(total_out_sum) - int(fixed_sum))
-    out_reasoning = (
-        _scale_ints(enc_w, enc_pool) if enc_pool > 0 and sum(enc_w) > 0 else [0] * n
+    _out = _reconstruct_output(
+        n,
+        raw_out_thought,
+        raw_out_enc,
+        raw_out_emit,
+        raw_out_message,
+        off_out,
+        off_reason,
     )
-    if enc_pool > 0 and sum(out_reasoning) == 0:
-        # no enc size signal → park residual on last active call
-        out_reasoning = [0] * n
-        for i in range(n - 1, -1, -1):
-            if th_w_list[i] + em_w_list[i] + msg_w_list[i] > 0 or i == 0:
-                out_reasoning[i] = enc_pool
-                break
-
-    # Fix drift so Σ(th+msg+em+enc) == total_out_sum
-    got_fixed_enc = int(
-        sum(out_thought) + sum(out_message) + sum(out_emit) + sum(out_reasoning)
-    )
-    if total_out_sum > 0 and got_fixed_enc != total_out_sum:
-        need = total_out_sum - got_fixed_enc
-        if need > 0:
-            out_reasoning[-1] = int(out_reasoning[-1]) + need
-        else:
-            need = -need
-            for bag in (out_reasoning, out_emit, out_message, out_thought):
-                if need <= 0:
-                    break
-                for i in sorted(range(n), key=lambda j: bag[j], reverse=True):
-                    if need <= 0:
-                        break
-                    take = min(int(bag[i]), need)
-                    bag[i] -= take
-                    need -= take
-
-    # Display / attr: reason budget = ToolReq + Enc (may exceed official reason)
-    target_r = int(sum(out_emit) + sum(out_reasoning))
-    pure_out = max(0, int(sum(out_thought) + sum(out_message)))
-
-    outputs = [0] * n
-    for i in range(n):
-        outputs[i] = (
-            int(out_thought[i])
-            + int(out_reasoning[i])
-            + int(out_emit[i])
-            + int(out_message[i])
-        )
-    out_got = int(sum(outputs))
-    if total_out_sum > 0 and out_got != total_out_sum:
-        d = total_out_sum - out_got
-        if d > 0:
-            out_reasoning[-1] += d
-            outputs[-1] += d
-        else:
-            need = -d
-            for i in range(n - 1, -1, -1):
-                for bag in (out_reasoning, out_emit, out_message, out_thought):
-                    if need <= 0:
-                        break
-                    take = min(int(bag[i]), need)
-                    bag[i] -= take
-                    outputs[i] -= take
-                    need -= take
+    out_thought = _out["out_thought"]
+    out_message = _out["out_message"]
+    out_emit = _out["out_emit"]
+    out_reasoning = _out["out_reasoning"]
+    outputs = _out["outputs"]
+    enc_w = _out["enc_w"]
 
     # Harness tree In = fixed LLM Out (re-enter) + tool pool (scaled separately).
     # Final call: Out → user (not next LLM); tools/hooks only.
@@ -526,22 +966,21 @@ def reconstruct_model_step_usage(
         cost_cache_logical = _price_cache(logical_cache, tier_ctx)
 
         th_tok = int(out_thought[i])
-        re_tok = int(out_reasoning[i])  # encrypted residual only
+        re_tok = int(out_reasoning[i])  # Enc + leftover Out, pro-rata TokZ
         em_tok = int(out_emit[i])
         msg_tok = int(out_message[i])
-        # Reasoning budget = ToolRequest + Encrypted (Thought is pure Out)
+        # Reasoning budget = ToolRequest + Encrypted (Thought mass is inside Enc)
         reason_budget_tok = em_tok + re_tok
-        # Attribution "Reasoning" strip = encrypted only
         reason_tok = re_tok
-        th_usd, re_usd, em_usd, msg_usd = _fit_usd_parts(
+        re_usd, em_usd, msg_usd = _fit_usd_parts(
             [
-                _price_out(th_tok, tier_ctx),
                 _price_out(re_tok, tier_ctx),
                 _price_out(em_tok, tier_ctx),
                 _price_out(msg_tok, tier_ctx),
             ],
             cost_out,
         )
+        th_usd = 0.0
 
         thought_chars = int(
             step.get("thought_summary_chars") or step.get("thought_chars") or 0
@@ -848,7 +1287,7 @@ def reconstruct_model_step_usage(
                     "Hook-only harness (internal / → user): no Cached, no next LLM."
                     if hook_only
                     else (
-                        "Cached = this call's prompt prefix (totalinput@start). "
+                        "Cached = this call's Input − paid uncached (last included). "
                         "Harness In = LLM Out (re-enter) + tool results."
                     )
                 )
@@ -1171,11 +1610,6 @@ def reconstruct_model_step_usage(
         cost_in_logical = float(cost_in)
 
         final_to_user = i == n - 1 and n >= 2
-        if final_to_user:
-            cache_t = 0
-            cost_cache = 0.0
-            cost_cache_logical = 0.0
-            logical_cache = 0
         paid_cache_t = int(cache_t)
         paid_cost_cache = float(cost_cache)
         # API bill @ stream start (paid uncached + cache + out) — session accounting
@@ -1233,8 +1667,8 @@ def reconstruct_model_step_usage(
         # NEVER use h_tok / unc_t: those are warm-scaled to official
         # Input−Cache (Σ multi-call bills) and inflated Δctx to 10k–100k.
         raw_delta = 0
-        s0, s1 = step.get("context_start"), step.get("context_end")
-        if isinstance(s0, int) and isinstance(s1, int):
+        s0, s1 = _step_stream_start(step), _step_stream_end(step)
+        if s1 > 0:
             raw_delta = max(0, s1 - s0)
         raw_h = (
             int(max(0, round(float(harness_w[i]))))
@@ -1271,7 +1705,7 @@ def reconstruct_model_step_usage(
         if final_to_user:
             step_ann["final_to_user"] = True
             step_ann["in_note"] = (
-                "Final call of the round → user. No Cached "
+                "Final call of the round → user. Cached stays. "
                 "(In = harness tools only; Out → user, not next LLM)."
             )
         step_ann["context_growth_est"] = int(growth_est)
@@ -1335,7 +1769,7 @@ def reconstruct_model_step_usage(
             "tokenizer": tokenizer_mode(),
             "in_note": (
                 "Tree In (call) = Harness In = LLM Out→In (mid-round) + tools. "
-                "Cached = totalinput@stream start (context_start), last=0. "
+                "Cached = Input − paid uncached at that prompt (last=0). "
                 "White estimate_usd = In + Cached + Out (displayed; Out also in In). "
                 "api_call_usd = paid@start uncached + cache + out."
             ),
@@ -1349,222 +1783,50 @@ def reconstruct_model_step_usage(
     reread_i = max(0, int(reread_uncached_tokens or 0)) if context_reread else 0
     user_i = max(0, int(user_uncached_tokens or 0))
     if not cold and off_unc is not None and annotated:
-        if prior_i > 0 and steps:
-            cs0 = steps[0].get("context_start")
-            if isinstance(cs0, int) and cs0 > prior_i:
-                warm_user_est = max(0, int(cs0) - prior_i)
-        # Prefer explicit user_uncached; fall back to stream growth estimate
-        if user_i <= 0 and warm_user_est > 0:
-            user_i = int(warm_user_est)
-        # Warm: harness target = off_unc − user − reread (never absorb User In)
-        target_h = max(0, int(off_unc) - int(user_i) - int(reread_i))
-
-        # Per-step fixed Out→In and tools-only weights
-        out_fixed_per: list[int] = []
-        tools_w_per: list[float] = []
-        for s in annotated:
-            o_fix = 0
-            t_w = 0.0
-            for ch in s.get("children") or []:
-                if ch.get("kind") != "phase_harness":
-                    continue
-                for sub in ch.get("children") or []:
-                    if sub.get("to_user"):
-                        continue
-                    ck = sub.get("kind")
-                    tin = int(sub.get("tokens_in") or sub.get("context_delta") or 0)
-                    if ck == "llm_to_in":
-                        o_fix += tin
-                    elif ck in ("tool", "late_context", "hook") or sub.get("name"):
-                        t_w += float(max(0, tin))
-            if o_fix <= 0:
-                o_fix = int(s.get("llm_out_in_tokens") or 0)
-            if t_w <= 0:
-                # fall back: harness_in − out
-                t_w = float(
-                    max(0, int(s.get("harness_in_tokens") or 0) - o_fix)
-                )
-            out_fixed_per.append(int(o_fix))
-            tools_w_per.append(float(t_w))
-
-        out_fixed_sum = int(sum(out_fixed_per))
-        tools_target = max(0, int(target_h) - out_fixed_sum)
-        tools_sum = sum(tools_w_per)
-        h_sum = out_fixed_sum + tools_sum
-
-        if h_sum > 0 and (
-            target_h != int(round(h_sum))
-            or (context_reread and reread_i > 0)
-            or (tools_sum > 0 and tools_target != int(round(tools_sum)))
-        ):
-            if tools_sum > 0:
-                scaled_tools = _scale_ints(tools_w_per, tools_target)
-            else:
-                scaled_tools = [0] * len(annotated)
-            tot_harness_in = 0
-            tot_harness_in_usd = 0.0
-            tot_out_to_harness_in = 0
-            tot_out_to_harness_in_usd = 0.0
-            for si, s in enumerate(annotated):
-                o_fix = int(out_fixed_per[si])
-                new_tools = int(scaled_tools[si]) if si < len(scaled_tools) else 0
-                new_h = int(o_fix) + int(new_tools)
-                tctx = step_tier_ctx(s, fallback=max(new_h, 1))
-                new_h_usd = float(_price_in(new_h, tctx)) if new_h > 0 else 0.0
-                children = list(s.get("children") or [])
-                for ch in children:
-                    if ch.get("kind") != "phase_harness":
-                        continue
-                    sub = list(ch.get("children") or [])
-                    # Keep llm_to_in fixed; scale only tool/late/hook kids
-                    tool_kids = [
-                        c
-                        for c in sub
-                        if not c.get("to_user")
-                        and c.get("kind") != "llm_to_in"
-                        and (
-                            c.get("kind") in ("tool", "late_context", "hook")
-                            or c.get("name")
-                        )
-                    ]
-                    for c in sub:
-                        if c.get("kind") != "llm_to_in":
-                            continue
-                        c["tokens_in"] = int(o_fix)
-                        c["context_delta"] = int(o_fix)
-                        c["cost_in_usd"] = (
-                            float(_price_in(o_fix, tctx)) if o_fix > 0 else 0.0
-                        )
-                        c["estimate_usd"] = float(c["cost_in_usd"])
-                    if tool_kids:
-                        kw = [
-                            float(
-                                max(
-                                    0,
-                                    int(
-                                        c.get("tokens_in")
-                                        or c.get("context_delta")
-                                        or 0
-                                    ),
-                                )
-                            )
-                            for c in tool_kids
-                        ]
-                        if sum(kw) <= 0:
-                            kw = [1.0] * len(tool_kids)
-                        if new_tools > 0:
-                            ks = _scale_ints(kw, new_tools)
-                            for c, kt in zip(tool_kids, ks):
-                                c["tokens_in"] = int(kt)
-                                c["context_delta"] = int(kt)
-                                c["cost_in_usd"] = float(_price_in(int(kt), tctx))
-                                c["estimate_usd"] = float(
-                                    float(c.get("cost_in_usd") or 0)
-                                    + float(c.get("cost_cached_usd") or 0)
-                                    + float(c.get("cost_out_usd") or 0)
-                                )
-                        else:
-                            for c in tool_kids:
-                                c["tokens_in"] = 0
-                                c["context_delta"] = 0
-                                c["cost_in_usd"] = 0.0
-                    ch["tokens_in"] = new_h
-                    ch["cost_in_usd"] = new_h_usd
-                    ch["estimate_usd"] = new_h_usd
-                    ch["llm_out_in_tokens"] = int(o_fix)
-                    ch["llm_out_in_usd"] = (
-                        float(_price_in(o_fix, tctx)) if o_fix > 0 else 0.0
-                    )
-                    ch["children"] = sub
-                s["children"] = children
-                s["tokens_in"] = new_h
-                s["cost_in_usd"] = new_h_usd
-                s["harness_in_tokens"] = new_h
-                s["harness_in_usd"] = new_h_usd
-                s["llm_out_in_tokens"] = int(o_fix)
-                s["llm_out_in_usd"] = (
-                    float(_price_in(o_fix, tctx)) if o_fix > 0 else 0.0
-                )
-                cache_usd = float(s.get("cost_cached_usd") or 0)
-                out_usd = float(s.get("cost_out_usd") or 0)
-                line_usd = float(new_h_usd + cache_usd + out_usd)
-                s["cost_of_call_usd"] = line_usd
-                s["estimate_usd"] = line_usd
-                est = dict(s.get("estimate") or {})
-                est["uncached_input_tokens"] = new_h
-                est["logical_uncached_tokens"] = new_h
-                est["cost_in_usd"] = new_h_usd
-                est["estimate_usd"] = line_usd
-                est["cost_of_call_usd"] = line_usd
-                s["estimate"] = est
-                tools_scaled: list[dict[str, Any]] = []
-                for ch in children:
-                    if ch.get("kind") == "phase_harness":
-                        for sub in ch.get("children") or []:
-                            if sub.get("kind") == "tool":
-                                tools_scaled.append(sub)
-                    elif ch.get("kind") == "tool":
-                        tools_scaled.append(ch)
-                s["tools"] = tools_scaled
-                comp = dict(s.get("composition") or {})
-                # Bar harness = full Call In (not tools-only)
-                comp["harness_results"] = int(new_h)
-                comp["harness_tools_only"] = int(new_tools)
-                comp["llm_out_to_in"] = int(o_fix)
-                s["composition"] = comp
-                s["harness_scaled_to_official_unc"] = True
-                s["harness_raw_tokens"] = int(out_fixed_per[si] + tools_w_per[si])
-                tot_harness_in += new_h
-                tot_harness_in_usd += new_h_usd
-                tot_out_to_harness_in += int(o_fix)
-                tot_out_to_harness_in_usd += (
-                    float(_price_in(o_fix, tctx)) if o_fix > 0 else 0.0
-                )
-            warm_in_scaled = not bool(context_reread and reread_i > 0)
-        elif h_sum > 0:
-            warm_in_scaled = not bool(context_reread and reread_i > 0)
+        wr = _rescale_warm_harness(
+            annotated,
+            steps,
+            off_unc=int(off_unc),
+            prior_i=prior_i,
+            user_uncached_tokens=int(user_uncached_tokens or 0),
+            reread_uncached_tokens=int(reread_uncached_tokens or 0),
+            context_reread=context_reread,
+            tot_harness_in=tot_harness_in,
+            tot_harness_in_usd=tot_harness_in_usd,
+            tot_out_to_harness_in=tot_out_to_harness_in,
+            tot_out_to_harness_in_usd=tot_out_to_harness_in_usd,
+        )
+        warm_in_scaled = bool(wr["warm_in_scaled"])
+        warm_user_est = int(wr["warm_user_est"])
+        user_i = int(wr["user_i"])
+        reread_i = int(wr["reread_i"])
+        tot_harness_in = wr["tot_harness_in"]
+        tot_harness_in_usd = wr["tot_harness_in_usd"]
+        tot_out_to_harness_in = wr["tot_out_to_harness_in"]
+        tot_out_to_harness_in_usd = wr["tot_out_to_harness_in_usd"]
 
     cache_display_sum = (
         int(sum(int(s.get("tokens_cached") or 0) for s in annotated)) if annotated else 0
     )
-    # Call caches sum to (off_cache − user_cache_share). Fit $ to that remainder
-    # so we don't re-inflate call Cached to the full official bill.
-    # Round Cached $ must still include user_cache_share (shown on user-prompt row;
-    # previously only call remainder was priced → e.g. 256k tok @ $0.039 not $0.077).
+    # Price each call's *own* prefix. Do not scale tokens up to official
+    # cachedRead (that re-inflates every call with the last-call slice).
+    # Round totals.cached_read stays official; last's omitted slice is
+    # last_cache_omitted on the breakdown.
     call_cache_tok = int(cache_display_sum)
     user_cache_usd = 0.0
     call_cache_usd = float(tot_cost_cache)
     if off_cache is not None:
-        # Official round total still reports full cachedRead
-        expected_call_cache = max(0, int(off_cache) - int(user_cache_share))
-        if (
-            not cold
-            and annotated
-            and call_cache_tok > 0
-            and call_cache_tok != expected_call_cache
-        ):
-            # Re-normalize token weights if drift
-            pass
-        # Price cache **per LLM call** with that call's own tier (context_start).
-        # Never use round peak: crossing 200k mid-round only raises rates for
-        # calls whose prompt already sits above the threshold.
-        if not cold and annotated and (call_cache_tok > 0 or expected_call_cache > 0):
-            w_c = [float(max(0, int(s.get("tokens_cached") or 0))) for s in annotated]
-            tok_sum = sum(w_c)
-            scale_tok = 1.0
-            if (
-                tok_sum > 0
-                and expected_call_cache > 0
-                and abs(tok_sum - expected_call_cache) > 0
-            ):
-                scale_tok = float(expected_call_cache) / tok_sum
+        if annotated:
             tot_cost_cache = 0.0
             tot_cost = 0.0
             for s in annotated:
-                c_tok = int(max(0, round(float(s.get("tokens_cached") or 0) * scale_tok)))
+                try:
+                    c_tok = int(s.get("tokens_cached") or 0)
+                except (TypeError, ValueError):
+                    c_tok = 0
                 tctx = step_tier_ctx(s, fallback=max(c_tok, 1))
                 c_usd = float(_price_cache(c_tok, tctx))
-                s["tokens_cached"] = c_tok
+                s["tokens_cached"] = int(c_tok)
                 s["cost_cached_usd"] = c_usd
                 s["tier_context_tokens"] = int(tctx)
                 s["tier"] = pick_tier(tctx)["name"]
@@ -1573,11 +1835,11 @@ def reconstruct_model_step_usage(
                 in_usd = float(s.get("cost_in_usd") or 0)
                 api_bill = paid_in + c_usd + out_usd
                 line_bill = in_usd + c_usd + out_usd
-                # White total matches displayed In + Cached + Out
                 s["estimate_usd"] = float(line_bill)
                 s["cost_of_call_usd"] = float(line_bill)
                 s["api_call_usd"] = float(api_bill)
                 est = dict(s.get("estimate") or {})
+                est["cached_read_tokens"] = int(c_tok)
                 est["cost_cached_usd"] = c_usd
                 est["estimate_usd"] = float(line_bill)
                 est["cost_of_call_usd"] = float(line_bill)
@@ -1593,15 +1855,16 @@ def reconstruct_model_step_usage(
                 for ch in s.get("children") or []:
                     if ch.get("kind") == "phase_harness" and not ch.get("hook_only"):
                         ch["cost_cached_usd"] = c_usd
-                        ch["tokens_cached"] = int(s.get("tokens_cached") or 0)
-                        ch["display_cached_tokens"] = int(s.get("tokens_cached") or 0)
+                        ch["tokens_cached"] = int(c_tok)
+                        ch["display_cached_tokens"] = int(c_tok)
                         ch["display_cached_usd"] = c_usd
                 tot_cost_cache += c_usd
                 tot_cost += api_bill
             call_cache_usd = float(tot_cost_cache)
         else:
             call_cache_usd = float(tot_cost_cache)
-        # User continuity cache $: tier of first call (or prior), not round peak
+        # User-row continuity $ (same prefix as Call 1). Do not add it
+        # again into tot_cost — Call 1 already prices that prefix.
         if not cold and user_cache_share > 0:
             user_tier_ctx = 1
             if annotated:
@@ -1611,11 +1874,7 @@ def reconstruct_model_step_usage(
             elif isinstance(prior_i, int) and prior_i > 0:
                 user_tier_ctx = int(prior_i)
             user_cache_usd = float(_price_cache(int(user_cache_share), user_tier_ctx))
-            tot_cost_cache = float(call_cache_usd) + float(user_cache_usd)
-            tot_cost = float(tot_cost) + float(user_cache_usd)
-        else:
-            tot_cost_cache = float(call_cache_usd)
-        # Round-level cached tokens = official (user share + call share)
+        tot_cost_cache = float(call_cache_usd)
         tot_cache = int(off_cache)
 
     paid_unc_sum = int(sum(paid_uncached)) if paid_uncached else 0
@@ -1672,6 +1931,7 @@ def reconstruct_model_step_usage(
         # Continuity cache held on user prompt (token scale excludes from calls;
         # $ is re-added into round cached_usd so tokens ↔ $ match).
         "user_cache_share_tokens": int(user_cache_share),
+        "last_cache_omitted_tokens": int(last_cache_omitted),
         "user_cache_share_usd": float(user_cache_usd),
         "call_cached_tokens": int(call_cache_tok),
         "call_cached_usd": float(call_cache_usd),
@@ -1704,7 +1964,7 @@ def reconstruct_model_step_usage(
         "note": (
             f"Tokenizer={tokenizer_mode()}. "
             "Reasoning=Thought+ToolReq+Enc residual; pure Out→messages only. "
-            "Cached[i]=context_start (last=0). Tree Call In=harness. Round $=API bill."
+            "Cached[i]=Input[i]−uncached[i] at that prompt (last=0, no dump). Tree Call In=harness."
         ),
         "prior_context_tokens": prior_context_tokens,
     }

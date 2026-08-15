@@ -104,7 +104,7 @@ class HierarchyBuilder:
         # Bumps when structure changes (for dashboard snapshot cache)
         self.revision: int = 0
         self._session_dir: Optional[Path] = None
-        self._child_usage_cache: dict[str, dict[str, int]] = {}
+        self._child_usage_cache: dict[str, Any] = {}
         # hook_execution payloads (session-level; first-prompt ones feed bootstrap)
         self._hooks: list[dict[str, Any]] = []
         self._bootstrap_hooks: list[dict[str, Any]] = []
@@ -143,6 +143,7 @@ class HierarchyBuilder:
         self._reasonings_cursor = 0
         self._tool_results_cache = None
         self._tool_results_mtime = None
+        self._child_usage_cache = {}
         # Never carry fork cards / hooks across session dirs
         self._pending_hooks.clear()
         self._pending_recaps.clear()
