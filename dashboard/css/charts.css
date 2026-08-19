@@ -163,10 +163,8 @@ canvas {
   flex-wrap: wrap;
   gap: var(--space-1) 6px;
   margin: var(--space-2) 0 0;
-  max-height: 72px;
-  overflow-y: auto;
-  scrollbar-width: thin;
-  scrollbar-color: var(--scrollbar-thumb) transparent;
+  max-height: none;
+  overflow: visible;
   padding: 2px 0;
 }
 
@@ -255,6 +253,15 @@ canvas {
 }
 
 /* ── Unit toggle ────────────────────────────────────────────── */
+.unit-toggle.is-disabled {
+  opacity: 0.38;
+  pointer-events: none;
+  filter: grayscale(0.35);
+}
+.unit-toggle.is-disabled button {
+  cursor: not-allowed;
+}
+
 .unit-toggle {
   display: inline-flex;
   border: 1px solid var(--border);

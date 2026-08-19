@@ -5,6 +5,48 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-08-19
+
+History watch dashboard, cost-chart I/O · Parts · Tools stacks (session +
+period), and thought Out $ on LLM calls.
+
+### Added
+
+- **`/history`** live `chat_history.jsonl` watcher: baselines on first sight,
+  then classifies append / tail / mutate / truncate. Prefix mutations (cache
+  miss risk) vs streaming tail. Compact-glue badge. Isolated from R1/System
+  reconstruct.
+- Cost chart **I/O · Parts · Tools** stack + **Rounds / Time · By label**.
+  Drill applies the same three stacks (I/O and Parts fold call cats).
+- Period **Parts / Tools** replay hierarchy per session (mtime cache). Each
+  round / recap / compact is bucketed by **its own timestamp** — a session
+  that continues across days does not dump its past into the current bucket.
+  Reasoning is **our** Enc/thought split, not API `reasoningTokens`.
+- `GET /api/aggregate?stack=parts|tools` and `GET /api/history`.
+
+### Changed
+
+- **Thought Out $** is a real share of official output (TokZ × out rate,
+  fitted with Enc / ToolReq / Message). It was hardcoded `$0` (mass parked
+  on Enc), so LLM Call tree, drill, and By-label charts showed $0 thought.
+- Recap In/Cached/Out stays split in **I/O**; **Parts** and **Tools** fold
+  recap (and compact) into one `recap` / `compact` block.
+- Cost-chart labels: In / Cached / Out and LLM Out→In keep that casing;
+  everything else lowercase. Recap no longer injects a second Cached chip.
+- X labels rotate when they would collide; plot height grows so they are
+  not clipped. Zoom (and the “scroll to zoom” hint) only on the X-axis
+  band. View switches reset to full unzoom unless the user wheel-zoomed.
+- Legend wraps with no scrollbar. By-label hide keeps the chip so it can
+  be shown again; zero cats are omitted. Timeframe / Cumulative / grain
+  are disabled in By-label (Time layout only).
+- Tooltips no longer flash across Session ↔ period (owner + stale fetch
+  ignored). Hover tip stays while the pointer is on the bar through polls.
+
+### Fixed
+
+- Thought $0 on LLM Call / Parts / Tools By-label (reconstruct `th_usd`).
+- Period Parts/Tools used API reasoning ticks instead of hierarchy cats.
+
 ## [0.4.1] — 2026-08-15
 
 Partial reconstruct / cache / sub-agent / compact-recap pass. Round 1 System

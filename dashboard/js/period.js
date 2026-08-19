@@ -1,6 +1,6 @@
 /** Daily / weekly / monthly aggregate view. */
 import { $, fmtTokens, fmtUsd, esc, joinParts, totalPrice } from './fmt.js';
-import { drawAggBars, setCostUnit } from './charts.js';
+import { drawAggBars, setCostUnit, hideAllChartTips } from './charts.js';
 import { switchSession } from './sessions.js';
 
 const PERIODS = new Set(["daily", "weekly", "monthly"]);
@@ -24,6 +24,8 @@ let _scope = "session";
 let _offset = 0;
 let _grain = "hour";
 let _mode = "timeframe";
+let _byLabel = false;
+let _stack = "io";
 let _pollRef = null;
 let _lastAgg = null;
 
@@ -44,6 +46,8 @@ function persist() {
     localStorage.setItem("tt-scope", _scope);
     localStorage.setItem("tt-agg-mode", _mode);
     localStorage.setItem("tt-period-grain", _grain);
+    localStorage.setItem("tt-agg-bylabel", _byLabel ? "1" : "0");
+    localStorage.setItem("tt-agg-stack", _stack);
   } catch { /* ignore */ }
 }
 
@@ -53,6 +57,9 @@ export function restoreScope() {
     if (PERIODS.has(s) || s === "session") _scope = s;
     const m = localStorage.getItem("tt-agg-mode");
     if (m === "cumulative" || m === "timeframe") _mode = m;
+    _byLabel = localStorage.getItem("tt-agg-bylabel") === "1";
+    const sk = localStorage.getItem("tt-agg-stack");
+    if (sk === "io" || sk === "parts" || sk === "tools") _stack = sk;
     const g = localStorage.getItem("tt-period-grain") || localStorage.getItem("tt-monthly-grain");
     if (g) _grain = normalizeGrain(_scope, g);
   } catch { /* ignore */ }
@@ -112,8 +119,44 @@ function applyScopeChrome() {
     cu.classList.toggle("active", _mode === "cumulative");
     cu.setAttribute("aria-pressed", _mode === "cumulative" ? "true" : "false");
   }
+  ["aggStackIo", "aggStackParts", "aggStackTools"].forEach((id) => {
+    const el = $(id);
+    if (!el) return;
+    const on = el.dataset.stack === _stack;
+    el.classList.toggle("active", on);
+    el.setAttribute("aria-pressed", on ? "true" : "false");
+  });
+  const t = $("aggLayoutTime");
+  const l = $("aggLayoutLabel");
+  if (t) {
+    t.classList.toggle("active", !_byLabel);
+    t.setAttribute("aria-pressed", !_byLabel ? "true" : "false");
+  }
+  if (l) {
+    l.classList.toggle("active", !!_byLabel);
+    l.setAttribute("aria-pressed", _byLabel ? "true" : "false");
+  }
   const next = $("periodNext");
   if (next) next.disabled = _offset >= 0;
+  const lockTime = !!_byLabel;
+  ["periodGrain", "aggTfCum"].forEach((id) => {
+    const el = $(id);
+    if (!el) return;
+    el.classList.toggle("is-disabled", lockTime);
+    el.setAttribute("aria-disabled", lockTime ? "true" : "false");
+    el.querySelectorAll("button").forEach((b) => { b.disabled = lockTime; });
+  });
+  if (grainWrap) {
+    grainWrap.title = lockTime
+      ? "Grain applies to Time layout only"
+      : "Bar grain";
+  }
+  const tfCum = $("aggTfCum");
+  if (tfCum) {
+    tfCum.title = lockTime
+      ? "Timeframe / Cumulative apply to Time layout only"
+      : "Bar values";
+  }
 }
 
 export function setScope(scope) {
@@ -122,6 +165,7 @@ export function setScope(scope) {
     _scope = next;
     _offset = 0;
     _grain = normalizeGrain(_scope, _grain);
+    hideAllChartTips();
   }
   persist();
   applyScopeChrome();
@@ -185,6 +229,7 @@ function restoreSessionCardLabels() {
 
 export function leavePeriodView() {
   restoreSessionCardLabels();
+  hideAllChartTips();
 }
 
 function paintSessionList(sessions) {
@@ -220,6 +265,7 @@ function paintSessionList(sessions) {
 }
 
 export function paintPeriod(agg) {
+  if (!isPeriodScope()) return;
   _lastAgg = agg;
   if (!agg || agg.error) {
     showPeriodError(agg && agg.error ? String(agg.error) : "no aggregate");
@@ -235,13 +281,16 @@ export function paintPeriod(agg) {
   const modeLab = $("aggModeLabel");
   if (modeLab) {
     const u = (window.__costChart && window.__costChart.unit) === "tokens" ? "Tok" : "$";
-    modeLab.textContent = `${_mode === "cumulative" ? "Cumulative" : "Timeframe"} · In / Cached / Out · ${u}`;
+    const stackLab = _stack === "tools" ? "Tools" : (_stack === "parts" ? "Parts" : "I/O");
+    modeLab.textContent = `${_mode === "cumulative" ? "Cumulative" : "Timeframe"} · ${stackLab}${_byLabel ? " · by label" : ""} · ${u}`;
   }
   paintCards(agg.totals || {});
   const unit = (window.__costChart && window.__costChart.unit) || "usd";
   drawAggBars($("costChart"), agg.buckets || [], {
     unit,
     cumulative: _mode === "cumulative",
+    byLabel: _byLabel,
+    stack: _stack,
   });
   paintSessionList(agg.sessions || []);
 }
@@ -259,10 +308,11 @@ export async function fetchPeriod() {
     badge.textContent = "loading";
     badge.className = "badge idle";
   }
-  const url = `/api/aggregate?period=${encodeURIComponent(_scope)}&offset=${_offset}&grain=${encodeURIComponent(_grain)}&_=${Date.now()}`;
+  const url = `/api/aggregate?period=${encodeURIComponent(_scope)}&offset=${_offset}&grain=${encodeURIComponent(_grain)}&stack=${encodeURIComponent(_stack)}&_=${Date.now()}`;
   const r = await fetch(url);
   if (!r.ok) throw new Error("HTTP " + r.status);
   const agg = await r.json();
+  if (!isPeriodScope()) return;
   paintPeriod(agg);
 }
 
@@ -280,6 +330,27 @@ export function bindPeriodControls() {
   $("grainB")?.addEventListener("click", (ev) => setGrain(ev.currentTarget.dataset.grain));
   $("aggModeTf")?.addEventListener("click", () => setMode("timeframe"));
   $("aggModeCum")?.addEventListener("click", () => setMode("cumulative"));
+  const setAggStack = (s) => {
+    _stack = s;
+    persist();
+    applyScopeChrome();
+    if (_pollRef) _pollRef();
+  };
+  $("aggStackIo")?.addEventListener("click", () => setAggStack("io"));
+  $("aggStackParts")?.addEventListener("click", () => setAggStack("parts"));
+  $("aggStackTools")?.addEventListener("click", () => setAggStack("tools"));
+  $("aggLayoutTime")?.addEventListener("click", () => {
+    _byLabel = false;
+    persist();
+    applyScopeChrome();
+    if (_lastAgg) paintPeriod(_lastAgg);
+  });
+  $("aggLayoutLabel")?.addEventListener("click", () => {
+    _byLabel = true;
+    persist();
+    applyScopeChrome();
+    if (_lastAgg) paintPeriod(_lastAgg);
+  });
   $("aggUnitUsd")?.addEventListener("click", () => setCostUnit("usd"));
   $("aggUnitTok")?.addEventListener("click", () => setCostUnit("tokens"));
 }

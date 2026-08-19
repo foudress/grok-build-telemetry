@@ -12,6 +12,7 @@
 <body>
   <header>
     <h1>Grok Token Telemetry</h1>
+    <a href="/history" class="meta" style="text-decoration:none">history</a>
     <span id="liveBadge" class="badge">connecting…</span>
     <div class="session-picker">
       <select id="scopeSelect" title="Session or period aggregate" aria-label="View">
@@ -73,9 +74,15 @@
       <h2 id="costPanelTitle">Cost per round</h2>
       <div id="taskTabs" class="task-tabs" hidden></div>
       <div class="chart-toolbar" id="sessionChartToolbar">
-        <label title="Split each round by attribution (system/user/harness/thought/…)">
-          <input type="checkbox" id="costDetailToggle" /> Detailed attribution
-        </label>
+        <span class="unit-toggle" title="How each bar is split" role="group" aria-label="Category stack">
+          <button type="button" id="stackIo" class="unit-btn active" data-stack="io" aria-pressed="true" title="In / Cached / Out">I/O</button>
+          <button type="button" id="stackParts" class="unit-btn" data-stack="parts" aria-pressed="false" title="User, thought, reasoning, message, harness…">Parts</button>
+          <button type="button" id="stackTools" class="unit-btn" data-stack="tools" aria-pressed="false" title="Per-tool + LLM Out→In (drill cats)">Tools</button>
+        </span>
+        <span class="unit-toggle" title="X axis" role="group" aria-label="X layout">
+          <button type="button" id="costLayoutRounds" class="unit-btn active" aria-pressed="true">Rounds</button>
+          <button type="button" id="costLayoutLabel" class="unit-btn" aria-pressed="false">By label</button>
+        </span>
         <span class="unit-toggle" title="Y-axis unit" role="group" aria-label="Cost chart unit">
           <button type="button" id="costUnitUsd" class="unit-btn active" aria-pressed="true">$</button>
           <button type="button" id="costUnitTok" class="unit-btn" aria-pressed="false">Tok</button>
@@ -91,9 +98,18 @@
           <button type="button" id="grainA" class="unit-btn" data-grain=""></button>
           <button type="button" id="grainB" class="unit-btn" data-grain=""></button>
         </span>
-        <span class="unit-toggle" title="Bar values" role="group" aria-label="Period chart mode">
+        <span class="unit-toggle" id="aggTfCum" title="Bar values" role="group" aria-label="Period chart mode">
           <button type="button" id="aggModeTf" class="unit-btn active" aria-pressed="true">Timeframe</button>
           <button type="button" id="aggModeCum" class="unit-btn" aria-pressed="false">Cumulative</button>
+        </span>
+        <span class="unit-toggle" title="How each bar is split" role="group" aria-label="Period category stack">
+          <button type="button" id="aggStackIo" class="unit-btn active" data-stack="io" aria-pressed="true" title="In / Cached / Out">I/O</button>
+          <button type="button" id="aggStackParts" class="unit-btn" data-stack="parts" aria-pressed="false" title="User, thought, our reasoning, message… by time bucket">Parts</button>
+          <button type="button" id="aggStackTools" class="unit-btn" data-stack="tools" aria-pressed="false" title="Per-tool + LLM Out→In (our reconstruct, by time bucket)">Tools</button>
+        </span>
+        <span class="unit-toggle" title="X axis" role="group" aria-label="Period X layout">
+          <button type="button" id="aggLayoutTime" class="unit-btn active" aria-pressed="true">Time</button>
+          <button type="button" id="aggLayoutLabel" class="unit-btn" aria-pressed="false">By label</button>
         </span>
         <span class="unit-toggle" title="Y-axis unit" role="group" aria-label="Period chart unit">
           <button type="button" id="aggUnitUsd" class="unit-btn active" aria-pressed="true">$</button>
@@ -101,7 +117,7 @@
         </span>
         <span id="aggModeLabel" class="mode-pill">In / Cached / Out</span>
       </div>
-      <div class="chart-wrap" id="costChartWrap" title="Scroll to zoom horizontal scale">
+      <div class="chart-wrap" id="costChartWrap">
         <canvas id="costYAxis" class="cost-yaxis" hidden></canvas>
         <div class="chart-scroll" id="costChartScroll">
           <canvas id="costChart" class="bars" height="320"></canvas>

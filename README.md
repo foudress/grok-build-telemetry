@@ -17,8 +17,9 @@ Live companion dashboard for **[Grok Build](https://x.ai)** sessions: exact toke
 - **System card** — history parts (system / user info / reminders / MCP) plus one **Tool definitions + Message** bucket so `System + R1 In = context_end` (not a hardcoded 8.2k, not official `Σ uncached`)
 - **Per-call cache** — last LLM call Cached = 0 (no harness after it). R1 ctx line is `0 → end`. R1 official Cached is shared across every call except last (Call 1 = System + User)
 - **Compact / Recap** — compact is Cached **or** In (miss) plus compressed **Out**; recaps and compacts keep trigger order. Compact continuation glue is not treated as the first user prompt
-- **Cost chart** — composition per round (drill into calls; harness In green). Sub-agent $ stacks on the parent round (violet); drill has a dedicated bar per agent. Wheel-zoom the X scale; minimum 8 slots so few-round sessions are not stretched
-- **Daily / Weekly / Monthly** — header scope next to Session. Histogram (hourly / 15 min / daily / weekly), timeframe or cumulative, tokens or $. Cards: Total In / Cached / Out / All. Session list for the window (click to open). No context chart
+- **Cost chart** — **I/O · Parts · Tools** stacks on rounds, drill, or **By label**. Recap stays In/Cached/Out in I/O; Parts/Tools fold it. Wheel-zoom only on the X-axis (full unzoom by default). Sub-agent $ stacks on the parent (violet)
+- **Daily / Weekly / Monthly** — same I/O · Parts · Tools. Parts/Tools use our hierarchy cats, bucketed by each turn’s time (not the whole session). Timeframe / grain apply to Time layout only
+- **History watch** — `http://127.0.0.1:8765/history` tails `chat_history.jsonl` for prefix mutations vs append (cache-miss risk)
 - **Sub-agents** — child sessions are peeled out of the parent LLM-call math, then shown as tabs + Sub Agent N rows (In / Cached / Out / $). First-round prompt is **Super Agent** (not User). Period totals skip child dirs (parent bill already includes them)
 - **Context over time** chart (200k rate-cliff line) — Session view only
 - Header **KV** chip (warm / stale idle / miss) + context pressure bar

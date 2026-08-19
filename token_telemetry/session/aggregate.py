@@ -17,6 +17,7 @@ from token_telemetry.session.discover import (
     _read_session_summary,
     list_session_dirs,
 )
+from token_telemetry.session.period_attr import cached_attr_events
 from token_telemetry.session.subagents import price_child_usage
 
 
@@ -110,9 +111,11 @@ def _empty_acc() -> dict[str, float]:
         "tokens_in": 0,
         "tokens_cached": 0,
         "tokens_out": 0,
+        "tokens_reason": 0,
         "cost_in_usd": 0.0,
         "cost_cached_usd": 0.0,
         "cost_out_usd": 0.0,
+        "cost_reason_usd": 0.0,
         "official_usd": 0.0,
         "turns": 0,
     }
@@ -122,9 +125,11 @@ def _add_priced(acc: dict[str, float], priced: dict[str, Any]) -> None:
     acc["tokens_in"] += int(priced.get("tokens_in") or 0)
     acc["tokens_cached"] += int(priced.get("tokens_cached") or 0)
     acc["tokens_out"] += int(priced.get("tokens_out") or 0)
+    acc["tokens_reason"] += int(priced.get("tokens_reason") or 0)
     acc["cost_in_usd"] += float(priced.get("cost_in_usd") or 0)
     acc["cost_cached_usd"] += float(priced.get("cost_cached_usd") or 0)
     acc["cost_out_usd"] += float(priced.get("cost_out_usd") or 0)
+    acc["cost_reason_usd"] += float(priced.get("cost_reason_usd") or 0)
     acc["official_usd"] += float(priced.get("official_usd") or 0)
     acc["turns"] += 1
 
@@ -133,18 +138,22 @@ def _round_acc(acc: dict[str, float]) -> dict[str, Any]:
     tin = int(acc.get("tokens_in") or 0)
     tc = int(acc.get("tokens_cached") or 0)
     tout = int(acc.get("tokens_out") or 0)
+    tr = int(acc.get("tokens_reason") or 0)
     ci = float(acc.get("cost_in_usd") or 0)
     cc = float(acc.get("cost_cached_usd") or 0)
     co = float(acc.get("cost_out_usd") or 0)
+    cr = float(acc.get("cost_reason_usd") or 0)
     tot = float(acc.get("official_usd") or 0) or (ci + cc + co)
     return {
         "tokens_in": tin,
         "tokens_cached": tc,
         "tokens_out": tout,
+        "tokens_reason": tr,
         "tokens_all": tin + tc + tout,
         "cost_in_usd": round(ci, 6),
         "cost_cached_usd": round(cc, 6),
         "cost_out_usd": round(co, 6),
+        "cost_reason_usd": round(cr, 6),
         "official_usd": round(tot, 6),
         "turns": int(acc.get("turns") or 0),
     }
@@ -225,6 +234,7 @@ def _cached_file(session_dir: Path) -> dict[str, Any]:
             "size": 0,
             "turns": [],
             "session_id": session_dir.name,
+            "path": str(session_dir),
             "title": session_dir.name[:8],
             "kind": None,
             "agent_name": None,
@@ -238,6 +248,7 @@ def _cached_file(session_dir: Path) -> dict[str, Any]:
         "size": size,
         "turns": _parse_turns(p),
         "session_id": session_dir.name,
+        "path": str(session_dir),
         "title": title,
         "kind": kind,
         "agent_name": agent,
@@ -377,11 +388,46 @@ def _place(epoch: float, specs: list[dict[str, Any]]) -> Optional[int]:
     return None
 
 
+def _add_cat_list(dest: dict[str, dict[str, Any]], segs: list[dict[str, Any]]) -> None:
+    for s in segs or []:
+        key = str(s.get("key") or "")
+        if not key:
+            continue
+        prev = dest.get(key)
+        if prev:
+            prev["usd"] += float(s.get("usd") or 0)
+            prev["tok"] += float(s.get("tok") or 0)
+        else:
+            dest[key] = {
+                "key": key,
+                "k": s.get("k") or key,
+                "label": s.get("label") or key,
+                "usd": float(s.get("usd") or 0),
+                "tok": float(s.get("tok") or 0),
+            }
+
+
+def _cats_out(acc: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = [v for v in acc.values() if (v.get("usd") or 0) > 0 or (v.get("tok") or 0) > 0]
+    rows.sort(key=lambda x: str(x.get("key") or ""))
+    return [
+        {
+            "key": r["key"],
+            "k": r["k"],
+            "label": r["label"],
+            "usd": round(float(r["usd"]), 8),
+            "tok": round(float(r["tok"]), 4),
+        }
+        for r in rows
+    ]
+
+
 def build_aggregate(
     period: str = "daily",
     offset: int = 0,
     grain: str = "day",
     now: Optional[datetime] = None,
+    stack: str = "io",
 ) -> dict[str, Any]:
     period = (period or "daily").strip().lower()
     if period not in ("daily", "weekly", "monthly"):
@@ -395,9 +441,12 @@ def build_aggregate(
     start, end, label = period_window(period, offset, now=now)
     start_e, end_e = start.timestamp(), end.timestamp()
     specs = _bucket_specs(period, start, end, grain)
-    buckets = [{**s, **_empty_acc()} for s in specs]
+    buckets = [{**s, **_empty_acc(), "_parts": {}, "_tools": {}} for s in specs]
     totals = _empty_acc()
+    tot_parts: dict[str, dict[str, Any]] = {}
+    tot_tools: dict[str, dict[str, Any]] = {}
     sessions: list[dict[str, Any]] = []
+    want_attr = (stack or "io").strip().lower() in ("parts", "tools")
 
     with _lock:
         files = _scan_files()
@@ -419,6 +468,28 @@ def build_aggregate(
                 idx = _place(float(ep), specs)
                 if idx is not None:
                     _add_priced(buckets[idx], t)
+        if billed and want_attr:
+            try:
+                d = Path(row.get("path") or "")
+                if not d.is_dir():
+                    # recover from updates path
+                    d = Path(str(row.get("updates") or ""))
+                    if d.is_file():
+                        d = d.parent
+                if d.is_dir():
+                    for ev in cached_attr_events(d):
+                        ep = ev.get("epoch")
+                        if ep is None or ep < start_e or ep >= end_e:
+                            continue
+                        idx = _place(float(ep), specs)
+                        if idx is None:
+                            continue
+                        _add_cat_list(buckets[idx]["_parts"], ev.get("parts") or [])
+                        _add_cat_list(buckets[idx]["_tools"], ev.get("tools") or [])
+                        _add_cat_list(tot_parts, ev.get("parts") or [])
+                        _add_cat_list(tot_tools, ev.get("tools") or [])
+            except Exception:
+                pass
         if sess_acc["turns"] <= 0:
             continue
         title = row.get("title") or row["session_id"][:8]
@@ -448,12 +519,14 @@ def build_aggregate(
         "label": label,
         "start": start.isoformat(),
         "end": end.isoformat(),
-        "totals": _round_acc(totals),
+        "totals": {**_round_acc(totals), "parts": _cats_out(tot_parts), "tools": _cats_out(tot_tools)},
         "buckets": [
             {
                 "key": b["key"],
                 "label": b["label"],
                 **_round_acc(b),
+                "parts": _cats_out(b.get("_parts") or {}),
+                "tools": _cats_out(b.get("_tools") or {}),
             }
             for b in buckets
         ],

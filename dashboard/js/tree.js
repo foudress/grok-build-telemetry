@@ -357,7 +357,7 @@ function renderChildNode(c, phaseKey) {
     };
     const outTok = m.to || c.estimate_output_tokens || c.tokens_out || 0;
     const prev = c.preview ? String(c.preview) : "[summary]";
-    return `<div class="node" title="${esc(c.estimate_note || "Thought — tokenizer definitive; inside reasoningTokens")}">
+    return `<div class="node" title="${esc(c.estimate_note || "Thought summary — TokZ + share of official Out $")}">
       <span class="tag thought">thought</span>
       <span class="sum-gray" title="${esc(prev)}">${esc(prev)}</span>
       ${partOut(outTok, m.co != null ? m.co : c.cost_out_usd)}

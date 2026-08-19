@@ -160,6 +160,7 @@ def price_child_usage(usage: Optional[dict[str, Any]]) -> dict[str, Any]:
     inn = _int(u.get("inputTokens") or u.get("input_tokens"))
     cache = _int(u.get("cachedReadTokens") or u.get("cached_read_tokens"))
     out = _int(u.get("outputTokens") or u.get("output_tokens"))
+    reason = _int(u.get("reasoningTokens") or u.get("reasoning_tokens"))
     if cache > inn:
         cache = inn
     unc = max(0, inn - cache)
@@ -179,13 +180,17 @@ def price_child_usage(usage: Optional[dict[str, Any]]) -> dict[str, Any]:
         ccache *= scale
         cout *= scale
         est_tot = official
+    reason = min(reason, out) if out else 0
+    creason = (cout * (reason / out)) if out > 0 and reason > 0 else 0.0
     return {
         "tokens_in": unc,
         "tokens_cached": cache,
         "tokens_out": out,
+        "tokens_reason": reason,
         "cost_in_usd": cin,
         "cost_cached_usd": ccache,
         "cost_out_usd": cout,
+        "cost_reason_usd": creason,
         "estimate_usd": est_tot,
         "official_usd": official if official is not None else est_tot,
         "context_tokens_for_tier": tier_ctx,

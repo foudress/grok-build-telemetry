@@ -969,18 +969,21 @@ def reconstruct_model_step_usage(
         re_tok = int(out_reasoning[i])  # Enc + leftover Out, pro-rata TokZ
         em_tok = int(out_emit[i])
         msg_tok = int(out_message[i])
-        # Reasoning budget = ToolRequest + Encrypted (Thought mass is inside Enc)
+        # Reasoning budget (tokens) = Enc + ToolReq. Thought is priced separately.
         reason_budget_tok = em_tok + re_tok
         reason_tok = re_tok
-        re_usd, em_usd, msg_usd = _fit_usd_parts(
+        # Thought / Enc / ToolReq / Message share official Out $.
+        # Thought was left at $0 (mass parked on Enc) — charts and LLM Call
+        # then showed 0$ while thought tokens were real.
+        th_usd, re_usd, em_usd, msg_usd = _fit_usd_parts(
             [
+                _price_out(th_tok, tier_ctx),
                 _price_out(re_tok, tier_ctx),
                 _price_out(em_tok, tier_ctx),
                 _price_out(msg_tok, tier_ctx),
             ],
             cost_out,
         )
-        th_usd = 0.0
 
         thought_chars = int(
             step.get("thought_summary_chars") or step.get("thought_chars") or 0

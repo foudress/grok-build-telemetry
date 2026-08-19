@@ -50,6 +50,29 @@ function measureChartTip(el, html) {
 function hideChartTip(el) {
   if (!el) return;
   el.classList.remove("is-visible");
+  el.innerHTML = "";
+}
+
+function hideAllChartTips() {
+  hideChartTip($("costTip"));
+  hideChartTip($("ctxTip"));
+}
+
+/** Drop property-style hover handlers (period used these; they stack with addEventListener). */
+function clearCostPointerProps(canvas) {
+  if (!canvas) return;
+  canvas.onmousemove = null;
+  canvas.onmouseleave = null;
+  canvas.onclick = null;
+  canvas._aggHit = null;
+}
+
+function setCostTipOwner(canvas, owner) {
+  if (!canvas) return;
+  if (canvas._costTipOwner !== owner) {
+    hideChartTip($("costTip"));
+    canvas._costTipOwner = owner;
+  }
 }
 
 /** Calm centered empty-state message inside a chart canvas. */
@@ -287,13 +310,7 @@ function drawLineChart(canvas, series, color, rounds) {
     }
     if (p.label && p._showX) {
       const isAnchor = isSys || String(p.label).startsWith("R");
-      ctx.fillStyle = isAnchor ? "#e6edf3" : CHART_AXIS.labelDim;
-      ctx.font = isAnchor
-        ? "10px system-ui, Segoe UI, sans-serif"
-        : "9px system-ui, Segoe UI, sans-serif";
-      ctx.textAlign = "center";
-      ctx.fillText(p.label, x, h - 8);
-      ctx.textAlign = "left";
+      drawXLabel(ctx, p.label, x, h - 10, avgPx < 16 && !isAnchor);
     }
   });
 
@@ -305,8 +322,13 @@ function drawLineChart(canvas, series, color, rounds) {
     canvas._ctxTipBound = true;
     const tip = () => $("ctxTip");
     canvas.addEventListener("mousemove", (ev) => {
-      const list = canvas._ctxPts;
+      canvas._ctxPtr = { clientX: ev.clientX, clientY: ev.clientY };
       const t = tip();
+      if (document.body.classList.contains("scope-period")) {
+        hideChartTip(t);
+        return;
+      }
+      const list = canvas._ctxPts;
       if (!list || !list.length) return hideChartTip(t);
       const rect = canvas.getBoundingClientRect();
       const mx = ev.clientX - rect.left;
@@ -364,6 +386,7 @@ function drawLineChart(canvas, series, color, rounds) {
       showChartTip(t, html, Math.max(4, leftPx), Math.max(4, my - 10));
     });
     canvas.addEventListener("mouseleave", () => {
+      canvas._ctxPtr = null;
       hideChartTip(tip());
       canvas.style.cursor = "default";
     });
@@ -382,16 +405,24 @@ function drawLineChart(canvas, series, color, rounds) {
       if (best && best.round != null) revealRound(best.round);
     });
   }
+  if (canvas._ctxPtr && !document.body.classList.contains("scope-period")) {
+    canvas.dispatchEvent(new MouseEvent("mousemove", {
+      clientX: canvas._ctxPtr.clientX,
+      clientY: canvas._ctxPtr.clientY,
+      bubbles: false,
+    }));
+  }
 }
 
 // Cost chart state: overview | detail attribution | drill into one turn's LLM calls
 window.__costChart = window.__costChart || {
-  detail: false,
+  stack: "io", // io | parts | tools
   drillTurn: null, // turn index when drilled
   rounds: [],
   turns: [],
   /** "usd" | "tokens" — Cost per round Y-axis */
   unit: "usd",
+  byLabel: false,
   /** Legend labels (as shown) currently hidden from the bar stack */
   hiddenLegend: new Set(),
   /** previous drill state — prune hide list when entering drill */
@@ -411,24 +442,55 @@ function normToolCatName(raw) {
 
 function costSegKey(seg) {
   if (!seg) return "";
-  if (seg.legendKey) return seg.legendKey;
-  if (seg.k === "tool" || seg.k === "toolreq")
-    return seg.k + ":" + normToolCatName(seg.label);
-  return seg.label || seg.k || "";
+  const k = String(seg.k || "");
+  if (k === "in" || k === "cached" || k === "out" || k === "system"
+      || k === "recap" || k === "compact" || k === "official")
+    return k;
+  if (seg.legendKey) {
+    const lk = String(seg.legendKey);
+    const low = lk.toLowerCase();
+    if (low === "in" || low === "cached" || low === "out" || low === "system")
+      return low;
+    return lk;
+  }
+  if (k === "tool" || k === "toolreq")
+    return k + ":" + normToolCatName(seg.label);
+  const lab = String(seg.label || "");
+  const low = lab.toLowerCase();
+  if (low === "in" || low === "cached" || low === "out" || low === "system")
+    return low;
+  return lab || k || "";
+}
+
+/** In / Cached / Out and LLM Out→In keep that casing; everything else lowercase. */
+function costDisplayLabel(seg) {
+  if (!seg) return "";
+  const k = String(seg.k || "");
+  if (k === "llm_out_in" || seg.legendKey === "llm_out_in") return "LLM Out→In";
+  if (k === "in") return "In";
+  if (k === "cached") return "Cached";
+  if (k === "out") return "Out";
+  const raw = String(seg.label || k || "");
+  if (raw === "LLM Out→In" || raw === "LLM Out->In") return "LLM Out→In";
+  if (raw === "In" || raw === "Cached" || raw === "Out") return raw;
+  return raw.toLowerCase();
 }
 
 function isCostSegHidden(seg, hidden) {
   if (!hidden || !hidden.size || !seg) return false;
   const key = costSegKey(seg);
   if (key && hidden.has(key)) return true;
-  if (hidden.has(seg.label)) return true;
+  if (seg.label && hidden.has(seg.label)) return true;
   if (seg.k && hidden.has(seg.k)) return true;
-  // simple-mode capitalized legend names
-  const cap = {
-    system: "System", in: "In", cached: "Cached", out: "Out",
-    official: "official",
+  const aliases = {
+    in: ["In", "in"],
+    cached: ["Cached", "cached"],
+    out: ["Out", "out"],
+    system: ["System", "system"],
   };
-  if (seg.k && cap[seg.k] && hidden.has(cap[seg.k])) return true;
+  for (const a of (aliases[key] || [])) {
+    if (hidden.has(a)) return true;
+  }
   return false;
 }
 
@@ -449,6 +511,7 @@ const COST_COLORS = {
   late: "#b48ead",
   llm: "#1a6b3c",        /* dark green — LLM Out→In */
   compact: "#f0a070",
+  recap: "#e0b060",
   official: "#3d9cf0",
   sub: "#8b7cf7",
 };
@@ -604,7 +667,7 @@ function turnCostParts(t, round, { detail, peelSystem } = {}) {
     ?? 0;
   const userTokN = userTok || 0;
   const harnessTokN = Number(bd.harness_in_tokens) || 0;
-  const thoughtTokN = Number(bd.llm_thought_summary_tokens) || 0;
+  let thoughtTokN = Number(bd.llm_thought_summary_tokens) || 0;
   const reasonTokN = Number(bd.llm_reasoning_encrypted_tokens)
     || Number(bd.llm_reasoning_tokens) || 0;
   const emitTokN = Number(bd.llm_out_to_harness_tokens) || 0;
@@ -615,7 +678,12 @@ function turnCostParts(t, round, { detail, peelSystem } = {}) {
   if (detail) {
     const harness = Number(bd.harness_in_usd) || 0;
     // Thought = pure Out (summary); Reasoning enc separate; tools from reason budget
-    const thought = Number(bd.llm_thought_summary_usd) || 0;
+    let thought = Number(bd.llm_thought_summary_usd) || 0;
+    if (!(thought > 0 || thoughtTokN > 0)) {
+      const fromSteps = _sumThoughtFromSteps(round);
+      thought = fromSteps.usd;
+      thoughtTokN = fromSteps.tok;
+    }
     const reasoningEnc = Number(bd.llm_reasoning_encrypted_usd)
       || (Number(bd.llm_reasoning_usd) || 0);
     const emit = Number(bd.llm_out_to_harness_usd) || 0;
@@ -623,7 +691,7 @@ function turnCostParts(t, round, { detail, peelSystem } = {}) {
     // System is a separate chart bar when peelSystem — omit from R1 stack
     if (!peelSystem && sys > 0) {
       segs.push({
-        k: "system", label: "System", v: sys, tok: sysTok || 0,
+        k: "system", label: "system", v: sys, tok: sysTok || 0,
         color: COST_COLORS.system, tokens: sysTok || null,
       });
     }
@@ -686,7 +754,7 @@ function turnCostParts(t, round, { detail, peelSystem } = {}) {
     // Simple stack: In / Cached / Out only (User folded into global In).
     // System only inside this bar when NOT a separate chart bar.
     if (!peelSystem && sys > 0) {
-      segs.push({ k: "system", label: "System", v: sys, tok: sysTok || 0, color: COST_COLORS.system });
+      segs.push({ k: "system", label: "system", v: sys, tok: sysTok || 0, color: COST_COLORS.system });
     }
     if (cin > 1e-9 || tinTok > 0)
       segs.push({ k: "in", label: "in", v: cin, tok: tinTok, color: COST_COLORS.in });
@@ -715,6 +783,36 @@ function turnCostParts(t, round, { detail, peelSystem } = {}) {
   };
 }
 
+function mergeCostSegs(a, b) {
+  const map = new Map();
+  for (const s of [...(a || []), ...(b || [])]) {
+    const key = costSegKey(s);
+    if (!key) continue;
+    const prev = map.get(key);
+    if (!prev) {
+      map.set(key, { ...s });
+      continue;
+    }
+    prev.v = (Number(prev.v) || 0) + (Number(s.v) || 0);
+    prev.tok = (Number(prev.tok) || 0) + (Number(s.tok) || 0);
+  }
+  return [...map.values()];
+}
+
+/** Drill-level cats folded onto one round bar (tools, LLM Out→In, …). */
+function turnCostPartsTools(t, round, { peelSystem } = {}) {
+  const base = turnCostParts(t, round, { detail: false, peelSystem });
+  const steps = (round && round.model_steps) || [];
+  let segs = [];
+  steps.forEach((s, i) => {
+    const b = callCostParts(s, s.index ?? i + 1, round);
+    segs = mergeCostSegs(segs, b.segs || []);
+  });
+  if (!segs.length)
+    return turnCostParts(t, round, { detail: true, peelSystem });
+  return { ...base, segs };
+}
+
 function systemCostBar(round) {
   const sp = round && round.system_prompt;
   const bd = (round && round.breakdown) || {};
@@ -724,7 +822,7 @@ function systemCostBar(round) {
   return {
     segs: [{
       k: "system",
-      label: "System",
+      label: "system",
       v: sys || 0,
       tok: sysTok || 0,
       color: COST_COLORS.system,
@@ -769,7 +867,7 @@ function callCostParts(step, callIndex, round) {
     if (userU > 0 || userT > 0) {
       bottomExtra.push({
         k: "user",
-        label: (window.__costChart && window.__costChart.superAgent) ? "Super Agent" : "User",
+        label: (window.__costChart && window.__costChart.superAgent) ? "super agent" : "user",
         v: userU || 0,
         tok: userT || 0,
         color: COST_COLORS.user,
@@ -1033,6 +1131,83 @@ function callCostParts(step, callIndex, round) {
   };
 }
 
+function _sumThoughtFromSteps(round) {
+  let usd = 0, tok = 0;
+  for (const step of (round && round.model_steps) || []) {
+    for (const ch of step.children || []) {
+      if (ch.kind !== "phase_llm") continue;
+      for (const sub of ch.children || []) {
+        if (sub.kind !== "thought") continue;
+        usd += Number(sub.cost_out_usd) || 0;
+        tok += Number(sub.tokens_out || sub.tokenizer_tokens || sub.tokens) || 0;
+      }
+    }
+  }
+  return { usd, tok };
+}
+
+function foldCallToIo(bar) {
+  let inn = 0, cache = 0, out = 0, innT = 0, cacheT = 0, outT = 0;
+  for (const s of bar.segs || []) {
+    const v = Number(s.v) || 0;
+    const t = Number(s.tok) || 0;
+    if (s.k === "cached") { cache += v; cacheT += t; }
+    else if (s.k === "in" || s.k === "user" || s.k === "harness" || s.k === "tool"
+        || s.k === "llm_out_in" || s.k === "residual") {
+      inn += v; innT += t;
+    } else {
+      out += v; outT += t;
+    }
+  }
+  const segs = [];
+  if (inn > 0 || innT > 0)
+    segs.push({ k: "in", label: "In", legendKey: "in", v: inn, tok: innT, color: COST_COLORS.in });
+  if (cache > 0 || cacheT > 0)
+    segs.push({ k: "cached", label: "Cached", legendKey: "cached", v: cache, tok: cacheT, color: COST_COLORS.cached });
+  if (out > 0 || outT > 0)
+    segs.push({ k: "out", label: "Out", legendKey: "out", v: out, tok: outT, color: COST_COLORS.out });
+  return { ...bar, segs, total: inn + cache + out, total_tok: innT + cacheT + outT };
+}
+
+function foldCallToParts(bar) {
+  const map = new Map();
+  for (const s of bar.segs || []) {
+    let k = s.k, lab = s.label, key = costSegKey(s);
+    if (s.k === "tool" || s.k === "llm_out_in") {
+      k = "harness"; lab = "harness"; key = "harness";
+    } else if (s.k === "toolreq") {
+      k = "toolreq"; lab = "tool req"; key = "toolreq";
+    }
+    const prev = map.get(key);
+    if (!prev) {
+      map.set(key, {
+        k, label: lab, legendKey: key,
+        v: Number(s.v) || 0, tok: Number(s.tok) || 0,
+        color: k === "harness" ? COST_COLORS.harness
+          : k === "toolreq" ? COST_COLORS.toolreq
+          : s.color,
+      });
+    } else {
+      prev.v += Number(s.v) || 0;
+      prev.tok += Number(s.tok) || 0;
+    }
+  }
+  const segs = [...map.values()].filter((s) => s.v > 0 || s.tok > 0);
+  return {
+    ...bar,
+    segs,
+    total: segs.reduce((a, s) => a + s.v, 0),
+    total_tok: segs.reduce((a, s) => a + (s.tok || 0), 0),
+  };
+}
+
+function applyDrillStack(bar, stack) {
+  if (!bar) return bar;
+  if (stack === "io") return foldCallToIo(bar);
+  if (stack === "parts") return foldCallToParts(bar);
+  return bar;
+}
+
 function subagentCostBar(sa) {
   if (!sa || !sa.session_id) return null;
   const u = sa.usage || {};
@@ -1128,7 +1303,7 @@ function eventMs(e) {
   return Number.isFinite(n) ? n : 0;
 }
 
-function compactCostBar(c, compactIndex) {
+function compactCostBar(c, compactIndex, { detail } = {}) {
   if (!c || c.kind !== "compaction") return null;
   const segs = [];
   // In XOR Cached (miss vs hit) + Out (compressed history). Never both.
@@ -1148,12 +1323,19 @@ function compactCostBar(c, compactIndex) {
     cacheU = preCache || Number(c.pre_read_usd) || 0;
     cacheT = preCacheT || preTok;
   }
-  if (inU > 0 || inT > 0)
-    segs.push({ k: "in", label: "In", v: inU, tok: inT, color: COST_COLORS.in });
-  if (cacheU > 0 || cacheT > 0)
-    segs.push({ k: "cached", label: "Cached", v: cacheU, tok: cacheT, color: COST_COLORS.cached });
-  if (outU > 0 || outT > 0)
-    segs.push({ k: "out", label: "Out", v: outU, tok: outT, color: COST_COLORS.out });
+  if (detail) {
+    const u = (inU || 0) + (cacheU || 0) + (outU || 0);
+    const t = (inT || 0) + (cacheT || 0) + (outT || 0);
+    if (u > 0 || t > 0)
+      segs.push({ k: "compact", label: "compact", legendKey: "compact", v: u, tok: t, color: COST_COLORS.compact });
+  } else {
+    if (inU > 0 || inT > 0)
+      segs.push({ k: "in", label: "In", legendKey: "in", v: inU, tok: inT, color: COST_COLORS.in });
+    if (cacheU > 0 || cacheT > 0)
+      segs.push({ k: "cached", label: "Cached", legendKey: "cached", v: cacheU, tok: cacheT, color: COST_COLORS.cached });
+    if (outU > 0 || outT > 0)
+      segs.push({ k: "out", label: "Out", legendKey: "out", v: outU, tok: outT, color: COST_COLORS.out });
+  }
   const total = Number(c.cost_usd) != null && Number(c.cost_usd) > 0
     ? Number(c.cost_usd)
     : segs.reduce((a, s) => a + s.v, 0);
@@ -1161,7 +1343,14 @@ function compactCostBar(c, compactIndex) {
   if (!(total > 0) && !(totalTok > 0) && !segs.length) {
     const before = Number(c.tokens_before) || 0;
     if (before <= 0) return null;
-    segs.push({ k: "cached", label: "pre-read", v: 0.000001, tok: before, color: COST_COLORS.cached });
+    segs.push({
+      k: detail ? "compact" : "cached",
+      label: detail ? "compact" : "pre-read",
+      legendKey: detail ? "compact" : "cached",
+      v: 0.000001,
+      tok: before,
+      color: detail ? COST_COLORS.compact : COST_COLORS.cached,
+    });
   }
   return {
     segs: segs.filter(s => s.v > 0 || s.tok > 0),
@@ -1177,7 +1366,7 @@ function compactCostBar(c, compactIndex) {
   };
 }
 
-function recapCostBar(c, recapIndex) {
+function recapCostBar(c, recapIndex, { detail } = {}) {
   if (!c || c.kind !== "session_recap") return null;
   const segs = [];
   const inU = Number(c.prompt_in_usd) || 0;
@@ -1186,12 +1375,19 @@ function recapCostBar(c, recapIndex) {
   const cacheT = Number(c.context_tokens ?? c.context_cached_tokens) || 0;
   const outU = Number(c.out_usd) || 0;
   const outT = Number(c.out_tokens) || 0;
-  if (inU > 0 || inT > 0)
-    segs.push({ k: "in", label: "In", v: inU, tok: inT, color: COST_COLORS.in });
-  if (cacheU > 0 || cacheT > 0)
-    segs.push({ k: "cached", label: "Cached", v: cacheU, tok: cacheT, color: COST_COLORS.cached });
-  if (outU > 0 || outT > 0)
-    segs.push({ k: "out", label: "Out", v: outU, tok: outT, color: COST_COLORS.out });
+  if (detail) {
+    const u = (inU || 0) + (cacheU || 0) + (outU || 0);
+    const t = (inT || 0) + (cacheT || 0) + (outT || 0);
+    if (u > 0 || t > 0)
+      segs.push({ k: "recap", label: "recap", legendKey: "recap", v: u, tok: t, color: COST_COLORS.recap });
+  } else {
+    if (inU > 0 || inT > 0)
+      segs.push({ k: "in", label: "In", legendKey: "in", v: inU, tok: inT, color: COST_COLORS.in });
+    if (cacheU > 0 || cacheT > 0)
+      segs.push({ k: "cached", label: "Cached", legendKey: "cached", v: cacheU, tok: cacheT, color: COST_COLORS.cached });
+    if (outU > 0 || outT > 0)
+      segs.push({ k: "out", label: "Out", legendKey: "out", v: outU, tok: outT, color: COST_COLORS.out });
+  }
   const total = Number(c.cost_usd) != null && Number(c.cost_usd) > 0
     ? Number(c.cost_usd)
     : segs.reduce((a, s) => a + s.v, 0);
@@ -1215,6 +1411,104 @@ const COST_CHART_H = 240;
 const COST_MIN_SLOT = 36;
 const COST_MAX_SLOT = 96;
 const MIN_COST_SLOTS = 8;
+const X_AXIS_BAND = 40;
+
+function resetChartZoom(store) {
+  const st = store || zoomStore();
+  if (!st) return;
+  st._costUserZoom = false;
+  st.slotPx = 0;
+  st._scrollLeft = 0;
+  st._costStickEnd = false;
+}
+
+function chartViewKey() {
+  if (document.body.classList.contains("scope-period")) {
+    const ag = window.__aggChart || {};
+    return ["p", ag.stack || "io", ag.byLabel ? 1 : 0, ag.cumulative ? 1 : 0].join(":");
+  }
+  const st = window.__costChart || {};
+  return ["s", st.stack || "io", st.byLabel ? 1 : 0, st.drillTurn == null ? "-" : String(st.drillTurn)].join(":");
+}
+
+function planXLabels(ctx, labels, groupW, { temporal } = {}) {
+  ctx.font = "10px system-ui, Segoe UI, sans-serif";
+  let maxW = 0;
+  for (const lab of labels || []) {
+    const w = ctx.measureText(String(lab || "")).width;
+    if (w > maxW) maxW = w;
+  }
+  const collide = maxW > Math.max(4, groupW - 6);
+  if (temporal) {
+    let every = 1;
+    if (groupW < 8) every = 8;
+    else if (groupW < 14) every = 4;
+    else if (groupW < 22) every = 2;
+    if (collide && groupW > 0)
+      every = Math.max(every, Math.ceil((maxW + 8) / groupW));
+    return { rotate: false, every, padB: 28 };
+  }
+  if (collide) {
+    const padB = Math.max(44, Math.ceil(16 + Math.sin(0.65) * maxW));
+    return { rotate: true, every: 1, padB };
+  }
+  return { rotate: false, every: 1, padB: 28 };
+}
+
+function drawXLabel(ctx, text, x, y, rotate) {
+  const s = String(text || "");
+  if (!s) return;
+  ctx.save();
+  ctx.fillStyle = CHART_AXIS.label;
+  ctx.font = "10px system-ui, Segoe UI, sans-serif";
+  if (rotate) {
+    ctx.translate(x, y);
+    ctx.rotate(-0.65);
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    ctx.fillText(s, 0, 0);
+  } else {
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    ctx.fillText(s, x, y);
+  }
+  ctx.restore();
+}
+
+function guessXPlan(labels, barCount, temporal) {
+  const scroller = $("costChartScroll");
+  const viewW = (scroller && scroller.clientWidth) || 600;
+  const nSlots = Math.max(barCount || 1, temporal ? MIN_COST_SLOTS : 1);
+  const groupW = Math.max(1, (viewW - PLOT_PAD_L - 12) / nSlots);
+  const ctx = document.createElement("canvas").getContext("2d");
+  return planXLabels(ctx, labels, groupW, { temporal });
+}
+
+function applyXPadHeight(canvas, padB) {
+  if (!canvas) return;
+  const extra = Math.max(0, (padB || 28) - 28);
+  canvas.style.height = (COST_CHART_H + extra) + "px";
+}
+
+function collectLabelLegend(bars, unit) {
+  const map = new Map();
+  for (const b of bars || []) {
+    for (const seg of b.segs || []) {
+      if (!(costSegMetric(seg, unit) > 0)) continue;
+      const key = costSegKey(seg);
+      if (!key || key === "official") continue;
+      if (!map.has(key))
+        map.set(key, { label: costDisplayLabel(seg), color: seg.color, k: seg.k });
+    }
+  }
+  return [...map.entries()];
+}
+
+function pointerInXAxis(ev, wrap) {
+  if (!wrap) return false;
+  const r = wrap.getBoundingClientRect();
+  return ev.clientY >= r.bottom - X_AXIS_BAND && ev.clientY <= r.bottom;
+}
 
 function zoomStore() {
   if (document.body.classList.contains("scope-period")) {
@@ -1247,14 +1541,24 @@ function layoutCostCanvas(canvas, barCount, { forceFit } = {}) {
   let h = canvas.clientHeight;
   if (!h || h < 80) h = COST_CHART_H;
   const store = zoomStore();
+  const vk = chartViewKey();
+  if (store._zoomViewKey !== vk) {
+    resetChartZoom(store);
+    store._zoomViewKey = vk;
+  }
   const keepScroll = store._costUserZoom || store._costStickEnd === false;
   const prevScroll = scroller
     ? (store._scrollLeft != null ? store._scrollLeft : scroller.scrollLeft)
     : 0;
   const { nSlots, minSlot, maxSlot } = slotRange(viewW, barCount);
   let slot = store.slotPx;
-  if (!(slot > 0)) slot = forceFit ? minSlot : COST_MIN_SLOT;
-  slot = Math.min(maxSlot, Math.max(minSlot, slot));
+  // Default + mode switches: fit the full range (fully zoomed out).
+  // Only keep a custom slot after the user wheel-zooms.
+  if (store._costUserZoom && slot > 0) {
+    slot = Math.min(maxSlot, Math.max(minSlot, slot));
+  } else {
+    slot = minSlot;
+  }
   store.slotPx = slot;
   const w = PLOT_PAD_L + 12 + nSlots * slot;
   const overflow = w > viewW + 1;
@@ -1307,9 +1611,14 @@ function bindCostZoom() {
   const wrap = $("costChartWrap");
   if (!wrap || wrap._zoomBound) return;
   wrap._zoomBound = true;
+  wrap.addEventListener("mousemove", (ev) => {
+    wrap.title = pointerInXAxis(ev, wrap) ? "Scroll to zoom horizontal scale" : "";
+  });
+  wrap.addEventListener("mouseleave", () => { wrap.title = ""; });
   wrap.addEventListener("wheel", (ev) => {
     if (ev.shiftKey) return;
     if (Math.abs(ev.deltaX) > Math.abs(ev.deltaY)) return;
+    if (!pointerInXAxis(ev, wrap)) return;
     const canvas = $("costChart");
     const scroller = $("costChartScroll");
     if (!canvas) return;
@@ -1398,7 +1707,73 @@ function eachCostYTick(yMin, max, step, unit, fn) {
   if (!seen.size) fn(yMin);
 }
 
+function _legendRank(key, meta) {
+  const lab = (meta && meta.label) || key;
+  const k = (meta && meta.k) || "";
+  const fixed = [
+    "system", "System", "user", "super agent", "User", "Super Agent",
+    "in", "In", "cached", "Cached",
+    "thought", "reasoning", "message", "LLM Out→In", "llm_out_in",
+    "out", "Out", "recap", "compact", "sub", "Sub", "official",
+    "in residual", "harness", "reload", "pre-read",
+  ];
+  const fi = fixed.indexOf(key) >= 0 ? fixed.indexOf(key) : fixed.indexOf(lab);
+  if (fi >= 0) return fi;
+  if (k === "toolreq" || String(key).startsWith("toolreq:")) return 50;
+  if (k === "llm_out_in" || key === "llm_out_in" || lab === "LLM Out→In") return 80;
+  if (k === "tool" || String(key).startsWith("tool:")) return 90;
+  if (k === "hook" || String(key).startsWith("hook:")) return 999;
+  return 100;
+}
+
+/** One bar per legend category — totals for the current view. */
+function aggregateBarsByLabel(bars, hidden, unit) {
+  const map = new Map();
+  for (const b of bars || []) {
+    for (const seg of b.segs || []) {
+      if (isCostSegHidden(seg, hidden)) continue;
+      const mv = costSegMetric(seg, unit);
+      if (!(mv > 0) && !(Number(seg.v) > 0) && !(Number(seg.tok) > 0)) continue;
+      const key = costSegKey(seg);
+      if (!key || key === "official") continue;
+      const label = costDisplayLabel(seg);
+      const prev = map.get(key) || {
+        key, label, color: seg.color, k: seg.k, v: 0, tok: 0,
+      };
+      prev.v += Number(seg.v) || 0;
+      prev.tok += Number(seg.tok) || 0;
+      if (!prev.color) prev.color = seg.color;
+      map.set(key, prev);
+    }
+  }
+  const rows = [...map.values()].sort((a, b) => {
+    const ra = _legendRank(a.key, a), rb = _legendRank(b.key, b);
+    if (ra !== rb) return ra - rb;
+    return String(a.label).localeCompare(String(b.label));
+  });
+  return rows.map((g) => ({
+    segs: [{
+      k: g.k || g.key,
+      label: g.label,
+      legendKey: g.key,
+      v: g.v,
+      tok: g.tok,
+      color: g.color,
+    }],
+    total: g.v,
+    total_tok: g.tok,
+    index: g.label,
+    label: g.label,
+    kind: "agg-label",
+    official: null,
+  }));
+}
+
 function drawBars(canvas, turns, rounds, opts) {
+  if (canvas) {
+    clearCostPointerProps(canvas);
+    setCostTipOwner(canvas, "session");
+  }
   const st = window.__costChart;
   st.turns = turns || [];
   st.rounds = rounds || [];
@@ -1409,9 +1784,11 @@ function drawBars(canvas, turns, rounds, opts) {
   if (backBtn) backBtn.hidden = st.drillTurn == null;
   if (modeLabel) {
     const u = st.unit === "tokens" ? "Tok" : "$";
+    const by = st.byLabel ? " · by label" : "";
+    const stackLab = st.stack === "tools" ? "Tools" : (st.stack === "parts" ? "Parts" : "I/O");
     modeLabel.textContent = st.drillTurn != null
-      ? `Drill · Round ${st.drillTurn} · ${u}`
-      : (st.detail ? `Detailed · ${u}` : `In / Cached / Out · ${u}`);
+      ? `Drill · Round ${st.drillTurn} · ${stackLab}${by} · ${u}`
+      : `${stackLab}${by} · ${u}`;
   }
 
   let bars = [];
@@ -1426,7 +1803,8 @@ function drawBars(canvas, turns, rounds, opts) {
     const steps = (round && round.model_steps) || [];
     bars = [];
     steps.forEach((s, i) => {
-      const b = callCostParts(s, s.index ?? i + 1, round);
+      const raw = callCostParts(s, s.index ?? i + 1, round);
+      const b = applyDrillStack(raw, st.stack || "io");
       b.turnIndex = st.drillTurn;
       bars.push(b);
       for (const sa of s.subagents_after || []) {
@@ -1466,11 +1844,12 @@ function drawBars(canvas, turns, rounds, opts) {
       for (const it of items) {
         if (it.kind === "compact") {
           compactN += 1;
-          const cb = compactCostBar(it.ev, compactN);
+          const unify = st.stack === "parts" || st.stack === "tools";
+          const cb = compactCostBar(it.ev, compactN, { detail: unify });
           if (cb) bars.push(cb);
         } else {
           recapN += 1;
-          const rb = recapCostBar(it.ev, recapN);
+          const rb = recapCostBar(it.ev, recapN, { detail: st.stack === "parts" || st.stack === "tools" });
           if (rb) bars.push(rb);
         }
       }
@@ -1496,10 +1875,11 @@ function drawBars(canvas, turns, rounds, opts) {
         }
         pushBetween(before);
       }
-      bars.push(attachSubagentSegsToTurn(
-        turnCostParts(t, round, { detail: st.detail, peelSystem }),
-        round
-      ));
+      const stack = st.stack || "io";
+      const parts = stack === "tools"
+        ? turnCostPartsTools(t, round, { peelSystem })
+        : turnCostParts(t, round, { detail: stack === "parts", peelSystem });
+      bars.push(attachSubagentSegsToTurn(parts, round));
       // Events after this round (between R[n] and R[n+1]), chronological
       const after = [];
       if (round && round.compact_after && round.compact_after.kind === "compaction") {
@@ -1511,6 +1891,23 @@ function drawBars(canvas, turns, rounds, opts) {
       pushBetween(after);
     }
   }
+
+  if (!(st.hiddenLegend instanceof Set)) st.hiddenLegend = new Set();
+  const isDrill0 = st.drillTurn != null;
+  if (isDrill0 !== !!st._wasDrill) {
+    st.hiddenLegend = new Set();
+  }
+  st._wasDrill = isDrill0;
+  const unit0 = st.unit === "tokens" ? "tokens" : "usd";
+  const labelLegend = st.byLabel ? collectLabelLegend(bars, unit0) : [];
+  if (st.byLabel && bars.length) {
+    bars = aggregateBarsByLabel(bars, st.hiddenLegend, unit0);
+  }
+  applyXPadHeight(canvas, guessXPlan(
+    bars.map((p) => p.label || String(p.index)),
+    bars.length,
+    false
+  ).padB);
 
   if (!bars.length) {
     resetCostCanvasFit(canvas);
@@ -1530,16 +1927,8 @@ function drawBars(canvas, turns, rounds, opts) {
 
   const { w, h, ctx, overflow } = layoutCostCanvas(canvas, bars.length);
 
-  if (!(st.hiddenLegend instanceof Set)) st.hiddenLegend = new Set();
   const unit = st.unit === "tokens" ? "tokens" : "usd";
   const isDrill = st.drillTurn != null;
-
-  // Rounds ↔ drill: drop every hidden chip (Cached stay-off was leaking).
-  if (isDrill !== !!st._wasDrill) {
-    st.hiddenLegend = new Set();
-  }
-  st._wasDrill = isDrill;
-
   const hidden = st.hiddenLegend;
   if (hidden.has("sub") || hidden.has("Sub")) {
     bars = bars.filter((b) => b.kind !== "subagent");
@@ -1565,12 +1954,19 @@ function drawBars(canvas, turns, rounds, opts) {
   if (rawMax <= 0) rawMax = unit === "tokens" ? 1000 : 0.0001;
   const { min: yMin, max, step: yStep } = niceCostYMaxForUnit(rawMax, unit);
 
-  // Legend lives in HTML below the canvas (wrap + scroll) — free plot top
-  const left = PLOT_PAD_L, right = 12, top = 12, bottom = 28;
+  const left = PLOT_PAD_L, right = 12, top = 12;
+  const nSlots0 = Math.max(bars.length, MIN_COST_SLOTS);
+  const groupW0 = Math.max(1, (w - left - right) / nSlots0);
+  const xPlan = planXLabels(
+    ctx,
+    bars.map((p) => p.label || String(p.index)),
+    groupW0,
+    { temporal: false }
+  );
+  const bottom = xPlan.padB;
   const plotW = w - left - right;
   const plotH = h - top - bottom;
-  // Pad X to ≥8 slots so few-round sessions stay readable (not stretched).
-  const nSlots = Math.max(bars.length, MIN_COST_SLOTS);
+  const nSlots = nSlots0;
   const groupW = plotW / nSlots;
   const bw = Math.max(1, Math.min(44, groupW * (groupW < 8 ? 0.9 : groupW < 18 ? 0.72 : 0.58)));
   const yOf = (v) => top + plotH - ((v - yMin) / (max - yMin)) * plotH;
@@ -1609,7 +2005,7 @@ function drawBars(canvas, turns, rounds, opts) {
       const key = costSegKey(seg);
       if (!key) return;
       if (!legendMap.has(key))
-        legendMap.set(key, { label: seg.label || key, color: seg.color, k: seg.k });
+        legendMap.set(key, { label: costDisplayLabel(seg) || key, color: seg.color, k: seg.k });
     });
     stack.forEach(seg => {
       const mv = costSegMetric(seg, unit);
@@ -1634,13 +2030,8 @@ function drawBars(canvas, turns, rounds, opts) {
       ctx.lineWidth = 1.5;
       ctx.strokeRect(x0 + 0.5, yBase + 0.5, bw - 1, (top + plotH) - yBase - 1);
     }
-    ctx.fillStyle = p.kind === "subagent" ? COST_COLORS.sub : CHART_AXIS.labelDim;
-    ctx.font = "10px system-ui, Segoe UI, sans-serif";
-    ctx.textAlign = "center";
-    const xEvery = groupW < 8 ? 8 : groupW < 14 ? 4 : groupW < 22 ? 2 : 1;
-    if (i % xEvery === 0)
-      ctx.fillText(p.label || String(p.index), x0 + bw / 2, h - 8);
-    ctx.textAlign = "left";
+    if (i % xPlan.every === 0)
+      drawXLabel(ctx, p.label || String(p.index), x0 + bw / 2, h - bottom + 6, xPlan.rotate);
     // attach visible segs for tooltip
     const visTot = stack.reduce((a, s) => a + costSegMetric(s, unit), 0);
     hit.push({
@@ -1652,15 +2043,17 @@ function drawBars(canvas, turns, rounds, opts) {
   // HTML chip legend — all categories present in this view only
   // (no stale hidden tools from previous mode)
   let legendItems = [...legendMap.entries()].map(([key, meta]) => [key, meta]);
-  if (st.drillTurn == null && !st.detail) {
+  if (st.byLabel && labelLegend.length) {
+    legendItems = labelLegend.slice();
+  } else if (st.drillTurn == null && st.stack === "io") {
     legendItems = [
-      ["System", { label: "System", color: COST_COLORS.system }],
-      ["In", { label: "In", color: COST_COLORS.in }],
-      ["Cached", { label: "Cached", color: COST_COLORS.cached }],
-      ["Out", { label: "Out", color: COST_COLORS.out }],
+      ["system", { label: "system", color: COST_COLORS.system, k: "system" }],
+      ["in", { label: "In", color: COST_COLORS.in, k: "in" }],
+      ["cached", { label: "Cached", color: COST_COLORS.cached, k: "cached" }],
+      ["out", { label: "Out", color: COST_COLORS.out, k: "out" }],
     ];
     if (bars.some((b) => b.kind === "subagent" || (b.segs || []).some((s) => s.k === "sub")))
-      legendItems.push(["sub", { label: "Sub", color: COST_COLORS.sub, k: "sub" }]);
+      legendItems.push(["sub", { label: "sub", color: COST_COLORS.sub, k: "sub" }]);
     if (unit === "usd")
       legendItems.push(["official", { label: "official", color: COST_COLORS.official }]);
   } else if (st.drillTurn == null && unit === "usd") {
@@ -1672,7 +2065,7 @@ function drawBars(canvas, turns, rounds, opts) {
     if (legendMap.has(name)) continue; // already from segs
     if (!legendItems.some(([key]) => key === name)) {
       // only if it was a fixed overview key still relevant
-      const fixedOk = ["System", "In", "Cached", "Out", "official", "in", "cached", "out"].includes(name);
+      const fixedOk = ["System", "In", "Cached", "Out", "official", "in", "cached", "out", "system"].includes(name);
       if (!fixedOk) continue; // drop stale tool hides from UI
       const fallback =
         name === "System" || name === "system" ? COST_COLORS.system
@@ -1685,24 +2078,8 @@ function drawBars(canvas, turns, rounds, opts) {
     }
   }
   // Order: fixed cats → toolreqs (alpha) → LLM Out→In → tools (alpha) → rest
-  const rankKey = (key, meta) => {
-    const lab = (meta && meta.label) || key;
-    const k = (meta && meta.k) || "";
-    const fixed = [
-      "System", "User", "Super Agent", "user", "In", "in", "Cached", "cached",
-      "thought", "reasoning", "message", "LLM Out→In", "llm_out_in",
-      "Out", "out", "Sub", "sub", "official", "in residual", "reload", "pre-read", "pre-read In",
-    ];
-    const fi = fixed.indexOf(key) >= 0 ? fixed.indexOf(key) : fixed.indexOf(lab);
-    if (fi >= 0) return fi;
-    if (k === "toolreq" || String(key).startsWith("toolreq:")) return 50 + String(lab).localeCompare("");
-    if (k === "llm_out_in" || key === "llm_out_in" || lab === "LLM Out→In") return 80;
-    if (k === "tool" || String(key).startsWith("tool:")) return 90 + String(lab).localeCompare("");
-    if (k === "hook" || String(key).startsWith("hook:")) return 999; // hidden from chart
-    return 100 + String(lab).localeCompare("");
-  };
   legendItems.sort((a, b) => {
-    const ra = rankKey(a[0], a[1]), rb = rankKey(b[0], b[1]);
+    const ra = _legendRank(a[0], a[1]), rb = _legendRank(b[0], b[1]);
     if (ra !== rb) return ra - rb;
     return String((a[1] && a[1].label) || a[0]).localeCompare(String((b[1] && b[1].label) || b[0]));
   });
@@ -1714,6 +2091,8 @@ function drawBars(canvas, turns, rounds, opts) {
   if (!canvas._tipBound) {
     canvas._tipBound = true;
     canvas.addEventListener("mousemove", (ev) => {
+      canvas._ptr = { clientX: ev.clientX, clientY: ev.clientY };
+      if (canvas._costTipOwner !== "session") return;
       const tipEl = $("costTip");
       if (!tipEl || !canvas._barHit) return;
       const rect = canvas.getBoundingClientRect();
@@ -1727,7 +2106,7 @@ function drawBars(canvas, turns, rounds, opts) {
         hideChartTip(tipEl);
         return;
       }
-      canvas.style.cursor = (found.p.kind === "turn" || found.p.kind === "subagent")
+      canvas.style.cursor = (!st.byLabel && (found.p.kind === "turn" || found.p.kind === "subagent"))
         ? "pointer" : "default";
       const p = found.p;
       tipEl.style.whiteSpace = "normal";
@@ -1737,9 +2116,10 @@ function drawBars(canvas, turns, rounds, opts) {
         : (p.kind === "system" ? "System"
           : (p.kind === "compact" ? ("Compact " + p.label)
             : (p.kind === "recap" ? ("Recap " + p.label)
+              : (p.kind === "agg-label" ? String(p.label || "")
               : (p.kind === "subagent"
                 ? ("Sub Agent " + String(p.label || "").replace(/^S/, "") + (p.title ? " · " + p.title : ""))
-                : ("Round " + p.index)))));
+                : ("Round " + p.index))))));
       const lines = [`<b>${esc(head)}</b>`];
       if (p.kind === "compact" && (p.tokens_before != null || p.tokens_after != null)) {
         lines.push(
@@ -1761,7 +2141,7 @@ function drawBars(canvas, turns, rounds, opts) {
           const cnt = s.n > 1 ? ` ×${s.n}` : "";
           const extra = s.title ? " · " + s.title : "";
           lines.push(
-            `<span style="color:${s.color}">●</span> ${esc(s.label)}${esc(extra)}${cnt} ${fmtCostAxis(mv, u)}`
+            `<span style="color:${s.color}">●</span> ${esc(costDisplayLabel(s))}${esc(extra)}${cnt} ${fmtCostAxis(mv, u)}`
           );
         });
       }
@@ -1780,10 +2160,13 @@ function drawBars(canvas, turns, rounds, opts) {
       showChartTip(tipEl, html, leftPx, Math.max(4, topPx));
     });
     canvas.addEventListener("mouseleave", () => {
+      canvas._ptr = null;
+      if (canvas._costTipOwner !== "session") return;
       hideChartTip($("costTip"));
       canvas.style.cursor = "default";
     });
     canvas.addEventListener("click", (ev) => {
+      if (canvas._costTipOwner !== "session") return;
       if (!canvas._barHit) return;
       const rect = canvas.getBoundingClientRect();
       const mx = ev.clientX - rect.left;
@@ -1795,12 +2178,20 @@ function drawBars(canvas, turns, rounds, opts) {
           window.__switchTaskTab(found.p.session_id);
         return;
       }
+      if (found.p.kind === "agg-label") return;
       if (found.p.kind === "turn") {
         window.__costChart.drillTurn = found.p.index;
         drawBars(canvas, window.__costChart.turns, window.__costChart.rounds);
         focusRound(found.p.index);
       }
     });
+  }
+  if (canvas._ptr && canvas._costTipOwner === "session") {
+    canvas.dispatchEvent(new MouseEvent("mousemove", {
+      clientX: canvas._ptr.clientX,
+      clientY: canvas._ptr.clientY,
+      bubbles: false,
+    }));
   }
 }
 
@@ -1891,27 +2282,49 @@ function setCostUnit(unit) {
   if (st) drawBars($("costChart"), st.turns, st.rounds);
 }
 
+function _mergeCatLists(into, extra) {
+  const map = new Map();
+  for (const s of into || []) map.set(s.key, { ...s });
+  for (const s of extra || []) {
+    const prev = map.get(s.key);
+    if (prev) {
+      prev.usd = (Number(prev.usd) || 0) + (Number(s.usd) || 0);
+      prev.tok = (Number(prev.tok) || 0) + (Number(s.tok) || 0);
+    } else map.set(s.key, { ...s });
+  }
+  return [...map.values()];
+}
+
 function _cumBuckets(buckets) {
   const out = [];
-  let tin = 0, tc = 0, tout = 0, ci = 0, cc = 0, co = 0, tot = 0;
+  let tin = 0, tc = 0, tout = 0, tr = 0, ci = 0, cc = 0, co = 0, cr = 0, tot = 0;
+  let parts = [], tools = [];
   for (const b of buckets || []) {
     tin += Number(b.tokens_in) || 0;
     tc += Number(b.tokens_cached) || 0;
     tout += Number(b.tokens_out) || 0;
+    tr += Number(b.tokens_reason) || 0;
     ci += Number(b.cost_in_usd) || 0;
     cc += Number(b.cost_cached_usd) || 0;
     co += Number(b.cost_out_usd) || 0;
+    cr += Number(b.cost_reason_usd) || 0;
     tot += Number(b.official_usd) || 0;
+    parts = _mergeCatLists(parts, b.parts);
+    tools = _mergeCatLists(tools, b.tools);
     out.push({
       ...b,
       tokens_in: tin,
       tokens_cached: tc,
       tokens_out: tout,
+      tokens_reason: tr,
       tokens_all: tin + tc + tout,
       cost_in_usd: ci,
       cost_cached_usd: cc,
       cost_out_usd: co,
+      cost_reason_usd: cr,
       official_usd: tot,
+      parts: parts.map((s) => ({ ...s })),
+      tools: tools.map((s) => ({ ...s })),
     });
   }
   return out;
@@ -1920,15 +2333,72 @@ function _cumBuckets(buckets) {
 /** Stacked In / Cached / Out histogram for period views. */
 function drawAggBars(canvas, buckets, opts) {
   if (!canvas) return;
+  if (!document.body.classList.contains("scope-period")) {
+    clearCostPointerProps(canvas);
+    hideChartTip($("costTip"));
+    return;
+  }
+  setCostTipOwner(canvas, "period");
   const unit = (opts && opts.unit) || (window.__costChart && window.__costChart.unit) || "usd";
   const cumulative = !!(opts && opts.cumulative);
+  const byLabel = !!(opts && opts.byLabel);
+  const stack = (opts && opts.stack) || "io";
   const prev = window.__aggChart || {};
   const hidden = prev.hiddenLegend instanceof Set ? prev.hiddenLegend : new Set();
-  const src = cumulative ? _cumBuckets(buckets) : (buckets || []);
+  let src = cumulative ? _cumBuckets(buckets) : (buckets || []).slice();
+  const segsFromCats = (list) => (list || []).map((s) => ({
+    k: s.k,
+    label: s.label,
+    legendKey: s.key,
+    v: unit === "tokens" ? Number(s.tok) || 0 : Number(s.usd) || 0,
+    tok: Number(s.tok) || 0,
+    color: COST_COLORS[s.k] || (s.k === "toolreq" ? COST_COLORS.toolreq : COST_COLORS.tool),
+  })).filter((s) => s.v > 0);
+  const segsOfBucket = (b) => {
+    if (b && b._oneSeg) return [b._oneSeg];
+    if (stack === "parts" && Array.isArray(b.parts) && b.parts.length)
+      return segsFromCats(b.parts);
+    if (stack === "tools" && Array.isArray(b.tools) && b.tools.length)
+      return segsFromCats(b.tools);
+    const tok = unit === "tokens";
+    return [
+      { k: "in", label: "In", legendKey: "in", v: tok ? Number(b.tokens_in) || 0 : Number(b.cost_in_usd) || 0, color: COST_COLORS.in },
+      { k: "cached", label: "Cached", legendKey: "cached", v: tok ? Number(b.tokens_cached) || 0 : Number(b.cost_cached_usd) || 0, color: COST_COLORS.cached },
+      { k: "out", label: "Out", legendKey: "out", v: tok ? Number(b.tokens_out) || 0 : Number(b.cost_out_usd) || 0, color: COST_COLORS.out },
+    ];
+  };
+  let periodLabelLegend = [];
+  if (byLabel && src.length) {
+    const accAll = new Map();
+    const accVis = new Map();
+    for (const b of src) {
+      for (const s of segsOfBucket(b)) {
+        if (!(s.v > 0)) continue;
+        const key = costSegKey(s);
+        const add = (map) => {
+          const prevS = map.get(key);
+          if (!prevS) map.set(key, { ...s });
+          else prevS.v += s.v;
+        };
+        add(accAll);
+        if (!isCostSegHidden(s, hidden)) add(accVis);
+      }
+    }
+    periodLabelLegend = [...accAll.entries()].map(([key, s]) => [key, {
+      label: costDisplayLabel(s), color: s.color, k: s.k,
+    }]);
+    src = [...accVis.values()].map((s) => ({
+      label: costDisplayLabel(s),
+      _oneSeg: s,
+      official_usd: s.v,
+    }));
+  }
   window.__aggChart = {
     buckets: buckets || [],
     unit,
     cumulative,
+    byLabel,
+    stack,
     hiddenLegend: hidden,
     slotPx: prev.slotPx,
     _costUserZoom: prev._costUserZoom,
@@ -1937,49 +2407,63 @@ function drawAggBars(canvas, buckets, opts) {
   };
 
   const tip = $("costTip");
+  applyXPadHeight(canvas, guessXPlan(
+    src.map((b) => b.label || ""),
+    Math.max(src.length, 1),
+    !byLabel
+  ).padB);
+
   const laid = layoutCostCanvas(canvas, Math.max(src.length, 1), {
-    forceFit: !prev._costUserZoom && src.length <= 36,
+    forceFit: !prev._costUserZoom,
   });
   const { w, h, ctx } = laid;
   const padL = PLOT_PAD_L;
   const padR = 12;
   const padT = 16;
-  const padB = 28;
+  const groupW0 = Math.max(1, (w - padL - padR) / Math.max(src.length, 1));
+  const xPlan = planXLabels(
+    ctx,
+    src.map((b) => b.label || ""),
+    groupW0,
+    { temporal: !byLabel }
+  );
+  const padB = xPlan.padB;
   const plotW = Math.max(10, w - padL - padR);
   const plotH = Math.max(10, h - padT - padB);
 
-  const legendItems = [
-    ["In", { label: "In", color: COST_COLORS.in, k: "in" }],
-    ["Cached", { label: "Cached", color: COST_COLORS.cached, k: "cached" }],
-    ["Out", { label: "Out", color: COST_COLORS.out, k: "out" }],
-  ];
-  renderCostLegend(legendItems, hidden);
+  const legendItems = periodLabelLegend.length
+    ? periodLabelLegend
+    : stack === "io"
+    ? [
+        ["in", { label: "In", color: COST_COLORS.in, k: "in" }],
+        ["cached", { label: "Cached", color: COST_COLORS.cached, k: "cached" }],
+        ["out", { label: "Out", color: COST_COLORS.out, k: "out" }],
+      ]
+    : null;
+  if (legendItems)
+    renderCostLegend(legendItems, hidden);
+  else {
+    const live = new Map();
+    for (const b of src) {
+      for (const s of segsOfBucket(b)) {
+        const key = costSegKey(s);
+        if (key && !live.has(key))
+          live.set(key, { label: costDisplayLabel(s), color: s.color, k: s.k });
+      }
+    }
+    renderCostLegend([...live.entries()], hidden);
+  }
 
   if (!src.length) {
     const yAxis = $("costYAxis");
     if (yAxis) yAxis.hidden = true;
     drawChartEmpty(ctx, w, h, "No usage in this period");
     hideChartTip(tip);
-    canvas.onmousemove = null;
-    canvas.onmouseleave = null;
+    canvas._aggHit = null;
     return;
   }
 
-  const segsOf = (b) => {
-    if (unit === "tokens") {
-      return [
-        { k: "in", label: "In", legendKey: "In", v: Number(b.tokens_in) || 0, color: COST_COLORS.in },
-        { k: "cached", label: "Cached", legendKey: "Cached", v: Number(b.tokens_cached) || 0, color: COST_COLORS.cached },
-        { k: "out", label: "Out", legendKey: "Out", v: Number(b.tokens_out) || 0, color: COST_COLORS.out },
-      ];
-    }
-    return [
-      { k: "in", label: "In", legendKey: "In", v: Number(b.cost_in_usd) || 0, color: COST_COLORS.in },
-      { k: "cached", label: "Cached", legendKey: "Cached", v: Number(b.cost_cached_usd) || 0, color: COST_COLORS.cached },
-      { k: "out", label: "Out", legendKey: "Out", v: Number(b.cost_out_usd) || 0, color: COST_COLORS.out },
-    ];
-  };
-  const visSegs = (b) => segsOf(b).filter((s) => {
+  const visSegs = (b) => segsOfBucket(b).filter((s) => {
     if (!(s.v > 0)) return false;
     return !hidden.has(s.legendKey) && !hidden.has(s.label) && !hidden.has(s.k);
   });
@@ -2016,7 +2500,6 @@ function drawAggBars(canvas, buckets, opts) {
   const gap = Math.max(0, Math.min(6, groupW * 0.18));
   const bw = Math.max(1, groupW - gap);
   const hit = [];
-  const labelEvery = groupW < 8 ? 8 : groupW < 14 ? 4 : groupW < 22 ? 2 : 1;
 
   bars.forEach((bar, i) => {
     const x = padL + i * groupW + (groupW - bw) / 2;
@@ -2029,48 +2512,55 @@ function drawAggBars(canvas, buckets, opts) {
       ctx.fillRect(x, y0, bw, Math.max(1, bh));
     });
     hit.push({ x, y: padT, w: bw, h: plotH, bar });
-    ctx.fillStyle = CHART_AXIS.label;
-    ctx.textAlign = "center";
-    ctx.textBaseline = "top";
-    const lab = bar.b.label || "";
-    const show = i % labelEvery === 0;
-    if (show) {
-      ctx.save();
-      if (n > 12 && lab.length > 6) {
-        ctx.translate(x + bw / 2, h - padB + 4);
-        ctx.rotate(-0.45);
-        ctx.textAlign = "right";
-        ctx.fillText(lab, 0, 0);
-        ctx.restore();
-      } else {
-        ctx.fillText(lab, x + bw / 2, h - padB + 6);
-      }
-    }
+    if (i % xPlan.every === 0)
+      drawXLabel(ctx, bar.b.label || "", x + bw / 2, h - padB + 6, xPlan.rotate);
   });
 
-  canvas.onmousemove = (ev) => {
-    const r = canvas.getBoundingClientRect();
-    const mx = ev.clientX - r.left;
-    const my = ev.clientY - r.top;
-    const found = hit.find((h0) => mx >= h0.x && mx <= h0.x + h0.w && my >= h0.y && my <= h0.y + h0.h);
-    if (!found) {
-      hideChartTip(tip);
-      return;
-    }
-    const b = found.bar.b;
-    const html = `<b>${esc(b.label || "")}</b><br>
+  canvas._aggHit = { hit, w };
+  if (!canvas._aggTipBound) {
+    canvas._aggTipBound = true;
+    canvas.addEventListener("mousemove", (ev) => {
+      canvas._ptr = { clientX: ev.clientX, clientY: ev.clientY };
+      if (canvas._costTipOwner !== "period") return;
+      const pack = canvas._aggHit;
+      const tipEl = $("costTip");
+      if (!pack || !tipEl) return;
+      const r = canvas.getBoundingClientRect();
+      const mx = ev.clientX - r.left;
+      const my = ev.clientY - r.top;
+      const found = pack.hit.find((h0) => mx >= h0.x && mx <= h0.x + h0.w && my >= h0.y && my <= h0.y + h0.h);
+      if (!found) {
+        hideChartTip(tipEl);
+        return;
+      }
+      const b = found.bar.b;
+      const html = b._oneSeg
+        ? `<b>${esc(b.label || "")}</b><br>${fmtCostAxis(found.bar.total, (window.__aggChart && window.__aggChart.unit) || "usd")}`
+        : `<b>${esc(b.label || "")}</b><br>
       <span class="tok-in">In</span> ${fmtTokens(b.tokens_in)} · ${fmtUsd(b.cost_in_usd)}<br>
       <span class="tok-cached">Cached</span> ${fmtTokens(b.tokens_cached)} · ${fmtUsd(b.cost_cached_usd)}<br>
       <span class="tok-out">Out</span> ${fmtTokens(b.tokens_out)} · ${fmtUsd(b.cost_out_usd)}<br>
       ${fmtUsd(b.official_usd)}`;
-    const tw = measureChartTip(tip, html);
-    let left = ev.clientX - r.left + 12;
-    let top = ev.clientY - r.top - tw.th - 8;
-    if (left + tw.tw > w) left = w - tw.tw - 4;
-    if (top < 0) top = ev.clientY - r.top + 16;
-    showChartTip(tip, html, left, top);
-  };
-  canvas.onmouseleave = () => hideChartTip(tip);
+      const tw = measureChartTip(tipEl, html);
+      let left = ev.clientX - r.left + 12;
+      let top = ev.clientY - r.top - tw.th - 8;
+      if (left + tw.tw > pack.w) left = pack.w - tw.tw - 4;
+      if (top < 0) top = ev.clientY - r.top + 16;
+      showChartTip(tipEl, html, left, top);
+    });
+    canvas.addEventListener("mouseleave", () => {
+      canvas._ptr = null;
+      if (canvas._costTipOwner !== "period") return;
+      hideChartTip($("costTip"));
+    });
+  }
+  if (canvas._ptr) {
+    canvas.dispatchEvent(new MouseEvent("mousemove", {
+      clientX: canvas._ptr.clientX,
+      clientY: canvas._ptr.clientY,
+      bubbles: false,
+    }));
+  }
 }
 
 export {
@@ -2081,4 +2571,6 @@ export {
   renderCostLegend,
   setCostUnit,
   findRound,
+  hideAllChartTips,
+  hideChartTip,
 };

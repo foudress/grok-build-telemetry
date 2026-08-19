@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>chat_history watch</title>
+  <link rel="stylesheet" href="css/tokens.css" />
+  <link rel="stylesheet" href="css/history.css" />
+</head>
+<body>
+  <header>
+    <h1>chat_history watch</h1>
+    <a href="/">telemetry</a>
+    <span id="liveBadge" class="badge">connecting…</span>
+    <span id="meta" class="meta">—</span>
+    <label class="filter">
+      <input type="checkbox" id="mutOnly" checked />
+      mutations only
+    </label>
+  </header>
+  <p id="note" class="note"></p>
+  <main>
+    <section>
+      <h2>Sessions <span id="sessCount" class="muted"></span></h2>
+      <div id="sessions">waiting for first tick…</div>
+    </section>
+    <section>
+      <h2>Events <span id="evCount" class="muted"></span></h2>
+      <div id="events">—</div>
+    </section>
+  </main>
+  <script src="js/history.js"></script>
+</body>
+</html>

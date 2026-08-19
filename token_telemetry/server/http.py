@@ -11,12 +11,14 @@ from urllib.parse import parse_qs, urlparse
 
 from token_telemetry.session.aggregate import build_aggregate
 from token_telemetry.session.discover import list_sessions_for_ui
+from token_telemetry.session.history_watch import WATCHER
 from token_telemetry.session.monitor import MONITOR
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DASHBOARD_DIR = REPO_ROOT / "dashboard"
 DASHBOARD_HTML = DASHBOARD_DIR / "index.html"
+HISTORY_HTML = DASHBOARD_DIR / "history.html"
 
 # Static dashboard assets (css/, js/, …) under DASHBOARD_DIR only
 _STATIC_MIME = {
@@ -94,6 +96,13 @@ class Handler(BaseHTTPRequestHandler):
             data = DASHBOARD_HTML.read_bytes()
             self._send(200, data, "text/html; charset=utf-8")
             return
+        if path in ("/history", "/history.html"):
+            if not HISTORY_HTML.is_file():
+                self._send(500, b"dashboard/history.html missing", "text/plain")
+                return
+            data = HISTORY_HTML.read_bytes()
+            self._send(200, data, "text/html; charset=utf-8")
+            return
         if path == "/api/state":
             body = MONITOR.snapshot_bytes()
             self._send(200, body, "application/json; charset=utf-8")
@@ -113,16 +122,21 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/health":
             self._send(200, b'{"ok":true}', "application/json")
             return
+        if path == "/api/history":
+            body = json.dumps(WATCHER.snapshot(), ensure_ascii=False).encode("utf-8")
+            self._send(200, body, "application/json; charset=utf-8")
+            return
         if path == "/api/aggregate":
             qs = parse_qs(urlparse(self.path).query)
             period = (qs.get("period") or ["daily"])[0]
             grain = (qs.get("grain") or ["day"])[0]
+            stack = (qs.get("stack") or ["io"])[0]
             try:
                 offset = int((qs.get("offset") or ["0"])[0])
             except ValueError:
                 offset = 0
             try:
-                payload = build_aggregate(period, offset, grain)
+                payload = build_aggregate(period, offset, grain, stack=stack)
             except Exception as exc:  # noqa: BLE001
                 payload = {"error": f"{type(exc).__name__}: {exc}"}
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -171,6 +185,10 @@ def background_poller(stop: threading.Event, interval: float = 0.5) -> None:
         try:
             with MONITOR.lock:
                 MONITOR.tick()
+        except Exception:
+            pass
+        try:
+            WATCHER.tick()
         except Exception:
             pass
         stop.wait(interval)

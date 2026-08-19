@@ -366,12 +366,13 @@ function restorePrefs() {
     else setTreeDensity("standard");
     const unit = localStorage.getItem("tt-cost-unit");
     if (unit === "tokens" || unit === "usd") setCostUnit(unit);
-    const detail = localStorage.getItem("tt-cost-detail");
-    if (detail === "1") {
-      window.__costChart.detail = true;
-      const cb = $("costDetailToggle");
-      if (cb) cb.checked = true;
-    }
+    let stack = localStorage.getItem("tt-cost-stack");
+    if (!stack && localStorage.getItem("tt-cost-detail") === "1") stack = "parts";
+    if (stack === "io" || stack === "parts" || stack === "tools")
+      window.__costChart.stack = stack;
+    const byLabel = localStorage.getItem("tt-cost-bylabel");
+    if (byLabel === "1") window.__costChart.byLabel = true;
+    syncCostChrome();
   } catch {
     setTreeDensity("standard");
   }
@@ -387,12 +388,49 @@ $("sessionSelect")?.addEventListener("change", (ev) => {
   switchSession(ev.target.value || null);
 });
 
-$("costDetailToggle")?.addEventListener("change", (ev) => {
-  window.__costChart.detail = !!ev.target.checked;
-  try { localStorage.setItem("tt-cost-detail", ev.target.checked ? "1" : "0"); } catch { /* ignore */ }
+function syncCostChrome() {
+  const st = window.__costChart || {};
+  const stack = st.stack || "io";
+  ["stackIo", "stackParts", "stackTools"].forEach((id) => {
+    const el = $(id);
+    if (!el) return;
+    const on = el.dataset.stack === stack;
+    el.classList.toggle("active", on);
+    el.setAttribute("aria-pressed", on ? "true" : "false");
+  });
+  const r = $("costLayoutRounds");
+  const l = $("costLayoutLabel");
+  if (r) {
+    r.classList.toggle("active", !st.byLabel);
+    r.setAttribute("aria-pressed", !st.byLabel ? "true" : "false");
+  }
+  if (l) {
+    l.classList.toggle("active", !!st.byLabel);
+    l.setAttribute("aria-pressed", st.byLabel ? "true" : "false");
+  }
+}
+
+function setCostStack(stack) {
+  window.__costChart.stack = stack;
+  try { localStorage.setItem("tt-cost-stack", stack); } catch { /* ignore */ }
+  syncCostChrome();
   const st = window.__costChart;
   if (st) drawBars($("costChart"), st.turns, st.rounds);
-});
+}
+
+function setCostByLabel(on) {
+  window.__costChart.byLabel = !!on;
+  try { localStorage.setItem("tt-cost-bylabel", on ? "1" : "0"); } catch { /* ignore */ }
+  syncCostChrome();
+  const st = window.__costChart;
+  if (st) drawBars($("costChart"), st.turns, st.rounds);
+}
+
+$("stackIo")?.addEventListener("click", () => setCostStack("io"));
+$("stackParts")?.addEventListener("click", () => setCostStack("parts"));
+$("stackTools")?.addEventListener("click", () => setCostStack("tools"));
+$("costLayoutRounds")?.addEventListener("click", () => setCostByLabel(false));
+$("costLayoutLabel")?.addEventListener("click", () => setCostByLabel(true));
 $("costUnitUsd")?.addEventListener("click", () => setCostUnit("usd"));
 $("costUnitTok")?.addEventListener("click", () => setCostUnit("tokens"));
 $("costDrillBack")?.addEventListener("click", () => {
