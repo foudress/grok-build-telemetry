@@ -174,9 +174,8 @@ function render(state) {
   $("liveBadge").textContent = state.watching ? "LIVE" : "idle";
   $("liveBadge").className = "badge " + (state.watching ? "live" : "idle");
 
-  const sid = state.session_id || "—";
-  const short = sid.length > 12 ? sid.slice(0, 8) + "…" : sid;
-  $("sessionMeta").innerHTML = `<code title="${esc(sid)}">${esc(short)}</code>`;
+  const meta = $("sessionMeta");
+  if (meta) meta.textContent = "";
   fillSessionSelect(state);
 
   paintTaskTabs(state);
@@ -394,6 +393,17 @@ bindPoll(poll);
 bindPeriodPoll(poll);
 restorePrefs();
 bindPeriodControls();
+
+$("cacheReset")?.addEventListener("click", async () => {
+  const btn = $("cacheReset");
+  if (btn) btn.disabled = true;
+  try {
+    await fetch("/api/cache/reset", { method: "POST" });
+  } catch { /* ignore */ }
+  if (btn) btn.disabled = false;
+  beginViewLoad();
+  poll();
+});
 
 $("sessionSelect")?.addEventListener("change", (ev) => {
   beginViewLoad();

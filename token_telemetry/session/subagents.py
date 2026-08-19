@@ -49,16 +49,11 @@ _USAGE_KEYS = (
 
 
 def read_session_summary(session_dir: Optional[Path]) -> dict[str, Any]:
+    from token_telemetry.session.discover import _read_session_summary
+
     if session_dir is None:
         return {}
-    p = Path(session_dir) / "summary.json"
-    if not p.is_file():
-        return {}
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    return _read_session_summary(Path(session_dir))
 
 
 def session_kind_of(session_dir: Optional[Path]) -> Optional[str]:
@@ -475,7 +470,7 @@ def peel_round_usage(
                 "session_id": uid,
                 "peeled": True,
                 "usage": dict(cu),
-                "title": summary.get("generated_title") or summary.get("session_summary"),
+                "title": summary.get("session_summary") or summary.get("generated_title"),
                 "agent_name": summary.get("agent_name"),
                 "session_kind": summary.get("session_kind") or "subagent",
                 **priced,

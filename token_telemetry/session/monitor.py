@@ -208,11 +208,12 @@ class _ChildWatch:
         estimate = _sum_rounds_estimate(rounds_all)
         rounds_raw = rounds_all[-API_ROUNDS:] if len(rounds_all) > API_ROUNDS else rounds_all
         rounds = [enrich_round(r) for r in rounds_raw]
-        title = (
-            summary.get("session_summary")
-            or summary.get("generated_title")
-            or summary.get("agent_name")
-            or self.session_id[:8]
+        from token_telemetry.session.discover import pick_session_title
+
+        title = pick_session_title(
+            summary,
+            session_id=self.session_id,
+            extra=summary.get("agent_name"),
         )
         return {
             "session_id": self.session_id,

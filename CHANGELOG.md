@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] — 2026-08-19
+
+Session titles, persisted period calcs, header cleanup, and tool-result
+weights without a fake JSON envelope.
+
+### Added
+
+- On-disk **calc cache** (`~/.grok/token-telemetry/calc-cache/`) for period
+  hierarchy replay and aggregate rows. Closed sessions are reused until
+  `updates.jsonl` / `summary.json` change. Header **Reset calc** wipes disk
+  + memory (`POST /api/cache/reset`).
+- Shared `pick_session_title` (`session_summary` → `generated_title` →
+  `last_turn_summary`).
+
+### Changed
+
+- Tool-result In **weights** tokenize the **content body only** (same as
+  grok-build `ToolResult.content`). No ACP envelope
+  `{"type":"tool_result","tool_call_id",…}`.
+- Header no longer shows a truncated session UUID (`sessionMeta` empty in
+  Session view; period still shows the window label).
+
+### Fixed
+
+- `summary.json` with a UTF-8 **BOM** failed to parse (`utf-8`), so titles
+  fell back to the session-id prefix. Readers now use `utf-8-sig`.
+- Period file cache ignored `summary.json` mtime, so a late title never
+  appeared until updates grew. Cache key includes summary fingerprint.
+
 ## [0.5.1] — 2026-08-19
 
 Period session hierarchy + Gantt timeline (hourglass) for Daily / Weekly / Monthly.

@@ -469,11 +469,9 @@ class _SessionTrack:
 
 def _session_label(session_dir: Path, sid: str) -> str:
     summary = _read_session_summary(session_dir)
-    title = summary.get("generated_title") or summary.get("session_summary")
-    if isinstance(title, str) and title.strip():
-        t = title.strip()
-        return t[:49] + "…" if len(t) > 52 else t
-    return sid[:8]
+    from token_telemetry.session.discover import pick_session_title
+
+    return pick_session_title(summary, session_id=sid, max_len=52)
 
 
 class HistoryWatcher:

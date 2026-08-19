@@ -544,7 +544,7 @@ def _stamp_tool_chat_results(hb: Any, tools: list[dict[str, Any]]) -> None:
     """Attach chat_history tool_result.content tokenizer size onto harness tools.
 
     chat_history is authoritative for result **chars** and tokenizer **weights**
-    (stream tool_call_update envelopes under-count / truncate tools like grep).
+    (stream tool_call_update bodies under-count / truncate tools like grep).
     """
     by_id = hb._load_tool_results_fresh()
     if not by_id:
@@ -933,7 +933,7 @@ def _finalize_step(hb: Any, step: dict[str, Any]) -> None:
 
     late = max(0, int(step.get("late_context_delta") or 0))
     tt_tools_sum = sum(int(t.get("tt_delta_observed") or 0) for t in cleaned)
-    # Tokenizer result weights (history when stamped; else stream envelope)
+    # Tokenizer result weights (history when stamped; else stream content body)
     content_sum = sum(int(t.get("result_tokens_est") or 0) for t in cleaned)
 
     # --- One tool-In estimator: tokenizer result weights + late into tools ---

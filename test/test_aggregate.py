@@ -243,3 +243,43 @@ def test_session_hierarchy_and_gap_segments(tmp_path, monkeypatch):
     kinds = {sp["kind"] for sp in sess[0]["spans"]}
     assert "work" in kinds
     assert "wait" in kinds
+
+
+def test_title_prefers_session_summary_even_with_bom(tmp_path, monkeypatch):
+    now = _aware(2026, 8, 14, 12, 0)
+    t12 = datetime(2026, 8, 14, 12, 0, tzinfo=timezone.utc).timestamp()
+    sid = "dddd4444-0000-0000-0000-000000000004"
+    d = tmp_path / sid
+    d.mkdir()
+    body = json.dumps(
+        {
+            "session_summary": "Real summary title",
+            "generated_title": "Old generated",
+        }
+    )
+    (d / "summary.json").write_bytes(b"\xef\xbb\xbf" + body.encode("utf-8"))
+    (d / "updates.jsonl").write_text(
+        json.dumps(
+            {
+                "timestamp": t12,
+                "params": {
+                    "_meta": {"agentTimestampMs": int(t12 * 1000)},
+                    "update": {
+                        "sessionUpdate": "turn_completed",
+                        "usage": {
+                            "inputTokens": 10,
+                            "cachedReadTokens": 0,
+                            "outputTokens": 1,
+                            "modelCalls": 1,
+                        },
+                    },
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(agg_mod, "list_session_dirs", lambda: [d])
+    _file_cache.clear()
+    out = build_aggregate("daily", 0, now=now)
+    assert out["sessions"][0]["title"] == "Real summary title"

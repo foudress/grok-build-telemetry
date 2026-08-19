@@ -177,6 +177,13 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps(result, ensure_ascii=False).encode("utf-8")
             self._send(200 if result.get("ok") else 400, body, "application/json; charset=utf-8")
             return
+        if path == "/api/cache/reset":
+            from token_telemetry.session.calc_cache import reset_all_calcs
+
+            n = reset_all_calcs()
+            body = json.dumps({"ok": True, "cleared": n}, ensure_ascii=False).encode("utf-8")
+            self._send(200, body, "application/json; charset=utf-8")
+            return
         self._send(404, b"not found", "text/plain")
 
 

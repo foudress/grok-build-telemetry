@@ -17,8 +17,10 @@ from token_telemetry.session.discover import (
     _parse_iso_to_epoch,
     _read_session_summary,
     list_session_dirs,
+    pick_session_title,
 )
-from token_telemetry.session.period_attr import cached_attr_events
+from token_telemetry.session.calc_cache import load_calc, save_calc
+from token_telemetry.session.period_attr import cached_attr_events, clear_attr_mem
 from token_telemetry.session.subagents import UUID_RE, price_child_usage
 
 
@@ -293,18 +295,9 @@ def _session_meta(
         agent = None
     else:
         agent = agent.strip()
-    title = (
-        summary.get("session_summary")
-        or summary.get("generated_title")
-        or agent
-        or session_dir.name[:8]
+    title = pick_session_title(
+        summary, session_id=session_dir.name, extra=agent, max_len=72
     )
-    if isinstance(title, str):
-        title = title.strip() or session_dir.name[:8]
-        if len(title) > 72:
-            title = title[:69] + "…"
-    else:
-        title = session_dir.name[:8]
     created = _parse_iso_to_epoch(summary.get("created_at"))
     last_active = _parse_iso_to_epoch(
         summary.get("last_active_at") or summary.get("updated_at")
@@ -312,17 +305,25 @@ def _session_meta(
     return str(title), kind, agent, _summary_parent_id(summary), created, last_active
 
 
+def _stat_pair(path: Path) -> tuple[float, int]:
+    try:
+        st = path.stat()
+        return float(st.st_mtime), int(st.st_size)
+    except OSError:
+        return 0.0, 0
+
+
 def _cached_file(session_dir: Path) -> dict[str, Any]:
     p = session_dir / "updates.jsonl"
     key = str(p)
-    try:
-        st = p.stat()
-        mtime = st.st_mtime
-        size = st.st_size
-    except OSError:
+    mtime, size = _stat_pair(p)
+    sum_mtime, sum_size = _stat_pair(session_dir / "summary.json")
+    if mtime == 0 and size == 0 and not p.is_file():
         return {
             "mtime": 0,
             "size": 0,
+            "sum_mtime": sum_mtime,
+            "sum_size": sum_size,
             "turns": [],
             "child_ids": [],
             "spans": [],
@@ -330,7 +331,7 @@ def _cached_file(session_dir: Path) -> dict[str, Any]:
             "last_all": None,
             "session_id": session_dir.name,
             "path": str(session_dir),
-            "title": session_dir.name[:8],
+            "title": pick_session_title({}, session_id=session_dir.name),
             "kind": None,
             "agent_name": None,
             "parent_id": None,
@@ -340,10 +341,22 @@ def _cached_file(session_dir: Path) -> dict[str, Any]:
         hit
         and hit.get("mtime") == mtime
         and hit.get("size") == size
+        and hit.get("sum_mtime") == sum_mtime
+        and hit.get("sum_size") == sum_size
         and "spans" in hit
-        and hit.get("title_src") == "session_summary"
     ):
         return hit
+    blob = load_calc(session_dir)
+    if blob and isinstance(blob.get("agg"), dict) and "spans" in blob["agg"]:
+        row = dict(blob["agg"])
+        row["mtime"] = mtime
+        row["size"] = size
+        row["sum_mtime"] = sum_mtime
+        row["sum_size"] = sum_size
+        row["path"] = str(session_dir)
+        row["session_id"] = session_dir.name
+        _file_cache[key] = row
+        return row
     title, kind, agent, parent_id, created, last_active = _session_meta(session_dir)
     turns, child_ids, markers = _parse_updates(p)
     sid = session_dir.name.lower()
@@ -359,6 +372,8 @@ def _cached_file(session_dir: Path) -> dict[str, Any]:
     row = {
         "mtime": mtime,
         "size": size,
+        "sum_mtime": sum_mtime,
+        "sum_size": sum_size,
         "turns": turns,
         "child_ids": child_ids,
         "spans": spans,
@@ -370,10 +385,28 @@ def _cached_file(session_dir: Path) -> dict[str, Any]:
         "kind": kind,
         "agent_name": agent,
         "parent_id": parent_id,
-        "title_src": "session_summary",
     }
     _file_cache[key] = row
+    disk_agg = {
+        k: row[k]
+        for k in (
+            "turns",
+            "child_ids",
+            "spans",
+            "first_all",
+            "last_all",
+            "title",
+            "kind",
+            "agent_name",
+            "parent_id",
+        )
+    }
+    save_calc(session_dir, agg=disk_agg)
     return row
+
+
+def clear_file_mem() -> None:
+    _file_cache.clear()
 
 
 def _scan_files() -> list[dict[str, Any]]:

@@ -54,15 +54,53 @@ def read_active_sessions_meta() -> list[dict[str, Any]]:
 
 
 def _read_session_summary(session_dir: Path) -> dict[str, Any]:
-    """Load summary.json (title, last_active_at, …). Empty dict if missing."""
+    """Load summary.json (title, last_active_at, …). Empty dict if missing.
+
+    Grok often writes a UTF-8 BOM; ``utf-8`` alone then fails and callers
+    fall back to the session-id prefix.
+    """
     p = session_dir / "summary.json"
     if not p.is_file():
         return {}
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _nonempty_str(v: Any) -> Optional[str]:
+    if isinstance(v, str) and v.strip():
+        return v.strip()
+    return None
+
+
+def pick_session_title(
+    summary: dict[str, Any],
+    *,
+    session_id: str,
+    cwd: Any = None,
+    extra: Any = None,
+    max_len: int = 72,
+) -> str:
+    """Prefer session_summary, then generated_title, then last_turn_summary."""
+    title = (
+        _nonempty_str(summary.get("session_summary"))
+        or _nonempty_str(summary.get("generated_title"))
+        or _nonempty_str(summary.get("last_turn_summary"))
+        or _nonempty_str(extra)
+    )
+    if not title:
+        info = summary.get("info")
+        info_cwd = info.get("cwd") if isinstance(info, dict) else None
+        raw_cwd = cwd or info_cwd
+        if isinstance(raw_cwd, str) and raw_cwd.strip():
+            title = Path(raw_cwd.replace("\\", "/")).name or raw_cwd.strip()
+    if not title:
+        title = (session_id or "")[:8] or "session"
+    if len(title) > max_len:
+        title = title[: max_len - 3] + "…"
+    return title
 
 
 def _parse_iso_to_epoch(s: Any) -> Optional[float]:
@@ -130,24 +168,16 @@ def list_sessions_for_ui() -> list[dict[str, Any]]:
         summary = _read_session_summary(d)
         meta = active_meta.get(sid) or {}
 
-        title = (
-            summary.get("session_summary")
-            or summary.get("generated_title")
-            or meta.get("title")
-            or meta.get("name")
-            or None
-        )
-        if isinstance(title, str):
-            title = title.strip() or None
-        # Fallback: short path basename of cwd, then hash
         cwd = summary.get("info", {}).get("cwd") if isinstance(summary.get("info"), dict) else None
         cwd = cwd or meta.get("cwd")
-        if not title and isinstance(cwd, str) and cwd.strip():
-            # last path segment as weak label
-            title = Path(cwd.replace("\\", "/")).name or cwd
-        label = title or sid[:8]
-        if isinstance(label, str) and len(label) > 52:
-            label = label[:49] + "…"
+        title = pick_session_title(
+            summary,
+            session_id=sid,
+            cwd=cwd,
+            extra=meta.get("title") or meta.get("name"),
+            max_len=52,
+        )
+        label = title
 
         last_active_iso = summary.get("last_active_at") or summary.get("updated_at")
         last_epoch = _parse_iso_to_epoch(last_active_iso)

@@ -23,6 +23,8 @@ out/
 !/test/test_finalize_anchor.py
 !/test/test_history_watch.py
 !/test/test_period_attr.py
+!/test/test_calc_cache.py
+!/test/test_tool_result_body.py
 
 # Maintainer session notes (not required for install)
 .grok/

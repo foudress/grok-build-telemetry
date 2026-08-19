@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from token_telemetry.hierarchy import HierarchyBuilder
+from token_telemetry.session.calc_cache import load_calc, save_calc
 
 
 _lock = threading.Lock()
@@ -298,10 +299,22 @@ def cached_attr_events(session_dir: Path) -> list[dict[str, Any]]:
         hit = _attr_cache.get(key)
         if hit and hit.get("mtime") == mtime and hit.get("size") == size:
             return hit.get("events") or []
+    blob = load_calc(session_dir)
+    if blob is not None and "events" in blob:
+        events = blob.get("events") or []
+        with _lock:
+            _attr_cache[key] = {"mtime": mtime, "size": size, "events": events}
+        return events
     try:
         events = extract_session_events(session_dir)
     except Exception:
         events = []
+    save_calc(session_dir, events=events)
     with _lock:
         _attr_cache[key] = {"mtime": mtime, "size": size, "events": events}
     return events
+
+
+def clear_attr_mem() -> None:
+    with _lock:
+        _attr_cache.clear()

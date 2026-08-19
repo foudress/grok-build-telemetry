@@ -465,7 +465,9 @@ def _content_metrics(update: dict[str, Any]) -> dict[str, Any]:
     """
     Extract result size hints from tool_call_update payloads.
 
-    Weight by the **model-facing tool_result body**, not:
+    Weight by the **model-facing tool_result body** (content only — same as
+    grok-build ``estimate_item_tokens`` on ToolResult), not:
+      • ACP/JSON envelope ``{type, tool_call_id, content}``
       • UI `type:diff` (oldText/newText) on stream content
       • SearchReplace EditsApplied.old/new_string blobs
       • full rawOutput debug dumps (ReadFile ×3, Bash ×2–6)
@@ -514,26 +516,25 @@ def _content_metrics(update: dict[str, Any]) -> dict[str, Any]:
             except (TypeError, ValueError):
                 absorb_text(str(primary))
 
-    # Body for envelope / token weights: wire text, else primary — never raw diffs
-    tid = update.get("toolCallId") or update.get("tool_call_id") or ""
+    # Body for token weights: wire text, else primary — never envelope / raw diffs
     if content_text:
         body: Any = content_text
     elif primary is not None:
         body = primary
     else:
         body = ""
-    try:
-        envelope = {
-            "type": "tool_result",
-            "tool_call_id": tid,
-            "content": body,
-        }
-        envelope_chars = len(json.dumps(envelope, ensure_ascii=False))
-    except (TypeError, ValueError):
-        envelope_chars = content_json_chars or primary_chars or text_chars
+    if isinstance(body, str):
+        body_chars = len(body)
+    elif body not in (None, ""):
+        try:
+            body_chars = len(json.dumps(body, ensure_ascii=False))
+        except (TypeError, ValueError):
+            body_chars = len(str(body))
+    else:
+        body_chars = 0
 
-    # Wire size: envelope / bare text / primary. Never max with raw_dump or UI diff.
-    chars = max(envelope_chars, content_json_chars, text_chars, primary_chars if body else 0)
+    # Wire size: content body only. Never max with raw_dump or UI diff.
+    chars = max(body_chars, content_json_chars, text_chars, primary_chars if body else 0)
     if chars > 0 and lines <= 0:
         lines = max(1, (text_chars.count("\n") + 1) if text_chars else 1)
 
@@ -567,16 +568,12 @@ def _content_metrics(update: dict[str, Any]) -> dict[str, Any]:
         if isinstance(ea, dict):
             path = ea.get("absolute_path") or ea.get("file_path") or path
 
-    # Tokenizer estimate from wire envelope (same body as chars)
-    if chars and body != "":
+    # Tokenizer estimate from content body only (harness ToolResult.content)
+    if isinstance(body, str) and body:
+        tokens_est = count_tokens(body)
+    elif body not in (None, ""):
         try:
-            tokens_est = count_json_tokens(
-                {
-                    "type": "tool_result",
-                    "tool_call_id": tid,
-                    "content": body,
-                }
-            )
+            tokens_est = count_json_tokens(body)
         except Exception:
             tokens_est = count_chars_as_tokens(chars)
     elif chars:
@@ -595,6 +592,5 @@ def _content_metrics(update: dict[str, Any]) -> dict[str, Any]:
         "limit": limit,
         "raw_output_chars": primary_chars,
         "raw_output_dump_chars": raw_dump_chars,
-        "envelope_chars": envelope_chars,
         **_arg_metrics(raw_in if isinstance(raw_in, (dict, str)) else None),
     }
