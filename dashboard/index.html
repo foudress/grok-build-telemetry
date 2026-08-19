@@ -11,6 +11,7 @@
 </head>
 <body>
   <header>
+    <button type="button" id="periodBack" class="ghost-btn period-back" hidden title="Back to period view">← Back</button>
     <h1>Grok Token Telemetry</h1>
     <a href="/history" class="meta" style="text-decoration:none">history</a>
     <span id="liveBadge" class="badge">connecting…</span>
@@ -29,12 +30,16 @@
     <span id="sessionMeta" class="meta">—</span>
     <span id="modelBadge" class="badge" hidden></span>
     <span id="kvChip" class="badge kv" hidden></span>
-    <span id="phaseMeta" class="meta"></span>
+    <span id="phaseMeta" class="meta" hidden></span>
     <div id="ctxPressure" class="ctx-pressure" hidden title="Context vs window · notch = 200k rate cliff">
       <span id="ctxPressureFill"></span>
       <span id="ctxPressureNotch" class="tier-notch"></span>
     </div>
   </header>
+  <div id="viewLoader" class="view-loader" hidden>
+    <span class="spinner" aria-hidden="true"></span>
+    <span class="view-loader-lab">Loading…</span>
+  </div>
   <div id="statusBanner" class="status-banner" hidden></div>
 
   <main>
@@ -71,7 +76,14 @@
     </section>
 
     <section class="panel" id="costPanel">
-      <h2 id="costPanelTitle">Cost per round</h2>
+      <div class="panel-head cost-panel-head">
+        <h2 id="costPanelTitle">Cost per round</h2>
+        <div id="periodNav" class="period-nav" hidden>
+          <button type="button" id="periodPrev" class="ghost-btn" title="Previous period">←</button>
+          <span id="periodLabel" class="mode-pill">—</span>
+          <button type="button" id="periodNext" class="ghost-btn" title="Next period">→</button>
+        </div>
+      </div>
       <div id="taskTabs" class="task-tabs" hidden></div>
       <div class="chart-toolbar" id="sessionChartToolbar">
         <span class="unit-toggle" title="How each bar is split" role="group" aria-label="Category stack">
@@ -88,12 +100,8 @@
           <button type="button" id="costUnitTok" class="unit-btn" aria-pressed="false">Tok</button>
         </span>
         <button type="button" id="costDrillBack" hidden>← Back to rounds</button>
-        <span id="costModeLabel" class="mode-pill"></span>
       </div>
       <div class="chart-toolbar" id="periodToolbar" hidden>
-        <button type="button" id="periodPrev" class="ghost-btn" title="Previous period">←</button>
-        <span id="periodLabel" class="mode-pill">—</span>
-        <button type="button" id="periodNext" class="ghost-btn" title="Next period">→</button>
         <span class="unit-toggle" id="periodGrain" hidden title="Bar grain" role="group" aria-label="Period grain">
           <button type="button" id="grainA" class="unit-btn" data-grain=""></button>
           <button type="button" id="grainB" class="unit-btn" data-grain=""></button>
@@ -114,8 +122,8 @@
         <span class="unit-toggle" title="Y-axis unit" role="group" aria-label="Period chart unit">
           <button type="button" id="aggUnitUsd" class="unit-btn active" aria-pressed="true">$</button>
           <button type="button" id="aggUnitTok" class="unit-btn" aria-pressed="false">Tok</button>
+          <button type="button" id="aggUnitTime" class="unit-btn hourglass-btn" aria-pressed="false" title="Timeline · session duration">&#x231B;</button>
         </span>
-        <span id="aggModeLabel" class="mode-pill">In / Cached / Out</span>
       </div>
       <div class="chart-wrap" id="costChartWrap">
         <canvas id="costYAxis" class="cost-yaxis" hidden></canvas>
@@ -123,6 +131,13 @@
           <canvas id="costChart" class="bars" height="320"></canvas>
         </div>
         <div id="costTip" class="chart-tip" role="tooltip"></div>
+        <button type="button" id="chartResize" class="chart-resize" hidden title="Drag to resize" aria-label="Resize chart">
+          <svg viewBox="0 0 18 18" width="16" height="16" aria-hidden="true">
+            <path d="M16 7 V16 H7" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+            <path d="M8 16 L16 8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+            <path d="M11.2 16 H16 V11.2" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+          </svg>
+        </button>
       </div>
       <div id="costLegend" class="cost-legend" title="Click a category to hide/show it in the bars"></div>
     </section>
@@ -135,6 +150,7 @@
             <button type="button" id="densStandard" class="unit-btn active" aria-pressed="true">Standard</button>
             <button type="button" id="densExpert" class="unit-btn" aria-pressed="false">Expert</button>
           </span>
+          <button type="button" id="ganttReset" class="ghost-btn" hidden>Show all</button>
           <button type="button" id="treeCollapse" class="ghost-btn">Collapse</button>
         </div>
       </div>

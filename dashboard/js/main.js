@@ -11,6 +11,8 @@ import {
   leavePeriodView,
   redrawPeriod,
   restoreScope,
+  beginViewLoad,
+  endViewLoad,
 } from './period.js';
 
 const TIER_CLIFF = 200000;
@@ -180,9 +182,11 @@ function render(state) {
   paintTaskTabs(state);
   const view = activeTaskView(state);
   const live = view.live || state.live || {};
-  $("phaseMeta").textContent = live.phase
-    ? `phase: ${live.phase}`
-    : (view.kind === "sub" ? "sub-agent" : "");
+  const phaseEl = $("phaseMeta");
+  if (phaseEl) {
+    phaseEl.textContent = "";
+    phaseEl.hidden = true;
+  }
 
   const sig = state.signals || {};
   const ctx = live.context_tokens_ui ?? live.context_tokens ?? (view.kind === "main" ? sig.contextTokensUsed : null);
@@ -346,7 +350,13 @@ async function poll() {
     const r = await fetch("/api/state?_=" + Date.now());
     if (!r.ok) throw new Error("HTTP " + r.status);
     const state = await r.json();
+    if (typeof window.__pendingSid === "string" && window.__pendingSid
+      && state.session_id && state.session_id !== window.__pendingSid) {
+      return;
+    }
+    window.__pendingSid = null;
     render(state);
+    endViewLoad();
   } catch (e) {
     console.error("dashboard poll/render failed:", e);
     $("liveBadge").textContent = "offline";
@@ -354,6 +364,7 @@ async function poll() {
     const meta = $("sessionMeta");
     if (meta) meta.textContent = String(e && e.message ? e.message : e).slice(0, 120);
     showBanner("Dashboard offline — last numbers kept on screen.", "error");
+    endViewLoad();
   } finally {
     _pollBusy = false;
   }
@@ -385,6 +396,7 @@ restorePrefs();
 bindPeriodControls();
 
 $("sessionSelect")?.addEventListener("change", (ev) => {
+  beginViewLoad();
   switchSession(ev.target.value || null);
 });
 

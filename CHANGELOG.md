@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] — 2026-08-19
+
+Period session hierarchy + Gantt timeline (hourglass) for Daily / Weekly / Monthly.
+
+### Added
+
+- Period **session list** nests parent sessions and their sub-agents (`Session N` / `Sub Agent N`).
+- **Hourglass** view next to `$` / `Tok`: Gantt of session duration. Work (LLM/harness) vs wait (user) on one lane.
+- Time window zoom (min = full period, max = 5 min) so weekly/monthly never blow the canvas white.
+- Pan X+Y, wheel zoom on the plot, Y-axis TradingView zoom (focus under cursor), corner resize handle.
+- Multi-select drill (parent includes children), **Show all**, **← Back** after opening a session from a period.
+- Nav **loading overlay** so the previous session does not flash.
+
+### Changed
+
+- Session titles prefer `summary.json` **`session_summary`**.
+- Gantt X ticks are date-first (`mer. 19`, no month) with a persistent **2h** grid when zoomed in; colliding labels rotate.
+- Gantt Y labels use 1 / 2 / 5 / 10 numbering (dots only in the gaps).
+- Session picker is a wrapping custom dropdown. **Follow active** always tracks the most recently active main session.
+- Period `$` / `Tok` / hourglass are exclusive. Hourglass greys Hourly/Daily, I/O, Parts, Tools, Time, By label.
+- Header no longer shows `phase: streaming`.
+
+### Fixed
+
+- Sub-agent bars were one-pixel (only `turn_completed`). Duration is first→last event.
+- Legend hide on Gantt no longer drops back to `$`/`Tok` bars.
+- Chart tooltips stay in the viewport when the canvas is zoomed.
+- Parent→child links no longer draw a stub past the child bar.
+
 ## [0.5.0] — 2026-08-19
 
 History watch dashboard, cost-chart I/O · Parts · Tools stacks (session +

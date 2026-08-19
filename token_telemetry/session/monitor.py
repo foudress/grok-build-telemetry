@@ -209,8 +209,8 @@ class _ChildWatch:
         rounds_raw = rounds_all[-API_ROUNDS:] if len(rounds_all) > API_ROUNDS else rounds_all
         rounds = [enrich_round(r) for r in rounds_raw]
         title = (
-            summary.get("generated_title")
-            or summary.get("session_summary")
+            summary.get("session_summary")
+            or summary.get("generated_title")
             or summary.get("agent_name")
             or self.session_id[:8]
         )

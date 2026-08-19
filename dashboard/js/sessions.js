@@ -10,6 +10,50 @@ export function bindPoll(fn) {
   _pollRef = fn;
 }
 
+function escHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+
+function clipTitle(s, n) {
+  const t = String(s || "").trim();
+  if (t.length <= n) return t;
+  return t.slice(0, n - 1) + "…";
+}
+
+function ensureSessionDd(sel) {
+  let wrap = $("sessionDd");
+  if (wrap) return wrap;
+  wrap = document.createElement("div");
+  wrap.id = "sessionDd";
+  wrap.className = "session-dd";
+  wrap.innerHTML = `<button type="button" id="sessionDdBtn" class="session-dd-btn session-picker-face"></button>
+    <div id="sessionDdMenu" class="session-dd-menu" hidden></div>`;
+  sel.classList.add("session-select-native");
+  sel.insertAdjacentElement("afterend", wrap);
+  const btn = $("sessionDdBtn");
+  const menu = $("sessionDdMenu");
+  btn.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    menu.hidden = !menu.hidden;
+    if (!menu.hidden) {
+      const br = wrap.getBoundingClientRect();
+      menu.style.left = "0";
+      menu.style.right = "auto";
+      const mw = Math.min(420, window.innerWidth - 16);
+      if (br.left + mw > window.innerWidth - 8) {
+        menu.style.left = "auto";
+        menu.style.right = "0";
+      }
+    }
+  });
+  document.addEventListener("click", (ev) => {
+    if (!wrap.contains(ev.target)) menu.hidden = true;
+  });
+  return wrap;
+}
+
 function fillSessionSelect(state) {
   const sel = $("sessionSelect");
   const pinHint = $("sessionPinHint");
@@ -22,7 +66,6 @@ function fillSessionSelect(state) {
     pinHint.hidden = !pinned;
     pinHint.textContent = pinned ? "pinned" : "";
   }
-  // Include age so labels refresh as time passes (bucketed to limit churn)
   const ageBucket = (s) => {
     const a = s.age_seconds != null ? Number(s.age_seconds) : 0;
     if (a < 60) return "s";
@@ -32,25 +75,24 @@ function fillSessionSelect(state) {
   };
   const key =
     sessions.map((s) => s.session_id + (s.active ? "A" : "") + ageBucket(s) + (s.label || "")).join("|") +
-    ">" +
-    current +
-    ">" +
-    (pinned || "") +
-    ">" +
-    (follow ? "F" : "P");
+    ">" + current + ">" + (pinned || "") + ">" + (follow ? "F" : "P");
+  ensureSessionDd(sel);
+  const btn = $("sessionDdBtn");
+  const menu = $("sessionDdMenu");
+  const curRow = sessions.find((s) => s.session_id === current);
+  const curTitle = (curRow && (curRow.title || curRow.label)) || current.slice(0, 8);
+  if (btn) {
+    btn.textContent = follow
+      ? `● ${clipTitle(curTitle, 48)}`
+      : clipTitle((curRow && (curRow.title || curRow.label)) || "Session", 52);
+    btn.title = curTitle;
+  }
   if (key === _lastSessionOptsKey && sel.options.length > 1) {
-    if (sel.value !== current && !_sessionSwitching && !follow) {
-      for (const o of sel.options) {
-        if (o.value === current) {
-          sel.value = current;
-          break;
-        }
-      }
-    }
+    if (sel.value !== current && current) sel.value = current;
     return;
   }
   _lastSessionOptsKey = key;
-  const prevFocus = document.activeElement === sel;
+
   const frag = document.createDocumentFragment();
   const followOpt = document.createElement("option");
   followOpt.value = "";
@@ -66,18 +108,9 @@ function fillSessionSelect(state) {
     for (const s of list) {
       const o = document.createElement("option");
       o.value = s.session_id;
-      const mark = s.session_id === current ? "▸ " : "";
       const title = (s.title || s.label || "").trim() || (s.session_id || "").slice(0, 8);
       const age = s.age_label ? ` · ${s.age_label}` : "";
-      // Title + last-active age (no hash in the main line)
-      o.textContent = `${mark}${title}${age}`;
-      const tipParts = [
-        s.session_id || "",
-        s.cwd ? "cwd: " + s.cwd : "",
-        s.last_active_at ? "last active: " + s.last_active_at : "",
-        s.path || "",
-      ].filter(Boolean);
-      o.title = tipParts.join("\n");
+      o.textContent = `${s.session_id === current ? "▸ " : ""}${title}${age}`;
       og.appendChild(o);
     }
     frag.appendChild(og);
@@ -86,26 +119,41 @@ function fillSessionSelect(state) {
   addGroup("Recent", other);
   sel.innerHTML = "";
   sel.appendChild(frag);
-  if (pinned || !follow) {
-    sel.value = current;
-    if (sel.value !== current && current) {
-      const o = document.createElement("option");
-      o.value = current;
-      const match = sessions.find((s) => s.session_id === current);
-      const t = (match && (match.title || match.label)) || (current || "").slice(0, 8);
-      const age = match && match.age_label ? ` · ${match.age_label}` : "";
-      o.textContent = `▸ ${t}${age} (current)`;
-      sel.appendChild(o);
-      sel.value = current;
-    }
-  } else {
-    sel.value = "";
+  sel.value = current || "";
+
+  if (menu) {
+    const bits = [];
+    bits.push(`<button type="button" class="session-dd-item${follow ? " is-on" : ""}" data-sid="">${follow ? "●" : "○"} Follow active (most recent)</button>`);
+    const grp = (name, list) => {
+      if (!list.length) return;
+      bits.push(`<div class="session-dd-group">${name}</div>`);
+      for (const s of list) {
+        const title = (s.title || s.label || "").trim() || s.session_id.slice(0, 8);
+        const age = s.age_label ? ` · ${s.age_label}` : "";
+        const on = s.session_id === current ? " is-on" : "";
+        bits.push(`<button type="button" class="session-dd-item${on}" data-sid="${escHtml(s.session_id)}" title="${escHtml(title)}">${escHtml(title)}${escHtml(age)}</button>`);
+      }
+    };
+    grp("Active", active);
+    grp("Recent", other);
+    menu.innerHTML = bits.join("");
+    menu.querySelectorAll("[data-sid]").forEach((el) => {
+      el.addEventListener("click", () => {
+        const sid = el.getAttribute("data-sid") || "";
+        menu.hidden = true;
+        sel.value = sid;
+        sel.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+    });
   }
-  if (prevFocus) sel.focus();
 }
 
 async function switchSession(sessionId) {
   _sessionSwitching = true;
+  window.__pendingSid = sessionId || null;
+  document.body.classList.add("is-loading");
+  const loader = document.getElementById("viewLoader");
+  if (loader) loader.hidden = false;
   try {
     const r = await fetch("/api/session", {
       method: "POST",

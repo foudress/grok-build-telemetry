@@ -124,7 +124,7 @@ def test_build_aggregate_daily_hourly_and_subagent(tmp_path, monkeypatch):
 
     ids = {s["session_id"] for s in out["sessions"]}
     assert len(out["sessions"]) == 2
-    assert any(s["title"].startswith("↳") for s in out["sessions"])
+    assert any(s["session_kind"] == "subagent" and s.get("depth") == 1 for s in out["sessions"])
     assert "aaaa1111-0000-0000-0000-000000000001" in ids
 
     # yesterday's turn is outside
@@ -169,3 +169,77 @@ def test_monthly_grain_week(tmp_path, monkeypatch):
     wd = build_aggregate("weekly", 0, grain="day", now=now)
     assert wd["grain"] == "day"
     assert len(wd["buckets"]) == 7
+
+
+def _evt(ep, kind):
+    return json.dumps({
+        "timestamp": ep,
+        "params": {
+            "_meta": {"agentTimestampMs": int(ep * 1000)},
+            "update": {"sessionUpdate": kind},
+        },
+    })
+
+
+def test_session_hierarchy_and_gap_segments(tmp_path, monkeypatch):
+    now = _aware(2026, 8, 14, 18, 0)
+    day0 = datetime(2026, 8, 14, tzinfo=timezone.utc)
+    t10 = (day0 + timedelta(hours=10)).timestamp()
+    t1040 = (day0 + timedelta(hours=10, minutes=40)).timestamp()
+    t11 = (day0 + timedelta(hours=11)).timestamp()
+    t12 = (day0 + timedelta(hours=12)).timestamp()
+    t15 = (day0 + timedelta(hours=15)).timestamp()
+    t16 = (day0 + timedelta(hours=16)).timestamp()
+    t17 = (day0 + timedelta(hours=17)).timestamp()
+    later = "cccc3333-0000-0000-0000-000000000003"
+    parent = "aaaa1111-0000-0000-0000-000000000001"
+    child = "bbbb2222-0000-0000-0000-000000000002"
+
+    _write_session(tmp_path, parent, [(t1040, 100, 0, 10), (t16, 100, 0, 10)], title="Main")
+    p = tmp_path / parent / "updates.jsonl"
+    extra = "\n".join([
+        _evt(t10, "user_message_chunk"),
+        _evt(t11, "agent_thought_chunk"),
+        json.dumps({
+            "timestamp": t11,
+            "params": {
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCall": {"toolName": "spawn_subagent", "rawInput": {"task_ids": [child]}},
+                }
+            },
+        }),
+        _evt(t15, "user_message_chunk"),
+    ])
+    p.write_text(p.read_text(encoding="utf-8") + extra + "\n", encoding="utf-8")
+
+    _write_session(tmp_path, child, [(t12, 50, 0, 5)], kind="subagent", title="Hunt")
+    cpath = tmp_path / child / "updates.jsonl"
+    cpath.write_text(
+        _evt(t11, "user_message_chunk") + "\n"
+        + _evt(t11 + 30, "agent_thought_chunk") + "\n"
+        + cpath.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    _write_session(tmp_path, later, [(t17, 20, 0, 2)], title="Later")
+
+    monkeypatch.setattr(agg_mod, "list_session_dirs", lambda: list(tmp_path.iterdir()))
+    _file_cache.clear()
+
+    out = build_aggregate("daily", 0, grain="hour", now=now)
+    sess = out["sessions"]
+    parents = [s for s in sess if s["depth"] == 0]
+    assert parents[0]["session_id"] == parent
+    assert parents[0]["label"] == "Session 1"
+    assert parents[1]["session_id"] == later
+    assert parents[1]["label"] == "Session 2"
+    assert sess[1]["session_id"] == child
+    assert sess[1]["parent_id"] == parent
+    assert sess[1]["label"] == "Sub Agent 1"
+    assert sess[1]["depth"] == 1
+    # child lives ~1h (first event t11 → turn t12), not a point bar
+    assert sess[1]["last_epoch"] - sess[1]["first_epoch"] >= 3500
+    kinds = {sp["kind"] for sp in sess[0]["spans"]}
+    assert "work" in kinds
+    assert "wait" in kinds

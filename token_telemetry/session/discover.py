@@ -104,7 +104,7 @@ def list_sessions_for_ui() -> list[dict[str, Any]]:
     """
     Sessions for the dashboard dropdown.
     Active sessions first (from active_sessions.json), then other recent dirs.
-    Prefer generated_title / session_summary over session id hash.
+    Prefer session_summary (then generated_title) over session id hash.
     """
     dirs = list_session_dirs()
     by_id = {d.name: d for d in dirs}
@@ -131,8 +131,8 @@ def list_sessions_for_ui() -> list[dict[str, Any]]:
         meta = active_meta.get(sid) or {}
 
         title = (
-            summary.get("generated_title")
-            or summary.get("session_summary")
+            summary.get("session_summary")
+            or summary.get("generated_title")
             or meta.get("title")
             or meta.get("name")
             or None
@@ -167,8 +167,10 @@ def list_sessions_for_ui() -> list[dict[str, Any]]:
         else:
             agent_name = agent_name.strip()
         if kind == "subagent":
-            sub_bit = agent_name or "sub"
-            label = f"↳ {sub_bit} · {label}"
+            role = (agent_name or "").strip()
+            if role.lower() in ("general-purpose", "general purpose"):
+                role = ""
+            label = f"↳ {role + ' · ' if role else ''}{label}"
 
         return {
             "session_id": sid,
@@ -217,18 +219,32 @@ def resolve_session_dir(session_id: Optional[str] = None) -> Optional[Path]:
         kind = summary.get("session_kind")
         return isinstance(kind, str) and kind.strip().lower() == "subagent"
 
-    # Prefer an active session that still has a fresh updates file
-    # (never auto-follow a sub-agent session — those live under the parent)
+    def _recency(d: Path) -> float:
+        summary = _read_session_summary(d)
+        ep = _parse_iso_to_epoch(
+            summary.get("last_active_at") or summary.get("updated_at")
+        )
+        try:
+            mt = (d / "updates.jsonl").stat().st_mtime
+        except OSError:
+            mt = 0.0
+        return max(float(ep or 0), float(mt or 0))
+
+    # Follow the most recently active main session (never a sub-agent).
     active = read_active_session_ids()
-    for sid in reversed(active):  # last opened wins
+    active_mains = []
+    for sid in active:
         d = by_id.get(sid)
         if d is not None and not _is_sub(d):
-            return d
+            active_mains.append(d)
+    if active_mains:
+        active_mains.sort(key=_recency, reverse=True)
+        return active_mains[0]
 
     mains = [d for d in dirs if not _is_sub(d)]
     pool = mains or dirs
     if not pool:
         return None
-    pool.sort(key=lambda d: (d / "updates.jsonl").stat().st_mtime, reverse=True)
+    pool.sort(key=_recency, reverse=True)
     return pool[0]
 

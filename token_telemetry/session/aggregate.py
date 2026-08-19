@@ -14,11 +14,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 from token_telemetry.session.discover import (
+    _parse_iso_to_epoch,
     _read_session_summary,
     list_session_dirs,
 )
 from token_telemetry.session.period_attr import cached_attr_events
-from token_telemetry.session.subagents import price_child_usage
+from token_telemetry.session.subagents import UUID_RE, price_child_usage
 
 
 _lock = threading.Lock()
@@ -159,42 +160,128 @@ def _round_acc(acc: dict[str, float]) -> dict[str, Any]:
     }
 
 
-def _parse_turns(path: Path) -> list[dict[str, Any]]:
+_SPAWN_HINTS = ("spawn_subagent", "get_command_or_subagent_output")
+
+
+def _extract_spawned_ids(raw: str) -> list[str]:
+    """Child session ids referenced by spawn / wait tools in this file."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in raw.splitlines():
+        if not any(h in line for h in _SPAWN_HINTS):
+            continue
+        for m in UUID_RE.finditer(line):
+            uid = m.group(0).lower()
+            if uid in seen:
+                continue
+            seen.add(uid)
+            out.append(uid)
+    return out
+
+
+_USER_UPDATES = frozenset(
+    {"user_message_chunk", "user_message", "user_prompt_submit"}
+)
+
+
+def _build_spans(markers: list[tuple[float, str]]) -> list[dict[str, Any]]:
+    """Continuous work / wait spans from first event to last."""
+    if not markers:
+        return []
+    rank = {"user": 0, "evt": 1, "turn": 2}
+    markers = sorted(markers, key=lambda x: (x[0], rank.get(x[1], 1)))
+    first = markers[0][0]
+    last = markers[-1][0]
+    spans: list[dict[str, Any]] = []
+    work_start: Optional[float] = first
+    wait_start: Optional[float] = None
+    mode = "work"
+    in_user = False
+    for ep, kind in markers:
+        if kind == "user":
+            if not in_user:
+                if mode == "wait" and wait_start is not None and ep > wait_start:
+                    spans.append({"start": wait_start, "end": ep, "kind": "wait"})
+                work_start = ep
+                wait_start = None
+                mode = "work"
+                in_user = True
+            continue
+        in_user = False
+        if kind == "turn":
+            ws = work_start if work_start is not None else ep
+            if ep > ws:
+                spans.append({"start": ws, "end": ep, "kind": "work"})
+            wait_start = ep
+            work_start = None
+            mode = "wait"
+    if mode == "work" and work_start is not None and last > work_start:
+        spans.append({"start": work_start, "end": last, "kind": "work"})
+    if mode == "wait" and wait_start is not None and last > wait_start:
+        spans.append({"start": wait_start, "end": last, "kind": "wait"})
+    if not spans:
+        spans.append({"start": first, "end": max(last, first), "kind": "work"})
+    return spans
+
+
+def _parse_updates(path: Path) -> tuple[list[dict[str, Any]], list[str], list[tuple[float, str]]]:
     try:
         raw = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return []
+        return [], [], []
     out: list[dict[str, Any]] = []
+    markers: list[tuple[float, str]] = []
     for line in raw.splitlines():
-        if "turn_completed" not in line:
+        if not line or line[0] not in "{[":
             continue
         try:
             o = json.loads(line)
         except json.JSONDecodeError:
             continue
-        params = o.get("params") if isinstance(o.get("params"), dict) else {}
-        upd = params.get("update") if isinstance(params.get("update"), dict) else {}
-        if upd.get("sessionUpdate") != "turn_completed":
-            continue
-        usage = upd.get("usage")
-        if not isinstance(usage, dict):
+        if not isinstance(o, dict):
             continue
         epoch = _event_epoch(o)
         if epoch is None:
             continue
-        priced = price_child_usage(usage)
-        if (
-            not priced["tokens_in"]
-            and not priced["tokens_cached"]
-            and not priced["tokens_out"]
-            and not priced["official_usd"]
-        ):
-            continue
-        out.append({"epoch": epoch, **priced})
-    return out
+        params = o.get("params") if isinstance(o.get("params"), dict) else {}
+        upd = params.get("update") if isinstance(params.get("update"), dict) else {}
+        kind = upd.get("sessionUpdate")
+        if kind in _USER_UPDATES:
+            markers.append((float(epoch), "user"))
+        elif kind == "turn_completed":
+            markers.append((float(epoch), "turn"))
+            usage = upd.get("usage")
+            if isinstance(usage, dict):
+                priced = price_child_usage(usage)
+                if (
+                    priced["tokens_in"]
+                    or priced["tokens_cached"]
+                    or priced["tokens_out"]
+                    or priced["official_usd"]
+                ):
+                    out.append({"epoch": epoch, **priced})
+        else:
+            markers.append((float(epoch), "evt"))
+    return out, _extract_spawned_ids(raw), markers
 
 
-def _session_meta(session_dir: Path) -> tuple[str, Optional[str], Optional[str]]:
+def _summary_parent_id(summary: dict[str, Any]) -> Optional[str]:
+    for key in ("parent_session_id", "parent_id"):
+        v = summary.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip().lower()
+    info = summary.get("info")
+    if isinstance(info, dict):
+        for key in ("parent_session_id", "parent_id"):
+            v = info.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip().lower()
+    return None
+
+
+def _session_meta(
+    session_dir: Path,
+) -> tuple[str, Optional[str], Optional[str], Optional[str], Optional[float], Optional[float]]:
     summary = _read_session_summary(session_dir)
     kind = summary.get("session_kind")
     if isinstance(kind, str):
@@ -207,8 +294,8 @@ def _session_meta(session_dir: Path) -> tuple[str, Optional[str], Optional[str]]
     else:
         agent = agent.strip()
     title = (
-        summary.get("generated_title")
-        or summary.get("session_summary")
+        summary.get("session_summary")
+        or summary.get("generated_title")
         or agent
         or session_dir.name[:8]
     )
@@ -218,7 +305,11 @@ def _session_meta(session_dir: Path) -> tuple[str, Optional[str], Optional[str]]
             title = title[:69] + "…"
     else:
         title = session_dir.name[:8]
-    return str(title), kind, agent
+    created = _parse_iso_to_epoch(summary.get("created_at"))
+    last_active = _parse_iso_to_epoch(
+        summary.get("last_active_at") or summary.get("updated_at")
+    )
+    return str(title), kind, agent, _summary_parent_id(summary), created, last_active
 
 
 def _cached_file(session_dir: Path) -> dict[str, Any]:
@@ -233,25 +324,53 @@ def _cached_file(session_dir: Path) -> dict[str, Any]:
             "mtime": 0,
             "size": 0,
             "turns": [],
+            "child_ids": [],
+            "spans": [],
+            "first_all": None,
+            "last_all": None,
             "session_id": session_dir.name,
             "path": str(session_dir),
             "title": session_dir.name[:8],
             "kind": None,
             "agent_name": None,
+            "parent_id": None,
         }
     hit = _file_cache.get(key)
-    if hit and hit.get("mtime") == mtime and hit.get("size") == size:
+    if (
+        hit
+        and hit.get("mtime") == mtime
+        and hit.get("size") == size
+        and "spans" in hit
+        and hit.get("title_src") == "session_summary"
+    ):
         return hit
-    title, kind, agent = _session_meta(session_dir)
+    title, kind, agent, parent_id, created, last_active = _session_meta(session_dir)
+    turns, child_ids, markers = _parse_updates(p)
+    sid = session_dir.name.lower()
+    child_ids = [c for c in child_ids if c != sid]
+    spans = _build_spans(markers)
+    first_all = created
+    last_all = last_active
+    if markers:
+        first_m = min(m[0] for m in markers)
+        last_m = max(m[0] for m in markers)
+        first_all = min(first_m, first_all) if first_all else first_m
+        last_all = max(last_m, last_all) if last_all else last_m
     row = {
         "mtime": mtime,
         "size": size,
-        "turns": _parse_turns(p),
+        "turns": turns,
+        "child_ids": child_ids,
+        "spans": spans,
+        "first_all": first_all,
+        "last_all": last_all,
         "session_id": session_dir.name,
         "path": str(session_dir),
         "title": title,
         "kind": kind,
         "agent_name": agent,
+        "parent_id": parent_id,
+        "title_src": "session_summary",
     }
     _file_cache[key] = row
     return row
@@ -381,6 +500,61 @@ def _bucket_specs(
     return specs
 
 
+def _order_sessions(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Parents first (recency), children indented under their parent."""
+    by_id = {str(s["session_id"]).lower(): s for s in sessions}
+    children: dict[str, list[dict[str, Any]]] = {}
+    roots: list[dict[str, Any]] = []
+    orphans: list[dict[str, Any]] = []
+    for s in sessions:
+        pid = (s.get("parent_id") or "").lower() or None
+        kind = s.get("session_kind")
+        if kind == "subagent" and pid and pid in by_id:
+            children.setdefault(pid, []).append(s)
+        elif kind == "subagent":
+            orphans.append(s)
+        else:
+            roots.append(s)
+
+    def _last(s: dict[str, Any]) -> float:
+        return float(s.get("last_epoch") or 0)
+
+    def _first(s: dict[str, Any]) -> float:
+        return float(s.get("first_epoch") or s.get("last_epoch") or 0)
+
+    roots.sort(key=_first)
+    orphans.sort(key=_first)
+    for kids in children.values():
+        kids.sort(key=_first)
+
+    ordered: list[dict[str, Any]] = []
+    n_parent = 0
+    for p in roots:
+        n_parent += 1
+        p["n"] = n_parent
+        p["child_n"] = None
+        p["depth"] = 0
+        p["label"] = f"Session {n_parent}"
+        ordered.append(p)
+        pid = str(p["session_id"]).lower()
+        for i, c in enumerate(children.get(pid) or [], start=1):
+            c["n"] = n_parent
+            c["child_n"] = i
+            c["depth"] = 1
+            c["label"] = f"Sub Agent {i}"
+            ordered.append(c)
+    if orphans:
+        n_parent += 1 if not roots else 0
+        # keep orphan subs after known trees
+        for i, c in enumerate(orphans, start=1):
+            c["n"] = n_parent or 1
+            c["child_n"] = i
+            c["depth"] = 1
+            c["label"] = f"Sub Agent {i}"
+            ordered.append(c)
+    return ordered
+
+
 def _place(epoch: float, specs: list[dict[str, Any]]) -> Optional[int]:
     for i, s in enumerate(specs):
         if s["start_epoch"] <= epoch < s["end_epoch"]:
@@ -451,11 +625,20 @@ def build_aggregate(
     with _lock:
         files = _scan_files()
 
+    child_to_parent: dict[str, str] = {}
+    for row in files:
+        pid = str(row.get("session_id") or "").lower()
+        if not pid or row.get("kind") == "subagent":
+            continue
+        for cid in row.get("child_ids") or []:
+            child_to_parent[str(cid).lower()] = pid
+
     for row in files:
         kind = row.get("kind")
         billed = kind != "subagent"
         sess_acc = _empty_acc()
         last_ep = None
+        first_ep = None
         for t in row.get("turns") or []:
             ep = t.get("epoch")
             if ep is None or ep < start_e or ep >= end_e:
@@ -463,6 +646,8 @@ def build_aggregate(
             _add_priced(sess_acc, t)
             if last_ep is None or ep > last_ep:
                 last_ep = ep
+            if first_ep is None or ep < first_ep:
+                first_ep = ep
             if billed:
                 _add_priced(totals, t)
                 idx = _place(float(ep), specs)
@@ -490,27 +675,58 @@ def build_aggregate(
                         _add_cat_list(tot_tools, ev.get("tools") or [])
             except Exception:
                 pass
-        if sess_acc["turns"] <= 0:
+        life0 = row.get("first_all")
+        life1 = row.get("last_all")
+        if life0 is None:
+            life0 = first_ep
+        if life1 is None:
+            life1 = last_ep
+        overlaps = (
+            life0 is not None
+            and life1 is not None
+            and float(life0) < end_e
+            and float(life1) >= start_e
+        )
+        if sess_acc["turns"] <= 0 and not overlaps:
             continue
-        title = row.get("title") or row["session_id"][:8]
-        if kind == "subagent":
-            sub = row.get("agent_name") or "sub"
-            title = f"↳ {sub} · {title}"
+        clip0 = max(float(life0), start_e) if life0 is not None else start_e
+        clip1 = min(float(life1), end_e) if life1 is not None else end_e
+        if clip1 < clip0:
+            clip1 = clip0
+        spans_out: list[dict[str, Any]] = []
+        for sp in row.get("spans") or []:
+            a = max(float(sp.get("start") or 0), start_e)
+            b = min(float(sp.get("end") or 0), end_e)
+            if b > a:
+                spans_out.append({"start": a, "end": b, "kind": sp.get("kind") or "work"})
+        if not spans_out and clip1 > clip0:
+            spans_out.append({"start": clip0, "end": clip1, "kind": "work"})
+        sid = str(row["session_id"])
+        title = row.get("title") or sid[:8]
+        parent_id = row.get("parent_id") or child_to_parent.get(sid.lower())
+        role = (row.get("agent_name") or "").strip()
+        if (
+            kind == "subagent"
+            and role
+            and role.lower() not in ("general-purpose", "general purpose")
+            and role not in title
+        ):
+            title = f"{role} · {title}"
         sessions.append(
             {
-                "session_id": row["session_id"],
+                "session_id": sid,
                 "title": title,
                 "session_kind": kind or "main",
                 "agent_name": row.get("agent_name"),
-                "last_epoch": last_ep,
+                "parent_id": parent_id,
+                "first_epoch": clip0,
+                "last_epoch": clip1,
+                "spans": spans_out,
                 **_round_acc(sess_acc),
             }
         )
 
-    sessions.sort(key=lambda s: float(s.get("last_epoch") or 0), reverse=True)
-    for i, s in enumerate(sessions, start=1):
-        s["n"] = i
-        s.pop("last_epoch", None)
+    sessions = _order_sessions(sessions)
 
     return {
         "period": period,
@@ -524,6 +740,8 @@ def build_aggregate(
             {
                 "key": b["key"],
                 "label": b["label"],
+                "start_epoch": b.get("start_epoch"),
+                "end_epoch": b.get("end_epoch"),
                 **_round_acc(b),
                 "parts": _cats_out(b.get("_parts") or {}),
                 "tools": _cats_out(b.get("_tools") or {}),

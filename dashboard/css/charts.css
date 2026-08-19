@@ -53,13 +53,48 @@ canvas {
   box-shadow: none;
 }
 
+#costChartWrap.is-gantt .chart-scroll {
+  overflow-x: hidden;
+  cursor: grab;
+}
+
+#costChartWrap.is-gantt.is-panning .chart-scroll {
+  cursor: grabbing;
+}
+
+.chart-resize {
+  position: absolute;
+  right: 1px;
+  bottom: 1px;
+  z-index: 7;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  border: 0;
+  background: transparent;
+  color: #8b9cb3;
+  cursor: nwse-resize;
+  opacity: 0.72;
+}
+
+.chart-resize:hover {
+  color: #d8e2ec;
+  opacity: 1;
+}
+
+.chart-resize[hidden] { display: none !important; }
+
 .cost-yaxis {
   position: absolute;
   left: 0;
   top: 0;
   width: 56px;
   height: 240px;
-  pointer-events: none;
+  pointer-events: auto;
+  cursor: ns-resize;
   z-index: 2;
   background: var(--bg-sunken);
   border-radius: var(--radius-md) 0 0 var(--radius-md);
@@ -75,6 +110,8 @@ canvas {
   height: 240px;
   border-radius: 0;
   border-right: 1px solid var(--border-subtle);
+  user-select: none;
+  touch-action: none;
 }
 
 /* ── Chart toolbar ──────────────────────────────────────────── */
@@ -334,9 +371,11 @@ canvas {
   font-size: var(--font-size-xs);
   line-height: 1.45;
   color: var(--text);
-  max-width: 260px;
+  max-width: min(360px, 70vw);
+  overflow-wrap: anywhere;
+  word-break: break-word;
   box-shadow: var(--shadow-tip);
-  white-space: nowrap;
+  white-space: normal;
   font-variant-numeric: tabular-nums;
   font-feature-settings: "tnum" 1, "lnum" 1;
   letter-spacing: 0.01em;

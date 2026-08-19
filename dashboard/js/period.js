@@ -1,6 +1,6 @@
 /** Daily / weekly / monthly aggregate view. */
 import { $, fmtTokens, fmtUsd, esc, joinParts, totalPrice } from './fmt.js';
-import { drawAggBars, setCostUnit, hideAllChartTips } from './charts.js';
+import { drawAggBars, drawTimeline, setCostUnit, hideAllChartTips, onGanttSelect, fitGanttToSessions } from './charts.js';
 import { switchSession } from './sessions.js';
 
 const PERIODS = new Set(["daily", "weekly", "monthly"]);
@@ -26,8 +26,11 @@ let _grain = "hour";
 let _mode = "timeframe";
 let _byLabel = false;
 let _stack = "io";
+let _timeline = false;
 let _pollRef = null;
 let _lastAgg = null;
+let _ganttSel = new Set();
+let _periodReturn = null;
 
 export function bindPeriodPoll(fn) {
   _pollRef = fn;
@@ -48,6 +51,7 @@ function persist() {
     localStorage.setItem("tt-period-grain", _grain);
     localStorage.setItem("tt-agg-bylabel", _byLabel ? "1" : "0");
     localStorage.setItem("tt-agg-stack", _stack);
+    localStorage.setItem("tt-agg-timeline", _timeline ? "1" : "0");
   } catch { /* ignore */ }
 }
 
@@ -60,6 +64,7 @@ export function restoreScope() {
     _byLabel = localStorage.getItem("tt-agg-bylabel") === "1";
     const sk = localStorage.getItem("tt-agg-stack");
     if (sk === "io" || sk === "parts" || sk === "tools") _stack = sk;
+    _timeline = localStorage.getItem("tt-agg-timeline") === "1";
     const g = localStorage.getItem("tt-period-grain") || localStorage.getItem("tt-monthly-grain");
     if (g) _grain = normalizeGrain(_scope, g);
   } catch { /* ignore */ }
@@ -85,6 +90,8 @@ function applyScopeChrome() {
   if (sel && sel.value !== _scope) sel.value = _scope;
   const tb = $("periodToolbar");
   if (tb) tb.hidden = !isPeriodScope();
+  const nav = $("periodNav");
+  if (nav) nav.hidden = !isPeriodScope();
   _grain = normalizeGrain(_scope, _grain);
   const grainWrap = $("periodGrain");
   const opts = GRAINS[_scope] || [];
@@ -138,7 +145,32 @@ function applyScopeChrome() {
   }
   const next = $("periodNext");
   if (next) next.disabled = _offset >= 0;
-  const lockTime = !!_byLabel;
+  const unit = (window.__costChart && window.__costChart.unit) || "usd";
+  const usdBtn = $("aggUnitUsd");
+  const tokBtn = $("aggUnitTok");
+  const timeBtn = $("aggUnitTime");
+  if (usdBtn) {
+    usdBtn.disabled = false;
+    usdBtn.classList.toggle("active", !_timeline && unit !== "tokens");
+    usdBtn.setAttribute("aria-pressed", (!_timeline && unit !== "tokens") ? "true" : "false");
+  }
+  if (tokBtn) {
+    tokBtn.disabled = false;
+    tokBtn.classList.toggle("active", !_timeline && unit === "tokens");
+    tokBtn.setAttribute("aria-pressed", (!_timeline && unit === "tokens") ? "true" : "false");
+  }
+  if (timeBtn) {
+    timeBtn.classList.toggle("active", !!_timeline);
+    timeBtn.setAttribute("aria-pressed", _timeline ? "true" : "false");
+  }
+  if (!_timeline) {
+    const rst = $("ganttReset");
+    if (rst) rst.hidden = true;
+  } else {
+    syncGanttSelChrome();
+  }
+  const ganttOff = !!_timeline;
+  const lockTime = !!_byLabel || ganttOff;
   ["periodGrain", "aggTfCum"].forEach((id) => {
     const el = $(id);
     if (!el) return;
@@ -146,9 +178,16 @@ function applyScopeChrome() {
     el.setAttribute("aria-disabled", lockTime ? "true" : "false");
     el.querySelectorAll("button").forEach((b) => { b.disabled = lockTime; });
   });
+  ["aggStackIo", "aggLayoutTime"].forEach((id) => {
+    const wrap = $(id)?.closest(".unit-toggle");
+    if (!wrap) return;
+    wrap.classList.toggle("is-disabled", ganttOff);
+    wrap.setAttribute("aria-disabled", ganttOff ? "true" : "false");
+    wrap.querySelectorAll("button").forEach((b) => { b.disabled = ganttOff; });
+  });
   if (grainWrap) {
     grainWrap.title = lockTime
-      ? "Grain applies to Time layout only"
+      ? (ganttOff ? "Grain hidden in timeline" : "Grain applies to Time layout only")
       : "Bar grain";
   }
   const tfCum = $("aggTfCum");
@@ -159,13 +198,73 @@ function applyScopeChrome() {
   }
 }
 
+export function beginViewLoad() {
+  document.body.classList.add("is-loading");
+  const el = $("viewLoader");
+  if (el) el.hidden = false;
+}
+
+export function endViewLoad() {
+  document.body.classList.remove("is-loading");
+  const el = $("viewLoader");
+  if (el) el.hidden = true;
+}
+
+function syncPeriodBack() {
+  const btn = $("periodBack");
+  if (!btn) return;
+  const show = !isPeriodScope() && !!_periodReturn;
+  btn.hidden = !show;
+  if (show) btn.textContent = "← Back";
+}
+
+export function openSessionFromPeriod(sid) {
+  if (PERIODS.has(_scope)) {
+    _periodReturn = {
+      scope: _scope,
+      offset: _offset,
+      grain: _grain,
+      timeline: _timeline,
+      mode: _mode,
+      stack: _stack,
+      byLabel: _byLabel,
+    };
+  }
+  beginViewLoad();
+  setScope("session");
+  switchSession(sid);
+  syncPeriodBack();
+}
+
+export function restorePeriodReturn() {
+  const snap = _periodReturn;
+  _periodReturn = null;
+  syncPeriodBack();
+  if (!snap) return;
+  beginViewLoad();
+  _scope = snap.scope;
+  _offset = snap.offset || 0;
+  _grain = normalizeGrain(_scope, snap.grain);
+  _timeline = !!snap.timeline;
+  _mode = snap.mode === "cumulative" ? "cumulative" : "timeframe";
+  _stack = snap.stack || "io";
+  _byLabel = !!snap.byLabel;
+  persist();
+  applyScopeChrome();
+  if (_pollRef) _pollRef();
+}
+
 export function setScope(scope) {
   const next = PERIODS.has(scope) || scope === "session" ? scope : "session";
   if (next !== _scope) {
+    beginViewLoad();
+    if (PERIODS.has(next)) _periodReturn = null;
     _scope = next;
     _offset = 0;
     _grain = normalizeGrain(_scope, _grain);
     hideAllChartTips();
+    if (next === "session") _ganttSel = new Set();
+    syncPeriodBack();
   }
   persist();
   applyScopeChrome();
@@ -232,6 +331,57 @@ export function leavePeriodView() {
   hideAllChartTips();
 }
 
+function ganttGroupIds(sid, sessions) {
+  const id = String(sid || "").toLowerCase();
+  const s = (sessions || []).find((x) => String(x.session_id).toLowerCase() === id);
+  if (!s) return [id];
+  if (s.depth > 0 || s.session_kind === "subagent") return [id];
+  const out = [id];
+  for (const c of sessions) {
+    if (String(c.parent_id || "").toLowerCase() === id)
+      out.push(String(c.session_id).toLowerCase());
+  }
+  return out;
+}
+
+function syncGanttSelChrome() {
+  const btn = $("ganttReset");
+  if (btn) btn.hidden = !_timeline || _ganttSel.size === 0;
+}
+
+function toggleGanttSel(sid) {
+  if (!_timeline) return;
+  const sessions = (_lastAgg && _lastAgg.sessions) || [];
+  const group = ganttGroupIds(sid, sessions);
+  const allOn = group.every((id) => _ganttSel.has(id));
+  if (allOn) group.forEach((id) => _ganttSel.delete(id));
+  else group.forEach((id) => _ganttSel.add(id));
+  if (window.__aggChart) window.__aggChart.selected = _ganttSel;
+  const picked = sessions.filter((s) => _ganttSel.has(String(s.session_id).toLowerCase()));
+  if (picked.length) fitGanttToSessions(picked);
+  else if (window.__aggChart) {
+    window.__aggChart._gt0 = null;
+    window.__aggChart._gt1 = null;
+  }
+  syncGanttSelChrome();
+  paintSessionList(sessions);
+  if (_lastAgg) drawTimeline($("costChart"), _lastAgg);
+}
+
+function clearGanttSel() {
+  _ganttSel = new Set();
+  if (window.__aggChart) {
+    window.__aggChart.selected = _ganttSel;
+    window.__aggChart._gt0 = null;
+    window.__aggChart._gt1 = null;
+  }
+  syncGanttSelChrome();
+  if (_lastAgg) {
+    paintSessionList(_lastAgg.sessions || []);
+    if (_timeline) drawTimeline($("costChart"), _lastAgg);
+  }
+}
+
 function paintSessionList(sessions) {
   const tree = $("roundTree");
   if (!tree) return;
@@ -246,20 +396,35 @@ function paintSessionList(sessions) {
       `<span class="tok-cached">Cached ${fmtTokens(s.tokens_cached || 0)}</span> <span class="cost-cached">${fmtUsd(s.cost_cached_usd || 0)}</span>`,
       `<span class="tok-out">Out +${fmtTokens(s.tokens_out || 0)}</span> <span class="cost-out">${fmtUsd(s.cost_out_usd || 0)}</span>`,
     ]);
-    const sub = s.session_kind === "subagent" ? " is-sub" : "";
-    return `<div class="sess-row${sub}" data-sid="${esc(s.session_id)}" title="${esc(s.session_id)}">
-      <span class="sess-n">Session ${s.n}</span>
-      <span class="sess-title">${esc(s.title || "")}</span>
+    const sub = (s.session_kind === "subagent" || Number(s.depth) > 0) ? " is-sub" : "";
+    const name = s.label || (sub ? `Sub Agent ${s.child_n || s.n}` : `Session ${s.n}`);
+    const sid = String(s.session_id);
+    const picked = _timeline && _ganttSel.size > 0 && _ganttSel.has(sid.toLowerCase()) ? " is-picked" : "";
+    const tip = _timeline
+      ? `${name} — ${s.title || sid}\nClick to drill · Double-click to open\n${sid}`
+      : `${name} — ${s.title || sid}\nClick to open\n${sid}`;
+    return `<div class="sess-row${sub}${picked}" data-sid="${esc(sid)}" title="${esc(tip)}">
+      <span class="sess-n" title="${esc(tip)}">${esc(name)}</span>
+      <span class="sess-title" title="${esc(s.title || sid)}">${esc(s.title || "")}</span>
       <span class="sess-ledger">${ledger}</span>
       <span class="sess-price">${totalPrice(s.official_usd)}</span>
     </div>`;
   }).join("");
   tree.querySelectorAll("[data-sid]").forEach((el) => {
-    el.addEventListener("click", () => {
+    el.addEventListener("click", (ev) => {
       const sid = el.getAttribute("data-sid");
       if (!sid) return;
-      setScope("session");
-      switchSession(sid);
+      if (_timeline) {
+        ev.preventDefault();
+        toggleGanttSel(sid);
+        return;
+      }
+      openSessionFromPeriod(sid);
+    });
+    el.addEventListener("dblclick", () => {
+      const sid = el.getAttribute("data-sid");
+      if (!sid) return;
+      openSessionFromPeriod(sid);
     });
   });
 }
@@ -278,20 +443,27 @@ export function paintPeriod(agg) {
   if (lab) lab.textContent = agg.label || "—";
   const next = $("periodNext");
   if (next) next.disabled = _offset >= 0;
-  const modeLab = $("aggModeLabel");
-  if (modeLab) {
-    const u = (window.__costChart && window.__costChart.unit) === "tokens" ? "Tok" : "$";
-    const stackLab = _stack === "tools" ? "Tools" : (_stack === "parts" ? "Parts" : "I/O");
-    modeLab.textContent = `${_mode === "cumulative" ? "Cumulative" : "Timeframe"} · ${stackLab}${_byLabel ? " · by label" : ""} · ${u}`;
-  }
   paintCards(agg.totals || {});
   const unit = (window.__costChart && window.__costChart.unit) || "usd";
-  drawAggBars($("costChart"), agg.buckets || [], {
-    unit,
-    cumulative: _mode === "cumulative",
-    byLabel: _byLabel,
-    stack: _stack,
-  });
+  if (_timeline) {
+    if (!window.__aggChart) window.__aggChart = {};
+    const key = `${agg.start}|${agg.end}`;
+    if (window.__aggChart._ganttPeriod !== key) {
+      window.__aggChart._gt0 = null;
+      window.__aggChart._gt1 = null;
+      window.__aggChart._ganttPeriod = key;
+    }
+    window.__aggChart.selected = _ganttSel;
+    drawTimeline($("costChart"), agg);
+    syncGanttSelChrome();
+  } else {
+    drawAggBars($("costChart"), agg.buckets || [], {
+      unit,
+      cumulative: _mode === "cumulative",
+      byLabel: _byLabel,
+      stack: _stack,
+    });
+  }
   paintSessionList(agg.sessions || []);
 }
 
@@ -314,6 +486,7 @@ export async function fetchPeriod() {
   const agg = await r.json();
   if (!isPeriodScope()) return;
   paintPeriod(agg);
+  endViewLoad();
 }
 
 export function redrawPeriod() {
@@ -351,6 +524,27 @@ export function bindPeriodControls() {
     applyScopeChrome();
     if (_lastAgg) paintPeriod(_lastAgg);
   });
-  $("aggUnitUsd")?.addEventListener("click", () => setCostUnit("usd"));
-  $("aggUnitTok")?.addEventListener("click", () => setCostUnit("tokens"));
+  $("aggUnitUsd")?.addEventListener("click", () => {
+    _timeline = false;
+    persist();
+    applyScopeChrome();
+    setCostUnit("usd");
+    if (_lastAgg) paintPeriod(_lastAgg);
+  });
+  $("aggUnitTok")?.addEventListener("click", () => {
+    _timeline = false;
+    persist();
+    applyScopeChrome();
+    setCostUnit("tokens");
+    if (_lastAgg) paintPeriod(_lastAgg);
+  });
+  $("aggUnitTime")?.addEventListener("click", () => {
+    _timeline = true;
+    persist();
+    applyScopeChrome();
+    if (_lastAgg) paintPeriod(_lastAgg);
+  });
+  $("ganttReset")?.addEventListener("click", () => clearGanttSel());
+  $("periodBack")?.addEventListener("click", () => restorePeriodReturn());
+  onGanttSelect((sid) => toggleGanttSel(sid));
 }
