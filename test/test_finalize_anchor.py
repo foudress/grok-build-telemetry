@@ -7,6 +7,7 @@ from token_telemetry.hierarchy.finalize import (
     _anchor_call_context_to_input,
     _apply_caused_context_display,
     _estimate_tooldef_message_bucket,
+    _merge_bootstrap_into_breakdown,
 )
 
 
@@ -91,6 +92,7 @@ def test_caused_context_skips_last_and_shifts_call1():
                 "context_end": 80000,
                 "stream_context_start": 80000,
                 "stream_context_end": 80000,
+                "tokens_cached": 80000,
             },
         ],
     }
@@ -100,6 +102,8 @@ def test_caused_context_skips_last_and_shifts_call1():
     assert last["skip_context"] is True
     assert last["display_context_start"] is None
     assert last["context_start"] == 80000
+    # skip_context is display-only (no harness after last call), not last Cached=0
+    assert last["tokens_cached"] == 80000
     assert a["skip_context"] is False
     assert a["display_context_start"] == 50000
     assert a["context_growth_est"] == 30000
@@ -182,6 +186,33 @@ def test_tooldef_message_bucket_is_window_remainder():
 class _HB:
     def __init__(self, rounds):
         self.rounds = rounds
+
+
+def test_tree_in_includes_user_compact_out():
+    """Between-rounds Compact Out is off Call In but must stay in tree In."""
+    r = {
+        "user_prompt": {
+            "kind": "user_prompt",
+            "tokens_in": 294,
+            "cost_in_usd": 0.001,
+            "compact_out": {"tokens_in": 6295, "cost_in_usd": 0.03},
+        },
+        "model_steps": [
+            {"tokens_in": 9687, "cost_in_usd": 0.05},
+        ],
+        "breakdown": {
+            "cache_miss_in_tokens": 1000,
+            "cache_miss_in_usd": 0.01,
+            "harness_in_tokens": 99999,  # overwritten from steps
+        },
+    }
+    _merge_bootstrap_into_breakdown(_HB([r]), r)
+    bd = r["breakdown"]
+    assert bd["user_in_tokens"] == 294
+    assert bd["user_compact_out_tokens"] == 6295
+    assert bd["harness_in_tokens"] == 9687
+    assert bd["tree_in_tokens"] == 294 + 6295 + 9687 + 1000
+    assert bd["tree_in_tokens"] != 294 + 9687 + 1000
 
 
 def test_compact_warm_is_cached_xor_plus_out():

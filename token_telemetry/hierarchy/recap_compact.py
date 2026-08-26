@@ -223,6 +223,7 @@ def _on_compact(hb: Any, update: dict[str, Any], agent_ms: Any) -> None:
 
     compact = {
         "kind": "compaction",
+        "auto": True,
         "tokens_before": before_i,
         "tokens_after": after_i,
         "tokens_removed": removed,
@@ -272,36 +273,76 @@ def _on_compact(hb: Any, update: dict[str, Any], agent_ms: Any) -> None:
         hb._last_ctx = after_i
         hb._cache_baseline = after_i
 
-    # Attach to the right place:
-    # 1) open round mid-flight → note + fix its context_end
-    # 2) between completed rounds → compact_after on last + pending for next
-    # 3) else buffer for next round as pending_compact
+    open_steps = []
     if hb._open is not None:
+        open_steps = [
+            s for s in (hb._open.get("model_steps") or []) if isinstance(s, dict)
+        ]
+
+    def _stamp_after_index(step: Optional[dict[str, Any]]) -> None:
+        if isinstance(step, dict) and step.get("index") is not None:
+            compact["after_step_index"] = step.get("index")
+
+    # Placement:
+    # 1) open round with LLM calls → mid-round card on last step (do not
+    #    stomp round.context_end; do not also pending as between-rounds)
+    # 2) open round but zero steps → compact_before on this round
+    # 3) between completed rounds → compact_after on last + pending
+    # 4) else buffer for next round
+    if hb._open is not None and open_steps:
         r = hb._open
+        last_s = open_steps[-1]
+        compact["placement"] = "mid_round"
+        _stamp_after_index(last_s)
+        last_s.setdefault("compacts_after", []).append(compact)
         r.setdefault("notes", []).append(compact)
         r.setdefault("compactions", []).append(compact)
+        r["mid_round_compacts"] = True
+        if r.get("context_start") is None and isinstance(before_i, int):
+            r["context_start"] = before_i
         if isinstance(after_i, int):
-            r["context_end"] = after_i
-            # context_start stays; delta will reflect compact on finalize
-            if r.get("context_start") is None and isinstance(before_i, int):
-                r["context_start"] = before_i
+            r["context_after_compact"] = after_i
+        hb._bump()
+        return
+
+    if hb._open is not None and not open_steps:
+        r = hb._open
+        compact["placement"] = "between_rounds"
+        if hb.rounds:
+            prev_steps = [
+                s
+                for s in (hb.rounds[-1].get("model_steps") or [])
+                if isinstance(s, dict)
+            ]
+            _stamp_after_index(prev_steps[-1] if prev_steps else None)
+            last = hb.rounds[-1]
+            last["compact_after"] = compact
+            last.setdefault("notes", []).append(compact)
+            last.setdefault("compactions", []).append(compact)
+            if isinstance(after_i, int):
+                last["context_after_compact"] = after_i
+        r["compact_before"] = compact
+        r.setdefault("compactions", []).append(compact)
+        hb._bump()
         return
 
     if hb.rounds:
         last = hb.rounds[-1]
-        # First-class between-round card (UI renders between R[n] and R[n+1])
+        compact["placement"] = "between_rounds"
+        prev_steps = [
+            s for s in (last.get("model_steps") or []) if isinstance(s, dict)
+        ]
+        _stamp_after_index(prev_steps[-1] if prev_steps else None)
         last["compact_after"] = compact
         last.setdefault("notes", []).append(compact)
         last.setdefault("compactions", []).append(compact)
         if isinstance(after_i, int):
             last["context_after_compact"] = after_i
-            # Keep pre-compact context_end for the round's own story; peak stays.
-        # Also pending so the next round owns compact_before (same dict ref)
         hb._pending_compact = compact
         hb._bump()
         return
 
-    # No rounds yet — stash for next round start
+    compact["placement"] = "between_rounds"
     hb._pending_compact = compact
 
 
@@ -337,35 +378,50 @@ def _attach_pending_recap_compact(hb: Any) -> None:
         hb._pending_recaps = []
 
 
+def _as_int(v: Any) -> Optional[int]:
+    try:
+        return int(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _compacts_to_fill(r: dict[str, Any]) -> list[dict[str, Any]]:
+    """Unique compaction dicts on this round (between-rounds + mid-round)."""
+    out: list[dict[str, Any]] = []
+    seen: set[int] = set()
+
+    def add(c: Any) -> None:
+        if not isinstance(c, dict) or c.get("kind") != "compaction":
+            return
+        key = id(c)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(c)
+
+    add(r.get("compact_before"))
+    for s in r.get("model_steps") or []:
+        if not isinstance(s, dict):
+            continue
+        for c in s.get("compacts_after") or []:
+            add(c)
+    return out
+
+
 def _fill_compact_cost(hb: Any, r: dict[str, Any]) -> None:
     """
-    Compact bill (between-round card):
+    Compact bill:
 
       1) pre-read of FULL context: Cached on hit, In on miss (never both)
-      2) Out = compressed history (tokens_after − reload)
+      2) Out = compressed history (tokens_after)
 
-    Reload tools/system stays next-round In. total = pre_read + out.
+    Compact Out re-entry + post-compact tools stay on the next harness
+    (compact_out_in). Do not steal that mass onto deferred_reload.
     """
-    compact = r.get("compact_before")
-    if not isinstance(compact, dict) or compact.get("kind") != "compaction":
+    compacts = _compacts_to_fill(r)
+    if not compacts:
         return
 
-    def _as_int(v: Any) -> Optional[int]:
-        try:
-            return int(v) if v is not None else None
-        except (TypeError, ValueError):
-            return None
-
-    before_i = _as_int(compact.get("tokens_before"))
-    after_i = _as_int(compact.get("tokens_after"))
-
-    steps = r.get("model_steps") or []
-    s0 = steps[0] if steps and isinstance(steps[0], dict) else None
-    est0 = (s0.get("estimate") if s0 else None) or {}
-    if not isinstance(est0, dict):
-        est0 = {}
-
-    # Last completed round before this one (for pre-compact cache split)
     prev = None
     if r in hb.rounds:
         idx = hb.rounds.index(r)
@@ -395,10 +451,6 @@ def _fill_compact_cost(hb: Any, r: dict[str, Any]) -> None:
         cc = float(e["cost_usd"]["cached_input"])
         return cu, cc, cu + cc
 
-    # --- 1) Pre-read FULL context: Cached XOR In (never both) ---
-    # Last-call display cache is 0 by design — do not use that ratio.
-    # Compact is a warm re-read unless the previous round actually missed.
-    pre_tok = max(0, before_i or 0)
     miss = False
     if isinstance(prev, dict):
         up = prev.get("user_prompt") if isinstance(prev.get("user_prompt"), dict) else {}
@@ -412,168 +464,66 @@ def _fill_compact_cost(hb: Any, r: dict[str, Any]) -> None:
             or up.get("context_reread")
             or bd_prev.get("context_reread")
         )
-    if pre_tok > 0:
-        if miss:
-            pre_unc, pre_cache = pre_tok, 0
-        else:
-            pre_unc, pre_cache = 0, pre_tok
-        u_usd, c_usd, pre_usd = _price(pre_unc, pre_cache, pre_tok)
-        compact["pre_read_tokens"] = pre_tok
-        compact["pre_read_uncached_tokens"] = pre_unc
-        compact["pre_read_cached_tokens"] = pre_cache
-        compact["pre_read_uncached_usd"] = round(u_usd, 8)
-        compact["pre_read_cached_usd"] = round(c_usd, 8)
-        compact["pre_read_usd"] = round(pre_usd, 8)
-        compact["pre_read_cache_miss"] = bool(miss)
-        compact["pre_read_note"] = (
-            "Cache miss: full tokens_before billed as In."
-            if miss
-            else "Cache hit: full tokens_before billed as Cached."
-        )
-    else:
-        compact["pre_read_tokens"] = 0
-        compact["pre_read_usd"] = 0.0
-        compact["pre_read_cache_miss"] = bool(miss)
 
-    tier_after = max(0, after_i or 0) or pre_tok or 1
-
-    # --- 2) Deferred reload (tools/system/summary) ---
-    rehyd = 0
-    if s0 is not None:
-        for ch in s0.get("children") or []:
-            if not isinstance(ch, dict) or ch.get("kind") != "phase_harness":
-                continue
-            for sub in ch.get("children") or []:
-                if isinstance(sub, dict) and sub.get("kind") == "caused_in_residual":
-                    rehyd += int(sub.get("tokens_in") or sub.get("context_delta") or 0)
-        if rehyd <= 0:
-            emit = int(s0.get("model_emit_delta") or 0)
-            arg_emit = sum(
-                int(t.get("arg_tokens_est") or 0) for t in (s0.get("tools") or [])
+    for compact in compacts:
+        before_i = _as_int(compact.get("tokens_before"))
+        after_i = _as_int(compact.get("tokens_after"))
+        pre_tok = max(0, before_i or 0)
+        if pre_tok > 0:
+            if miss:
+                pre_unc, pre_cache = pre_tok, 0
+            else:
+                pre_unc, pre_cache = 0, pre_tok
+            u_usd, c_usd, pre_usd = _price(pre_unc, pre_cache, pre_tok)
+            compact["pre_read_tokens"] = pre_tok
+            compact["pre_read_uncached_tokens"] = pre_unc
+            compact["pre_read_cached_tokens"] = pre_cache
+            compact["pre_read_uncached_usd"] = round(u_usd, 8)
+            compact["pre_read_cached_usd"] = round(c_usd, 8)
+            compact["pre_read_usd"] = round(pre_usd, 8)
+            compact["pre_read_cache_miss"] = bool(miss)
+            compact["pre_read_note"] = (
+                "Cache miss: full tokens_before billed as In."
+                if miss
+                else "Cache hit: full tokens_before billed as Cached."
             )
-            if emit > max(arg_emit, 1) * 3:
-                rehyd = max(0, emit - max(arg_emit, 0))
-            elif est0:
-                caused = int(est0.get("uncached_input_tokens") or 0)
-                tools = sum(
-                    int(t.get("context_delta") or t.get("tokens_in") or 0)
-                    for t in (s0.get("tools") or [])
-                )
-                rehyd = max(0, caused - tools)
-        caused0 = int(est0.get("uncached_input_tokens") or s0.get("tokens_in") or 0)
-        if caused0 > 0:
-            rehyd = min(rehyd, caused0)
-
-    if rehyd > 0:
-        _, _, rehyd_usd = _price(rehyd, 0, tier_after or rehyd)
-        compact["deferred_reload_tokens"] = int(rehyd)
-        compact["deferred_reload_usd"] = round(rehyd_usd, 8)
-        compact["deferred_reload_note"] = (
-            "Post-compact rehydration (tools/system/summary) paid as uncached In "
-            "on the next call(s). Moved off Call 1 onto this Compact row."
-        )
-        # Strip from call-1 caused In so Compact owns that slice
-        if s0 is not None and est0:
-            try:
-                peak = int(
-                    est0.get("logical_input_tokens")
-                    or est0.get("input_tokens")
-                    or tier_after
-                    or rehyd
-                )
-                for key in ("uncached_input_tokens", "logical_uncached_tokens"):
-                    v = est0.get(key)
-                    if isinstance(v, int) and v > 0:
-                        est0[key] = max(0, v - rehyd)
-                new_unc = int(est0.get("uncached_input_tokens") or 0)
-                new_in_usd, _, _ = _price(new_unc, 0, peak)
-                est0["cost_in_usd"] = round(new_in_usd, 8)
-                log_unc = int(est0.get("logical_uncached_tokens") or 0)
-                log_in_usd, _, _ = _price(log_unc, 0, peak)
-                est0["cost_in_logical_usd"] = round(log_in_usd, 8)
-                cache_usd = float(est0.get("cost_cached_usd") or 0)
-                out_usd = float(est0.get("cost_out_usd") or 0)
-                est0["estimate_usd"] = round(new_in_usd + cache_usd + out_usd, 8)
-                est0["api_call_usd"] = est0["estimate_usd"]
-                if isinstance(est0.get("cost_usd"), dict):
-                    est0["cost_usd"]["uncached_input"] = round(new_in_usd, 8)
-                    est0["cost_usd"]["input"] = round(new_in_usd, 8)
-                    est0["cost_usd"]["total"] = est0["estimate_usd"]
-                s0["tokens_in"] = new_unc
-                s0["cost_in_usd"] = est0["cost_in_usd"]
-                s0["estimate_usd"] = est0["estimate_usd"]
-
-                left = rehyd
-                for ch in s0.get("children") or []:
-                    if not isinstance(ch, dict) or ch.get("kind") != "phase_harness":
-                        continue
-                    kept_sub = []
-                    for sub in ch.get("children") or []:
-                        if not isinstance(sub, dict):
-                            continue
-                        if sub.get("kind") == "caused_in_residual" and left > 0:
-                            tin = int(
-                                sub.get("tokens_in") or sub.get("context_delta") or 0
-                            )
-                            take = min(tin, left)
-                            new_t = max(0, tin - take)
-                            left -= take
-                            if new_t <= 0:
-                                continue
-                            sub = dict(sub)
-                            sub["tokens_in"] = new_t
-                            sub["context_delta"] = new_t
-                            su, _, _ = _price(new_t, 0, peak)
-                            sub["cost_in_usd"] = round(su, 8)
-                            sub["estimate_usd"] = round(su, 8)
-                        kept_sub.append(sub)
-                    ch["children"] = kept_sub
-                    h_tok = new_unc if new_unc > 0 else sum(
-                        int(s.get("tokens_in") or 0) for s in kept_sub
-                    )
-                    hu, _, _ = _price(h_tok, 0, peak)
-                    ch["tokens_in"] = h_tok
-                    ch["cost_in_usd"] = round(hu, 8)
-                    ch["estimate_usd"] = round(hu, 8)
-            except Exception:
-                pass
-    else:
-        compact.setdefault("deferred_reload_tokens", None)
-        compact.setdefault("deferred_reload_usd", None)
-
-    # --- 3) Out = compressed history the compact LLM wrote ---
-    # tokens_after is the new window (≈ summary + remaining system/tools).
-    # Reload is next-round In, not compact Out — subtract when known.
-    reload_tok = int(compact.get("deferred_reload_tokens") or 0)
-    out_tok = 0
-    if isinstance(after_i, int) and after_i > 0:
-        out_tok = max(1, after_i - max(0, reload_tok))
-    if out_tok > 0:
-        peak_out = max(after_i or out_tok, pre_tok, 1)
-        if estimate_cost_usd is None:
-            hi = peak_out > 200_000
-            ro = 12.0 if hi else 6.0
-            o_usd = out_tok * ro / 1e6
         else:
-            e_out = estimate_cost_usd(
-                input_tokens=0,
-                output_tokens=int(out_tok),
-                cached_read_tokens=0,
-                peak_context_tokens=peak_out,
-                model_calls=1,
-            )
-            o_usd = float(e_out["cost_usd"]["output"])
-        compact["out_tokens"] = int(out_tok)
-        compact["out_usd"] = round(o_usd, 8)
-    else:
-        compact.setdefault("out_tokens", None)
-        compact.setdefault("out_usd", None)
+            compact["pre_read_tokens"] = 0
+            compact["pre_read_usd"] = 0.0
+            compact["pre_read_cache_miss"] = bool(miss)
 
-    # --- Total: XOR pre-read + compressed Out (reload stays next-round In) ---
-    pre_usd = float(compact.get("pre_read_usd") or 0)
-    out_usd = float(compact.get("out_usd") or 0)
-    compact["cost_usd"] = round(pre_usd + out_usd, 8)
-    compact["cost_note"] = (
-        "Compact $ = (Cached hit | In miss) of tokens_before + Out "
-        "(compressed history). Reload tools/system is next-round In."
-    )
+        # Compact Out stays on this row; next harness owns re-entry.
+        compact["deferred_reload_tokens"] = None
+        compact["deferred_reload_usd"] = None
+
+        out_tok = 0
+        if isinstance(after_i, int) and after_i > 0:
+            out_tok = int(after_i)
+        if out_tok > 0:
+            peak_out = max(after_i or out_tok, pre_tok, 1)
+            if estimate_cost_usd is None:
+                hi = peak_out > 200_000
+                ro = 12.0 if hi else 6.0
+                o_usd = out_tok * ro / 1e6
+            else:
+                e_out = estimate_cost_usd(
+                    input_tokens=0,
+                    output_tokens=int(out_tok),
+                    cached_read_tokens=0,
+                    peak_context_tokens=peak_out,
+                    model_calls=1,
+                )
+                o_usd = float(e_out["cost_usd"]["output"])
+            compact["out_tokens"] = int(out_tok)
+            compact["out_usd"] = round(o_usd, 8)
+        else:
+            compact.setdefault("out_tokens", None)
+            compact.setdefault("out_usd", None)
+
+        pre_usd = float(compact.get("pre_read_usd") or 0)
+        out_usd = float(compact.get("out_usd") or 0)
+        compact["cost_usd"] = round(pre_usd + out_usd, 8)
+        compact["cost_note"] = (
+            "Compact $ = (Cached hit | In miss) of tokens_before + Out "
+            "(compressed history). Reload tools/system is next-call In."
+        )

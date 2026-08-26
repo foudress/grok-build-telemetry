@@ -1,24 +1,29 @@
 /** Daily / weekly / monthly aggregate view. */
-import { $, fmtTokens, fmtUsd, esc, joinParts, totalPrice } from './fmt.js';
-import { drawAggBars, drawTimeline, setCostUnit, hideAllChartTips, onGanttSelect, fitGanttToSessions } from './charts.js';
+import { $, fmtTokens, fmtUsd, esc, joinParts, totalPrice, isSubagentKind, ratesPerMFromIoCosts } from './fmt.js';
+import { drawAggBars, drawTimeline, setCostUnit, hideAllChartTips, onGanttSelect, fitGanttToSessions, drawRateChart, drawIoStepChart, clearRateHost } from './charts.js';
 import { switchSession } from './sessions.js';
+import { FEATURES } from './features.js';
 
 const PERIODS = new Set(["daily", "weekly", "monthly"]);
 const GRAINS = {
   daily: [
     { id: "hour", label: "Hourly" },
     { id: "15m", label: "15 min" },
+    { id: "session", label: "Session" },
   ],
   weekly: [
     { id: "hour", label: "Hourly" },
     { id: "day", label: "Daily" },
+    { id: "session", label: "Session" },
   ],
   monthly: [
     { id: "day", label: "Daily" },
     { id: "week", label: "Weekly" },
+    { id: "session", label: "Session" },
   ],
 };
 const GRAIN_DEFAULT = { daily: "hour", weekly: "day", monthly: "day" };
+const AGG_MODES = new Set(["timeframe", "cumulative", "normalized"]);
 
 let _scope = "session";
 let _offset = 0;
@@ -27,6 +32,9 @@ let _mode = "timeframe";
 let _byLabel = false;
 let _stack = "io";
 let _timeline = false;
+let _rate = false;
+let _ioStep = false;
+let _rateGrain = "session";
 let _pollRef = null;
 let _lastAgg = null;
 let _ganttSel = new Set();
@@ -52,6 +60,9 @@ function persist() {
     localStorage.setItem("tt-agg-bylabel", _byLabel ? "1" : "0");
     localStorage.setItem("tt-agg-stack", _stack);
     localStorage.setItem("tt-agg-timeline", _timeline ? "1" : "0");
+    localStorage.setItem("tt-agg-rate", _rate ? "1" : "0");
+    localStorage.setItem("tt-agg-io-step", _ioStep ? "1" : "0");
+    localStorage.setItem("tt-agg-rate-grain", _rateGrain);
   } catch { /* ignore */ }
 }
 
@@ -60,11 +71,17 @@ export function restoreScope() {
     const s = localStorage.getItem("tt-scope");
     if (PERIODS.has(s) || s === "session") _scope = s;
     const m = localStorage.getItem("tt-agg-mode");
-    if (m === "cumulative" || m === "timeframe") _mode = m;
+    if (AGG_MODES.has(m)) _mode = m;
     _byLabel = localStorage.getItem("tt-agg-bylabel") === "1";
     const sk = localStorage.getItem("tt-agg-stack");
     if (sk === "io" || sk === "parts" || sk === "tools") _stack = sk;
-    _timeline = localStorage.getItem("tt-agg-timeline") === "1";
+    // Always open on $ — never restore hourglass / tok/s / I/O$ from a prior visit.
+    // Gated surfaces (gantt / tok/s) stay off even if prefs linger.
+    _timeline = false;
+    _rate = false;
+    _ioStep = false;
+    const rg = localStorage.getItem("tt-agg-rate-grain");
+    if (rg === "round" || rg === "session") _rateGrain = rg;
     const g = localStorage.getItem("tt-period-grain") || localStorage.getItem("tt-monthly-grain");
     if (g) _grain = normalizeGrain(_scope, g);
   } catch { /* ignore */ }
@@ -78,13 +95,21 @@ function normalizeGrain(scope, grain) {
 }
 
 function grainTitle() {
+  // Session cost chart — never leave a stale period "Tokens per second" title.
+  if (!isPeriodScope()) return "Cost Per Turn";
+  if (_ioStep) return "Official I/O $/M / session";
+  if (_rate) return "Tokens per second";
+  if (_grain === "session") return "Per-session usage";
   if (_scope === "daily") return _grain === "15m" ? "15-min usage" : "Hourly usage";
   if (_scope === "weekly") return _grain === "hour" ? "Hourly usage" : "Daily usage";
   if (_scope === "monthly") return _grain === "week" ? "Weekly usage" : "Daily usage";
-  return "Cost per round";
+  return "Cost Per Turn";
 }
 
 function applyScopeChrome() {
+  if (!FEATURES.gantt) _timeline = false;
+  if (!FEATURES.toksPerSec) _rate = false;
+  if (!FEATURES.periodIoPriceStep) _ioStep = false;
   document.body.classList.toggle("scope-period", isPeriodScope());
   const sel = $("scopeSelect");
   if (sel && sel.value !== _scope) sel.value = _scope;
@@ -93,24 +118,22 @@ function applyScopeChrome() {
   const nav = $("periodNav");
   if (nav) nav.hidden = !isPeriodScope();
   _grain = normalizeGrain(_scope, _grain);
+  const ganttOff = !!_timeline || !!_rate || !!_ioStep;
+  const showTimeExtras = isPeriodScope() && !ganttOff && !_byLabel;
+  const showLayout = isPeriodScope() && !ganttOff;
+  const showStack = isPeriodScope() && !ganttOff;
+
   const grainWrap = $("periodGrain");
   const opts = GRAINS[_scope] || [];
   if (grainWrap) {
-    grainWrap.hidden = !isPeriodScope() || opts.length < 2;
-    const btns = [ $("grainA"), $("grainB") ];
-    opts.forEach((opt, i) => {
-      const btn = btns[i];
-      if (!btn) return;
-      btn.hidden = false;
-      btn.dataset.grain = opt.id;
-      btn.textContent = opt.label;
-      const on = _grain === opt.id;
-      btn.classList.toggle("active", on);
-      btn.setAttribute("aria-pressed", on ? "true" : "false");
-    });
-    btns.forEach((btn, i) => {
-      if (btn && i >= opts.length) btn.hidden = true;
-    });
+    grainWrap.hidden = !showTimeExtras || opts.length < 2;
+    if (!grainWrap.hidden) {
+      grainWrap.innerHTML = opts.map((opt) => {
+        const on = _grain === opt.id;
+        return `<button type="button" class="unit-btn${on ? " active" : ""}" data-grain="${opt.id}" aria-pressed="${on ? "true" : "false"}">${opt.label}</button>`;
+      }).join("");
+    }
+    grainWrap.title = "Bar grain";
   }
   const title = $("costPanelTitle");
   if (title) title.textContent = grainTitle();
@@ -118,13 +141,18 @@ function applyScopeChrome() {
   if (treeTitle) treeTitle.textContent = isPeriodScope() ? "Sessions" : "Round hierarchy";
   const tf = $("aggModeTf");
   const cu = $("aggModeCum");
+  const nm = $("aggModeNorm");
   if (tf) {
-    tf.classList.toggle("active", _mode !== "cumulative");
-    tf.setAttribute("aria-pressed", _mode !== "cumulative" ? "true" : "false");
+    tf.classList.toggle("active", _mode === "timeframe");
+    tf.setAttribute("aria-pressed", _mode === "timeframe" ? "true" : "false");
   }
   if (cu) {
     cu.classList.toggle("active", _mode === "cumulative");
     cu.setAttribute("aria-pressed", _mode === "cumulative" ? "true" : "false");
+  }
+  if (nm) {
+    nm.classList.toggle("active", _mode === "normalized");
+    nm.setAttribute("aria-pressed", _mode === "normalized" ? "true" : "false");
   }
   ["aggStackIo", "aggStackParts", "aggStackTools"].forEach((id) => {
     const el = $(id);
@@ -148,53 +176,64 @@ function applyScopeChrome() {
   const unit = (window.__costChart && window.__costChart.unit) || "usd";
   const usdBtn = $("aggUnitUsd");
   const tokBtn = $("aggUnitTok");
+  const ioStepBtn = $("aggUnitIoStep");
   const timeBtn = $("aggUnitTime");
+  const rateBtn = $("aggUnitRate");
   if (usdBtn) {
     usdBtn.disabled = false;
-    usdBtn.classList.toggle("active", !_timeline && unit !== "tokens");
-    usdBtn.setAttribute("aria-pressed", (!_timeline && unit !== "tokens") ? "true" : "false");
+    usdBtn.classList.toggle("active", !_timeline && !_rate && !_ioStep && unit !== "tokens");
+    usdBtn.setAttribute("aria-pressed", (!_timeline && !_rate && !_ioStep && unit !== "tokens") ? "true" : "false");
   }
   if (tokBtn) {
     tokBtn.disabled = false;
-    tokBtn.classList.toggle("active", !_timeline && unit === "tokens");
-    tokBtn.setAttribute("aria-pressed", (!_timeline && unit === "tokens") ? "true" : "false");
+    tokBtn.classList.toggle("active", !_timeline && !_rate && !_ioStep && unit === "tokens");
+    tokBtn.setAttribute("aria-pressed", (!_timeline && !_rate && !_ioStep && unit === "tokens") ? "true" : "false");
+  }
+  if (ioStepBtn) {
+    ioStepBtn.hidden = !FEATURES.periodIoPriceStep;
+    ioStepBtn.classList.toggle("active", !!_ioStep);
+    ioStepBtn.setAttribute("aria-pressed", _ioStep ? "true" : "false");
   }
   if (timeBtn) {
-    timeBtn.classList.toggle("active", !!_timeline);
-    timeBtn.setAttribute("aria-pressed", _timeline ? "true" : "false");
+    timeBtn.hidden = !FEATURES.gantt;
+    timeBtn.classList.toggle("active", !!_timeline && !_rate && !_ioStep);
+    timeBtn.setAttribute("aria-pressed", (_timeline && !_rate && !_ioStep) ? "true" : "false");
   }
+  if (rateBtn) {
+    rateBtn.hidden = !FEATURES.toksPerSec;
+    rateBtn.classList.toggle("active", !!_rate && !_ioStep);
+    rateBtn.setAttribute("aria-pressed", (_rate && !_ioStep) ? "true" : "false");
+  }
+  const rateGrain = $("periodRateGrain");
+  if (rateGrain) {
+    rateGrain.hidden = !_rate || !isPeriodScope();
+    const sBtn = $("aggRateSession");
+    const rBtn = $("aggRateRound");
+    if (sBtn) {
+      sBtn.classList.toggle("active", _rateGrain !== "round");
+      sBtn.setAttribute("aria-pressed", _rateGrain !== "round" ? "true" : "false");
+    }
+    if (rBtn) {
+      rBtn.classList.toggle("active", _rateGrain === "round");
+      rBtn.setAttribute("aria-pressed", _rateGrain === "round" ? "true" : "false");
+    }
+  }
+  // Hide unused groups (no grayed-out chrome).
+  const layoutToggle = $("aggLayoutToggle");
+  if (layoutToggle) layoutToggle.hidden = !showLayout;
+  const tfCum = $("aggTfCum");
+  if (tfCum) {
+    tfCum.hidden = !showTimeExtras;
+    tfCum.title = "Bar values";
+  }
+  const stackToggle = $("aggStackToggle");
+  if (stackToggle) stackToggle.hidden = !showStack;
+
   if (!_timeline) {
     const rst = $("ganttReset");
     if (rst) rst.hidden = true;
   } else {
     syncGanttSelChrome();
-  }
-  const ganttOff = !!_timeline;
-  const lockTime = !!_byLabel || ganttOff;
-  ["periodGrain", "aggTfCum"].forEach((id) => {
-    const el = $(id);
-    if (!el) return;
-    el.classList.toggle("is-disabled", lockTime);
-    el.setAttribute("aria-disabled", lockTime ? "true" : "false");
-    el.querySelectorAll("button").forEach((b) => { b.disabled = lockTime; });
-  });
-  ["aggStackIo", "aggLayoutTime"].forEach((id) => {
-    const wrap = $(id)?.closest(".unit-toggle");
-    if (!wrap) return;
-    wrap.classList.toggle("is-disabled", ganttOff);
-    wrap.setAttribute("aria-disabled", ganttOff ? "true" : "false");
-    wrap.querySelectorAll("button").forEach((b) => { b.disabled = ganttOff; });
-  });
-  if (grainWrap) {
-    grainWrap.title = lockTime
-      ? (ganttOff ? "Grain hidden in timeline" : "Grain applies to Time layout only")
-      : "Bar grain";
-  }
-  const tfCum = $("aggTfCum");
-  if (tfCum) {
-    tfCum.title = lockTime
-      ? "Timeframe / Cumulative apply to Time layout only"
-      : "Bar values";
   }
 }
 
@@ -225,6 +264,9 @@ export function openSessionFromPeriod(sid) {
       offset: _offset,
       grain: _grain,
       timeline: _timeline,
+      rate: _rate,
+      ioStep: _ioStep,
+      rateGrain: _rateGrain,
       mode: _mode,
       stack: _stack,
       byLabel: _byLabel,
@@ -232,7 +274,19 @@ export function openSessionFromPeriod(sid) {
   }
   beginViewLoad();
   setScope("session");
-  switchSession(sid);
+  const want = String(sid || "").toLowerCase();
+  const row = (_lastAgg && _lastAgg.sessions || []).find(
+    (s) => String(s.session_id || "").toLowerCase() === want
+  );
+  let target = sid;
+  let focusSub = null;
+  if (row && (Number(row.depth) > 0 || isSubagentKind(row.session_kind))) {
+    // Never open the dedicated sub-agent session page — parent + Sub N tab.
+    target = row.parent_id || sid;
+    focusSub = row.session_id;
+  }
+  window.__pendingTaskTab = focusSub || "main";
+  switchSession(target);
   syncPeriodBack();
 }
 
@@ -246,7 +300,12 @@ export function restorePeriodReturn() {
   _offset = snap.offset || 0;
   _grain = normalizeGrain(_scope, snap.grain);
   _timeline = !!snap.timeline;
-  _mode = snap.mode === "cumulative" ? "cumulative" : "timeframe";
+  _rate = !!snap.rate;
+  _ioStep = !!snap.ioStep && !!FEATURES.periodIoPriceStep;
+  if (_rate || _ioStep) _timeline = false;
+  if (_ioStep) _rate = false;
+  _rateGrain = snap.rateGrain === "round" ? "round" : "session";
+  _mode = AGG_MODES.has(snap.mode) ? snap.mode : "timeframe";
   _stack = snap.stack || "io";
   _byLabel = !!snap.byLabel;
   persist();
@@ -271,22 +330,29 @@ export function setScope(scope) {
   if (_pollRef) _pollRef();
 }
 
+function requestAggFetch({ showLoader = true } = {}) {
+  // Grain / date tweaks with an existing period payload are warm calc-cache —
+  // keep the chart up and skip the full-page spinner flash.
+  if (showLoader) beginViewLoad();
+  if (_pollRef) _pollRef();
+}
+
 function setOffset(delta) {
   _offset += delta;
   if (_offset > 0) _offset = 0;
   applyScopeChrome();
-  if (_pollRef) _pollRef();
+  requestAggFetch({ showLoader: !_lastAgg });
 }
 
 function setGrain(g) {
   _grain = normalizeGrain(_scope, g);
   persist();
   applyScopeChrome();
-  if (_pollRef) _pollRef();
+  requestAggFetch({ showLoader: !_lastAgg });
 }
 
 function setMode(m) {
-  _mode = m === "cumulative" ? "cumulative" : "timeframe";
+  _mode = AGG_MODES.has(m) ? m : "timeframe";
   persist();
   applyScopeChrome();
   if (_lastAgg) paintPeriod(_lastAgg);
@@ -313,6 +379,14 @@ function paintCards(tot) {
   if (s2) { s2.textContent = fmtUsd(tot.cost_cached_usd); s2.className = "sub"; }
   if (s3) { s3.textContent = fmtUsd(tot.cost_out_usd); s3.className = "sub"; }
   if (s4) { s4.textContent = fmtUsd(tot.official_usd); s4.className = "sub"; }
+  // Period reuses kpi2 — disable session flip chrome.
+  const kpi2 = $("kpi2");
+  if (kpi2) {
+    kpi2.classList.add("card-flip-off");
+    kpi2.classList.remove("is-flipped");
+    kpi2.setAttribute("aria-pressed", "false");
+    kpi2.tabIndex = -1;
+  }
 }
 
 function restoreSessionCardLabels() {
@@ -329,13 +403,18 @@ function restoreSessionCardLabels() {
 export function leavePeriodView() {
   restoreSessionCardLabels();
   hideAllChartTips();
+  const kpi2 = $("kpi2");
+  if (kpi2) {
+    kpi2.classList.remove("card-flip-off");
+    kpi2.tabIndex = 0;
+  }
 }
 
 function ganttGroupIds(sid, sessions) {
   const id = String(sid || "").toLowerCase();
   const s = (sessions || []).find((x) => String(x.session_id).toLowerCase() === id);
   if (!s) return [id];
-  if (s.depth > 0 || s.session_kind === "subagent") return [id];
+  if (s.depth > 0 || isSubagentKind(s.session_kind)) return [id];
   const out = [id];
   for (const c of sessions) {
     if (String(c.parent_id || "").toLowerCase() === id)
@@ -396,7 +475,7 @@ function paintSessionList(sessions) {
       `<span class="tok-cached">Cached ${fmtTokens(s.tokens_cached || 0)}</span> <span class="cost-cached">${fmtUsd(s.cost_cached_usd || 0)}</span>`,
       `<span class="tok-out">Out +${fmtTokens(s.tokens_out || 0)}</span> <span class="cost-out">${fmtUsd(s.cost_out_usd || 0)}</span>`,
     ]);
-    const sub = (s.session_kind === "subagent" || Number(s.depth) > 0) ? " is-sub" : "";
+    const sub = (isSubagentKind(s.session_kind) || Number(s.depth) > 0) ? " is-sub" : "";
     const name = s.label || (sub ? `Sub Agent ${s.child_n || s.n}` : `Session ${s.n}`);
     const sid = String(s.session_id);
     const picked = _timeline && _ganttSel.size > 0 && _ganttSel.has(sid.toLowerCase()) ? " is-picked" : "";
@@ -407,7 +486,11 @@ function paintSessionList(sessions) {
       <span class="sess-n" title="${esc(tip)}">${esc(name)}</span>
       <span class="sess-title" title="${esc(s.title || sid)}">${esc(s.title || "")}</span>
       <span class="sess-ledger">${ledger}</span>
-      <span class="sess-price">${totalPrice(s.official_usd)}</span>
+      <span class="sess-price">${totalPrice(
+        s.estimate_usd != null
+          ? s.estimate_usd
+          : (Number(s.cost_in_usd) || 0) + (Number(s.cost_cached_usd) || 0) + (Number(s.cost_out_usd) || 0)
+      )}</span>
     </div>`;
   }).join("");
   tree.querySelectorAll("[data-sid]").forEach((el) => {
@@ -438,15 +521,83 @@ export function paintPeriod(agg) {
   }
   $("liveBadge").textContent = "period";
   $("liveBadge").className = "badge idle";
-  $("sessionMeta").innerHTML = `<code title="${esc(agg.start || "")} → ${esc(agg.end || "")}">${esc(agg.label || "")}</code>`;
+  // Date lives in periodNav — do not duplicate in the header meta strip.
+  const meta = $("sessionMeta");
+  if (meta) meta.textContent = "";
   const lab = $("periodLabel");
   if (lab) lab.textContent = agg.label || "—";
   const next = $("periodNext");
   if (next) next.disabled = _offset >= 0;
   paintCards(agg.totals || {});
   const unit = (window.__costChart && window.__costChart.unit) || "usd";
-  if (_timeline) {
-    if (!window.__aggChart) window.__aggChart = {};
+  if (!window.__aggChart) window.__aggChart = {};
+  window.__aggChart.rate = !!_rate;
+  window.__aggChart.ioStep = !!_ioStep;
+  window.__aggChart.rateGrain = _rateGrain;
+  if (_ioStep) {
+    window.__aggChart.timeline = false;
+    window.__aggChart.ratePts = null;
+    const pts = (agg.sessions || []).map((s) => {
+      const depth = Number(s.depth) || 0;
+      const isSub = depth > 0 || isSubagentKind(s.session_kind);
+      let label = String(s.n ?? "");
+      if (isSub && s.child_n != null) label = `${s.n != null ? s.n : "?"}.${s.child_n}`;
+      else if (isSub) label = `↳${s.n ?? "?"}`;
+      // $/M = Official $ ÷ API tokens (same as Session cost Official subline).
+      const rates = ratesPerMFromIoCosts(s);
+      return {
+        label,
+        title: s.label || s.title || label,
+        session_id: s.session_id,
+        kind: "session",
+        n: s.n,
+        child_n: s.child_n,
+        depth,
+        in: rates.in,
+        cached: rates.cached,
+        out: rates.out,
+        snapped: !!rates.snapped,
+        cost_in_usd: Number(s.cost_in_usd) || 0,
+        cost_cached_usd: Number(s.cost_cached_usd) || 0,
+        cost_out_usd: Number(s.cost_out_usd) || 0,
+        tokens_in: s.tokens_in,
+        tokens_cached: s.tokens_cached,
+        tokens_out: s.tokens_out,
+      };
+    });
+    drawIoStepChart($("costChart"), pts, {
+      onClick: (p) => {
+        if (p && p.session_id) openSessionFromPeriod(p.session_id);
+      },
+    });
+  } else if (_rate) {
+    window.__aggChart.timeline = false;
+    window.__aggChart.ioStepPts = null;
+    const raw = _rateGrain === "round" ? (agg.tps_rounds || []) : (agg.tps_sessions || []);
+    const pts = raw.map((p) => ({
+      // Server already emits Session-grain style labels (29 / 29.1 / 29 R2).
+      label: p.label || (p.round != null ? `R${p.round}` : String(p.n ?? "")),
+      v: p.v,
+      kind: _rateGrain === "round" ? "round" : "session",
+      round: p.round,
+      session_id: p.session_id,
+      gen_ms: p.gen_ms,
+      tokens_out: p.gen_out_tokens ?? p.out,
+      n: p.n,
+      child_n: p.child_n,
+      depth: p.depth,
+    }));
+    drawRateChart($("costChart"), pts, {
+      host: "cost",
+      grain: _rateGrain,
+      color: "#7ec8ff",
+      onClick: (p) => {
+        if (p && p.session_id) openSessionFromPeriod(p.session_id);
+      },
+    });
+  } else if (_timeline) {
+    clearRateHost("cost");
+    window.__aggChart.ioStepPts = null;
     const key = `${agg.start}|${agg.end}`;
     if (window.__aggChart._ganttPeriod !== key) {
       window.__aggChart._gt0 = null;
@@ -457,9 +608,13 @@ export function paintPeriod(agg) {
     drawTimeline($("costChart"), agg);
     syncGanttSelChrome();
   } else {
+    clearRateHost("cost");
+    window.__aggChart.ratePts = null;
+    window.__aggChart.ioStepPts = null;
     drawAggBars($("costChart"), agg.buckets || [], {
       unit,
       cumulative: _mode === "cumulative",
+      normalized: _mode === "normalized",
       byLabel: _byLabel,
       stack: _stack,
     });
@@ -480,13 +635,15 @@ export async function fetchPeriod() {
     badge.textContent = "loading";
     badge.className = "badge idle";
   }
-  const url = `/api/aggregate?period=${encodeURIComponent(_scope)}&offset=${_offset}&grain=${encodeURIComponent(_grain)}&stack=${encodeURIComponent(_stack)}&_=${Date.now()}`;
+  // rate=1 when user is on tok/s (includes sub-agent points). Otherwise still
+  // returns Parts/Tools cats + mains tps so stack switches stay local.
+  const url = `/api/aggregate?period=${encodeURIComponent(_scope)}&offset=${_offset}&grain=${encodeURIComponent(_grain)}&stack=${encodeURIComponent(_stack)}&rate=${_rate ? "1" : "0"}&_=${Date.now()}`;
   const r = await fetch(url);
   if (!r.ok) throw new Error("HTTP " + r.status);
   const agg = await r.json();
   if (!isPeriodScope()) return;
   paintPeriod(agg);
-  endViewLoad();
+  // endViewLoad left to poll() so a superseded in-flight fetch does not hide the spinner.
 }
 
 export function redrawPeriod() {
@@ -499,15 +656,25 @@ export function bindPeriodControls() {
   });
   $("periodPrev")?.addEventListener("click", () => setOffset(-1));
   $("periodNext")?.addEventListener("click", () => setOffset(1));
-  $("grainA")?.addEventListener("click", (ev) => setGrain(ev.currentTarget.dataset.grain));
-  $("grainB")?.addEventListener("click", (ev) => setGrain(ev.currentTarget.dataset.grain));
+  $("periodGrain")?.addEventListener("click", (ev) => {
+    const btn = ev.target.closest("[data-grain]");
+    if (!btn || btn.disabled) return;
+    const g = btn.getAttribute("data-grain");
+    if (g) setGrain(g);
+  });
   $("aggModeTf")?.addEventListener("click", () => setMode("timeframe"));
   $("aggModeCum")?.addEventListener("click", () => setMode("cumulative"));
+  $("aggModeNorm")?.addEventListener("click", () => setMode("normalized"));
   const setAggStack = (s) => {
     _stack = s;
     persist();
     applyScopeChrome();
-    if (_pollRef) _pollRef();
+    // Server always fills Parts/Tools cats with the first attr pass — no refetch.
+    if (_lastAgg && (_lastAgg.cats_ready || Array.isArray((_lastAgg.totals || {}).parts))) {
+      paintPeriod(_lastAgg);
+    } else {
+      requestAggFetch();
+    }
   };
   $("aggStackIo")?.addEventListener("click", () => setAggStack("io"));
   $("aggStackParts")?.addEventListener("click", () => setAggStack("parts"));
@@ -526,20 +693,63 @@ export function bindPeriodControls() {
   });
   $("aggUnitUsd")?.addEventListener("click", () => {
     _timeline = false;
+    _rate = false;
+    _ioStep = false;
+    // Unit must update before chrome highlight (reads __costChart.unit).
+    setCostUnit("usd");
     persist();
     applyScopeChrome();
-    setCostUnit("usd");
     if (_lastAgg) paintPeriod(_lastAgg);
   });
   $("aggUnitTok")?.addEventListener("click", () => {
     _timeline = false;
+    _rate = false;
+    _ioStep = false;
+    setCostUnit("tokens");
     persist();
     applyScopeChrome();
-    setCostUnit("tokens");
+    if (_lastAgg) paintPeriod(_lastAgg);
+  });
+  $("aggUnitIoStep")?.addEventListener("click", () => {
+    if (!FEATURES.periodIoPriceStep) return;
+    _timeline = false;
+    _rate = false;
+    _ioStep = true;
+    persist();
+    applyScopeChrome();
     if (_lastAgg) paintPeriod(_lastAgg);
   });
   $("aggUnitTime")?.addEventListener("click", () => {
+    if (!FEATURES.gantt) return;
     _timeline = true;
+    _rate = false;
+    _ioStep = false;
+    persist();
+    applyScopeChrome();
+    if (_lastAgg) paintPeriod(_lastAgg);
+  });
+  $("aggUnitRate")?.addEventListener("click", () => {
+    if (!FEATURES.toksPerSec) return;
+    _timeline = false;
+    _rate = true;
+    _ioStep = false;
+    persist();
+    applyScopeChrome();
+    // rate_full means this payload included sub-agent tok/s (rate=1 fetch).
+    // Empty [] used to look "ready" via Array.isArray — painted blank with no spinner.
+    if (_lastAgg && _lastAgg.rate_full) paintPeriod(_lastAgg);
+    else requestAggFetch();
+  });
+  $("aggRateSession")?.addEventListener("click", () => {
+    _rateGrain = "session";
+    hideAllChartTips();
+    persist();
+    applyScopeChrome();
+    if (_lastAgg) paintPeriod(_lastAgg);
+  });
+  $("aggRateRound")?.addEventListener("click", () => {
+    _rateGrain = "round";
+    hideAllChartTips();
     persist();
     applyScopeChrome();
     if (_lastAgg) paintPeriod(_lastAgg);

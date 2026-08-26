@@ -187,9 +187,29 @@ def estimate_tokens(s: str) -> int:
     return len(s.encode("utf-8")) // BYTES_PER_TOKEN
 
 
+def wrap_user_query(text: Any) -> str:
+    """Keep ``<user_query>…</user_query>`` (and sibling tags) in the tokZ payload."""
+    if text is None:
+        return ""
+    s = text if isinstance(text, str) else str(text)
+    if not s.strip():
+        return s
+    if "<user_query>" in s.lower():
+        return s
+    return f"<user_query>{s}</user_query>"
+
+
+def count_user_prompt_tokens(text: Any) -> int:
+    """tokZ of a user prompt: full tagged payload, never inner-only."""
+    return count_tokens(wrap_user_query(text))
+
+
 def count_tokens(text: Any) -> int:
     """
     Count tokens for a text payload with the active tokenizer.
+
+    Always tokenize the string as given (full quotes / XML tags / JSON glue).
+    Callers must pass the complete payload — never a stripped inner match.
     """
     if text is None:
         return 0

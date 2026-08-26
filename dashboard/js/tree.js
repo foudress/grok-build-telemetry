@@ -24,6 +24,97 @@ function eventMs(e) {
   return Number.isFinite(n) ? n : 0;
 }
 
+/** User-owned Compact Out mass on a step (between-rounds — shown under User[N]). */
+function userCompactPeel(step) {
+  let t = 0;
+  let u = 0;
+  if (step && step.user_compact_out_tokens != null) {
+    t = Math.round(Number(step.user_compact_out_tokens) || 0);
+    u = Number(step.user_compact_out_usd) || 0;
+    if (t > 0 || u > 0) return { t, u };
+  }
+  const est = step && step.estimate;
+  if (est && est.user_compact_out_tokens != null) {
+    t = Math.round(Number(est.user_compact_out_tokens) || 0);
+    u = Number(est.user_compact_out_usd) || 0;
+    if (t > 0 || u > 0) return { t, u };
+  }
+  for (const ch of (step && step.children) || []) {
+    if (!ch || ch.kind !== "phase_harness") continue;
+    for (const sub of ch.children || []) {
+      if (sub && sub.kind === "compact_out_in" && String(sub.attribution || "") === "user") {
+        t += Math.round(Number(sub.tokens_in || sub.context_delta) || 0);
+        u += Number(sub.cost_in_usd) || 0;
+      }
+    }
+  }
+  return { t, u };
+}
+
+/**
+ * Compact Out to subtract from Call/Harness display totals.
+ * Reconstruct already excludes User-owned Compact Out from tokens_in /
+ * harness_in_* and stamps user_compact_out_* — peeling again under-counts
+ * (e.g. tools 9.7k shown under a 3.4k Harness header).
+ * Only peel when parent totals still include that mass (legacy payloads).
+ */
+function userCompactPeelFromTotals(step) {
+  const peel = userCompactPeel(step);
+  if (!(peel.t > 0 || peel.u > 0)) return { t: 0, u: 0 };
+  // Server stamp ⇒ Call/Harness In already exclude Compact Out.
+  if (step && (step.user_compact_out_tokens != null
+    || (step.estimate && step.estimate.user_compact_out_tokens != null))) {
+    return { t: 0, u: 0 };
+  }
+  let dispT = 0;
+  for (const ch of (step && step.children) || []) {
+    if (!ch || ch.kind !== "phase_harness") continue;
+    for (const sub of ch.children || []) {
+      if (!sub || sub.to_user) continue;
+      if (sub.kind === "compact_out_in" && String(sub.attribution || "") === "user") continue;
+      if (["tool", "late_context", "hook", "llm_to_in", "compact_out_in"].includes(sub.kind)
+        || sub.name) {
+        dispT += Math.round(Number(sub.tokens_in || sub.context_delta) || 0);
+      }
+    }
+  }
+  const raw = Math.round(Number(step && (step.tokens_in ?? step.harness_in_tokens)) || 0);
+  const full = dispT + peel.t;
+  // Peel only when parent looks like it still includes Compact Out.
+  if (Math.abs(raw - full) <= Math.abs(raw - dispT)) return peel;
+  return { t: 0, u: 0 };
+}
+
+/** Peel user Compact Out from a phase_harness node only if its tokens_in still include it. */
+function harnessPhaseDisplayIn(phase, money) {
+  let peelT = 0;
+  let peelU = 0;
+  let dispT = 0;
+  for (const sub of (phase && phase.children) || []) {
+    if (!sub || sub.to_user) continue;
+    const isUserCo = sub.kind === "compact_out_in" && String(sub.attribution || "") === "user";
+    const tin = Math.round(Number(sub.tokens_in || sub.context_delta) || 0);
+    const uin = Number(sub.cost_in_usd) || 0;
+    if (isUserCo) {
+      peelT += tin;
+      peelU += uin;
+      continue;
+    }
+    if (["tool", "late_context", "hook", "llm_to_in", "compact_out_in"].includes(sub.kind)
+      || sub.name) {
+      dispT += tin;
+    }
+  }
+  const rawT = Math.round(Number(money && money.ti) || 0);
+  const rawU = Number(money && money.ci) || 0;
+  const full = dispT + peelT;
+  const includes = peelT > 0 && Math.abs(rawT - full) <= Math.abs(rawT - dispT);
+  return {
+    inTok: Math.max(0, includes ? rawT - peelT : rawT),
+    inUsd: Math.max(0, includes ? rawU - peelU : rawU),
+  };
+}
+
 /** Always-visible hook row (display-only — not billed model In). */
 function renderHookNode(h) {
   if (!h) return "";
@@ -51,23 +142,79 @@ function renderHookNode(h) {
   </div>`;
 }
 
-function renderSubagentCard(sa) {
+/** Same tot as the System card header In (do not re-derive). */
+function systemBoxPartsAndTotal(sp) {
+  const rawParts = (sp && sp.parts || []).filter((p) => p && p.kind !== "hooks");
+  const residualTok = Math.round(Number(sp && sp.message_residual_tokens) || 0);
+  if (
+    residualTok > 0
+    && !rawParts.some((p) => p.kind === "tool_definitions" || p.kind === "tool_defs_message")
+  ) {
+    rawParts.push({
+      kind: "tool_defs_message",
+      label: "Tool definitions + Message",
+      tokens: residualTok,
+      tokenizer_tokens: residualTok,
+    });
+  }
+  const partsTok = rawParts.reduce((s, p) => s + (Number(p.tokens ?? p.tokens_in) || 0), 0);
+  const tot = (sp && (sp.message_residual_tokens != null || rawParts.length))
+    ? partsTok
+    : (sp && (sp.tokens_in ?? sp.logical_tokens ?? sp.uncached_est));
+  return { rawParts, tot };
+}
+
+function findSubSession(subs, sa) {
+  const list = subs || [];
+  const sid = String((sa && sa.session_id) || "").toLowerCase();
+  const root = String((sa && (sa.root_session_id || sa.session_id)) || "").toLowerCase();
+  const n = sa && sa.n;
+  return list.find((s) => String(s.session_id || "").toLowerCase() === sid)
+    || list.find((s) => {
+      const rs = String(s.root_session_id || s.session_id || "").toLowerCase();
+      return rs === root || String(s.session_id || "").toLowerCase() === root;
+    })
+    || (n != null ? list.find((s) => Number(s.n) === Number(n)) : null)
+    || null;
+}
+
+function renderSubagentCard(sa, subs) {
   if (!sa) return "";
   const n = sa.n != null ? sa.n : "?";
-  const title = sa.title || sa.label || "Sub Agent";
+  const rk = Number(sa.resume_index) || 0;
+  const multi = Number(sa.resume_max) > 1 || rk > 1;
+  const tag = sa.label || (multi && rk >= 1 ? `Sub Agent ${n} R${rk}` : `Sub Agent ${n}`);
+  const title = sa.is_sys ? "" : (sa.title || sa.label || tag);
   const u = sa.usage || {};
-  const sid = sa.session_id || "";
-  const inTok = sa.tokens_in != null
+  const sub = findSubSession(subs, sa);
+  const sid = (sub && sub.session_id) || sa.session_id || "";
+  let inTok = sa.tokens_in != null
     ? sa.tokens_in
     : Math.max(0, Number(u.inputTokens || 0) - Number(u.cachedReadTokens || 0));
-  const cacheTok = sa.tokens_cached != null ? sa.tokens_cached : (u.cachedReadTokens || 0);
-  const outTok = sa.tokens_out != null ? sa.tokens_out : (u.outputTokens || 0);
-  const cin = sa.cost_in_usd;
+  let cacheTok = sa.tokens_cached != null ? sa.tokens_cached : (u.cachedReadTokens || 0);
+  let outTok = sa.tokens_out != null ? sa.tokens_out : (u.outputTokens || 0);
+  let cin = sa.cost_in_usd;
   const ccache = sa.cost_cached_usd;
   const cout = sa.cost_out_usd;
-  const usd = sa.official_usd != null
-    ? sa.official_usd
+  let usd = sa.estimate_usd != null
+    ? sa.estimate_usd
     : (Number(cin || 0) + Number(ccache || 0) + Number(cout || 0));
+  if (sa.is_sys && sub) {
+    const rounds = sub.rounds || [];
+    const r1 = rounds.find((r) => Number(r.index) === 1)
+      || rounds.find((r) => r && r.system_prompt)
+      || rounds[0];
+    const sp = r1 && r1.system_prompt;
+    if (sp) {
+      const { tot } = systemBoxPartsAndTotal(sp);
+      inTok = tot;
+      cin = sp.cost_in_usd;
+      usd = sp.estimate_usd != null ? sp.estimate_usd : cin;
+      cacheTok = 0;
+      outTok = 0;
+    }
+  }
+  const goRound = sa.is_sys ? 1 : (rk >= 1 ? rk : 1);
   const line = joinParts([
     partIn(inTok, cin),
     partCached(cacheTok, ccache),
@@ -76,15 +223,15 @@ function renderSubagentCard(sa) {
   const typeTip = sa.agent_name
     ? `type ${sa.agent_name} (spawn role) · ${sid}`
     : sid;
-  return `<div class="subagent-card" data-sub-tab="${esc(sid)}" title="${esc(typeTip)}">
-    <span class="tag subagent">Sub Agent ${esc(String(n))}</span>
+  return `<div class="subagent-card" data-sub-tab="${esc(sid)}" data-sub-round="${esc(String(goRound))}" title="${esc(typeTip)}">
+    <span class="tag subagent">${esc(tag)}</span>
     <span class="sum-gray">${esc(title)}</span>
     ${line}
     ${usd != null && usd !== "" ? totalPrice(usd) : ""}
   </div>`;
 }
 
-function compBar(comp, se) {
+function compBar(comp, se, step) {
   if (!comp && !se) return "";
   // Thought/Message/ToolReq = exact TokZ; Enc = residual of full off_out
   const th = Math.max(0, Number(
@@ -102,13 +249,15 @@ function compBar(comp, se) {
   const outTot = Math.max(0, Number(
     se?.output_tokens ?? comp?.output_total ?? (th + re + em + msg)
   ) || 0);
-  // Harness bar = full Call In (not tools-only, not minus Out→In)
+  // Harness bar = Call In (User-owned Compact Out already excluded when stamped).
   let h = Math.max(0, Number(
     se?.uncached_input_tokens
     ?? se?.harness_in_tokens
     ?? comp?.harness_results
     ?? comp?.harness_in_total
   ) || 0);
+  const peel = userCompactPeelFromTotals(step || null);
+  h = Math.max(0, h - (peel.t || 0));
   // late residual redistributed into tools — never shown
   if (!th && !re && !em && !msg && !h) return "";
   const total = th + re + em + msg + h || 1;
@@ -148,21 +297,23 @@ function renderChildNode(c, phaseKey) {
   }
   if (c.kind === "phase_harness") {
     const m = moneyFromNode(c);
+    // User Compact Out lives under User[N]; peel only if phase totals still include it.
+    const { inTok, inUsd } = harnessPhaseDisplayIn(c, m);
     // Full detail in hierarchy — do not aggregate identical tools (graph only)
     const kids = (c.children || []).map(ch => renderChildNode(ch)).join("");
     const pid = phaseKey + "-harness";
     const isOpen = !window.__closedPhases?.has(pid);
     // Tools present: In + Cached. Hook-only harness: no Cached (internal / → user).
-    const hookOnly = !!c.hook_only || !!c.final_to_user || (!(m.ti > 0) && !(c.tool_count > 0));
+    const hookOnly = !!c.hook_only || !!c.final_to_user || (!(inTok > 0) && !(c.tool_count > 0));
     const showCache = !hookOnly && (m.tc > 0 || m.cc > 0);
     const segs = showCache
-      ? [partIn(m.ti, m.ci), partCached(m.tc, m.cc)]
-      : [partIn(m.ti, m.ci)];
+      ? [partIn(inTok, inUsd), partCached(m.tc, m.cc)]
+      : [partIn(inTok, inUsd)];
     return `<details class="phase" data-pid="${esc(pid)}"${isOpen ? " open" : ""}>
       <summary>
         <span class="tag phase-harness">Harness</span>
         ${joinParts(segs.filter(Boolean))}
-        ${m.ti ? " " + totalPrice(m.ci) : ""}
+        ${inTok ? " " + totalPrice(inUsd) : ""}
         ${c.tool_count ? `<span class="muted">· ${c.tool_count} tools</span>` : ""}
         <span class="muted" title="${hookOnly
           ? "Hook-only harness (→ user / internal). No Cached; not a next LLM prompt."
@@ -177,6 +328,20 @@ function renderChildNode(c, phaseKey) {
   }
   if (c.kind === "hook") {
     return renderHookNode(c);
+  }
+  if (c.kind === "compact_out_in") {
+    // Between-rounds: shown under User[N], not Call-1 harness.
+    if (String(c.attribution || "") === "user") return "";
+    const m = moneyFromNode(c);
+    const inTok = Math.round(Number(m.ti || c.tokens_in || c.context_delta || 0));
+    const z = Math.round(Number(c.tokenizer_tokens || inTok || 0));
+    const cn = c.compact_index;
+    const lab = (cn != null && Number(cn) > 0) ? `Compact ${Number(cn)} Out` : "Compact Out";
+    return `<div class="node" title="${esc(c.estimate_note || "Compacted history re-enters next LLM prompt")}">
+      <span class="tag llm-out-in">${esc(lab)}</span>
+      ${partIn(inTok, m.ci)}
+      ${eolTokenizerMeta({ ...c, tokenizer_tokens: z }, inTok > 0 ? inTok : null)}
+    </div>`;
   }
   if (c.kind === "llm_to_in") {
     // First harness line: LLM Out [N] · tools… · In +tok
@@ -267,7 +432,7 @@ function renderChildNode(c, phaseKey) {
       ${eolTokenizerMeta(c, outTok)}
     </div>`;
   }
-  if (c.kind === "tool" || (c.name && !["thought","reasoning","message","phase_llm","phase_harness","tool_request","tool_requests","llm_to_in","hook","late_context"].includes(c.kind))) {
+  if (c.kind === "tool" || (c.name && !["thought","reasoning","message","phase_llm","phase_harness","tool_request","tool_requests","llm_to_in","compact_out_in","hook","late_context"].includes(c.kind))) {
     const m = moneyFromNode(c);
     const pathBit = shortPath(c.path);
     const resume = c.title && c.title !== c.name ? String(c.title).slice(0, 36) : "";
@@ -322,7 +487,14 @@ function renderChildNode(c, phaseKey) {
       ch_result_chars: c.ch_result_chars || c.result_chars,
       ch_result_tokens: tokZExact,
     };
-    const inTok = Math.round(Number(m.ti || c.context_delta || 0)) || 0;
+    const inTok = Math.round(Number(
+      m.ti
+      || c.tokens_in
+      || c.context_delta
+      || c.ch_result_tokens
+      || c.result_tokens_est
+      || 0
+    )) || 0;
     return `<div class="node" title="${esc(tipFull || c.tool_call_id || "")}">
       <span class="tag ${tagClass}">${esc(tag)}</span>
       ${grayHtml ? `<span class="sum-gray" title="${esc(String(tipFull || grayHtml))}">${isPlan ? grayHtml : esc(grayHtml)}</span>` : ""}
@@ -332,7 +504,9 @@ function renderChildNode(c, phaseKey) {
   }
   if (c.kind === "reasoning") {
     const m = moneyFromNode(c);
-    const outTok = m.to || c.estimate_output_tokens || c.tokens_out || 0;
+    const outTok = Math.round(Number(
+      c.tokens_out ?? c.estimate_output_tokens ?? m.to
+    ) || 0);
     // Prefer stamped encrypted TokZ — never raw chars (chars//4 is last resort only)
     const metaNode = {
       ...c,
@@ -355,7 +529,9 @@ function renderChildNode(c, phaseKey) {
       tokenizer_tokens: c.summary_tokens ?? c.tokenizer_tokens,
       summary_chars: c.summary_chars || c.chars,
     };
-    const outTok = m.to || c.estimate_output_tokens || c.tokens_out || 0;
+    const outTok = Math.round(Number(
+      c.tokens_out ?? c.estimate_output_tokens ?? m.to
+    ) || 0);
     const prev = c.preview ? String(c.preview) : "[summary]";
     return `<div class="node" title="${esc(c.estimate_note || "Thought summary — TokZ + share of official Out $")}">
       <span class="tag thought">thought</span>
@@ -412,6 +588,20 @@ function renderRoundTree(rounds, opts) {
   const hadTree = prevRids.size > 0;
   let enterI = 0;
 
+  function compactOnStep(c) {
+    if (!c) return false;
+    const ms = c.agent_ms;
+    for (const rr of rounds || []) {
+      for (const s of rr.model_steps || []) {
+        for (const x of s.compacts_after || []) {
+          if (x === c) return true;
+          if (ms != null && x && x.agent_ms === ms) return true;
+        }
+      }
+    }
+    return false;
+  }
+
   function renderCompactRow(c, where) {
     if (!c || c.kind !== "compaction") return "";
     const before = c.tokens_before;
@@ -453,8 +643,10 @@ function renderRoundTree(rounds, opts) {
       ? `ctx ${fmtTokens(before)}${AR}${fmtTokens(after)}`
       : "";
 
-    return `<div class="compact-row" title="${esc(c.cost_note || "Between rounds · " + (where || ""))}">
-      <span class="tag compact">Compact</span>
+    const autoTag = c.auto !== false;
+    const whereBit = where || (c.placement === "mid_round" ? "mid-round" : "between rounds");
+    return `<div class="compact-row" title="${esc(c.cost_note || whereBit)}">
+      <span class="tag compact${autoTag ? " compact-auto" : ""}">Compact${autoTag ? " · auto" : ""}</span>
       <span class="compact-meta"></span>
       <span class="compact-ledger">
         ${headParts}
@@ -501,12 +693,7 @@ function renderRoundTree(rounds, opts) {
   function renderSystemBootstrap(sp) {
     if (!sp || !(sp.tokens_in || sp.logical_tokens || (sp.parts && sp.parts.length)))
       return "";
-    // Hooks are not in the prompt — never show on System card
-    const rawParts = (sp.parts || []).filter(p => p && p.kind !== "hooks");
-    const partsTok = rawParts.reduce((s, p) => s + (Number(p.tokens ?? p.tokens_in) || 0), 0);
-    const tot = (sp.message_residual_tokens != null || rawParts.length)
-      ? partsTok
-      : (sp.tokens_in ?? sp.logical_tokens ?? sp.uncached_est);
+    const { rawParts, tot } = systemBoxPartsAndTotal(sp);
     const parts = rawParts.map(p => {
       const tokF = Math.round(Number(p.tokens ?? p.tokens_in) || 0);
       const usd = p.cost_in_usd;
@@ -550,8 +737,9 @@ function renderRoundTree(rounds, opts) {
     let sumCallIn = 0;
     let sumCallInUsd = 0;
     for (const s of stepsForSum) {
-      sumCallIn += Number(s.tokens_in) || 0;
-      sumCallInUsd += Number(s.cost_in_usd) || 0;
+      const uc = userCompactPeelFromTotals(s);
+      sumCallIn += Math.max(0, (Number(s.tokens_in) || 0) - uc.t);
+      sumCallInUsd += Math.max(0, (Number(s.cost_in_usd) || 0) - uc.u);
     }
     const userInTok = Number(up.tokens_in ?? up.uncached_est ?? bd.user_in_tokens) || 0;
     const userInUsd = Number(up.cost_in_usd ?? bd.user_in_usd) || 0;
@@ -576,16 +764,38 @@ function renderRoundTree(rounds, opts) {
     // User [N]: LLM answer [N-1] (Thought TokZ + Reasoning TokF + Message TokZ)
     // + prompt residual — no double-count. Server peels when answer fits in pool.
     // On cache miss: prior re-read already includes answer N-1 — hide/skip it.
-    const rereadHit = !!(up.session_restart || up.cache_miss || r.session_restart
+    // Miss lives on Attribution Reread→LLM + red box, never under User.
+    const missTok = Number(
+      bd.cache_miss_in_tokens
+      ?? r.cache_miss_in_tokens
+      ?? up.cache_miss_in_tokens
+      ?? r.reread_in_tokens
+      ?? up.reread_in_tokens
+      ?? up.reread_tokens
+      ?? bd.reread_in_tokens
+      ?? bd.reread_tokens
+    ) || 0;
+    const missUsd = Number(
+      bd.cache_miss_in_usd
+      ?? r.cache_miss_in_usd
+      ?? up.cache_miss_in_usd
+      ?? r.reread_in_usd
+      ?? up.reread_in_usd
+      ?? bd.reread_in_usd
+    ) || 0;
+    const rereadHit = !!(missTok > 0 || missUsd > 0
+      || up.session_restart || up.cache_miss || r.session_restart
       || up.context_reread || r.context_reread || r.cache_miss
       || (bd && bd.context_reread));
     const prevAns = up.prev_llm_answer || {};
-    const prevAbsorbed = !!(rereadHit || prevAns.absorbed_in_reread);
+    const prevAbsorbed = false;
+    // TokZ meta for eol chip only — not billed In.
     const prevTokZ = Math.round(Number(
-      prevAns.tokenizer_tokens || prevAns.tokens_in || 0
+      prevAns.tokenizer_tokens || prevAns.tokens_in_full || prevAns.tokens_in || 0
     )) || 0;
-    // In = hybrid (th TokZ + re TokF + msg TokZ); prefer tokens_in
-    const prevInTokRaw = Math.round(Number(prevAns.tokens_in || prevTokZ) || 0);
+    // Billed continuity In only (peel-capped on server). Do not fall back to
+    // tokens_in_full / tokenizer — that re-invents warm cached answer as In.
+    const prevInTokRaw = Math.round(Number(prevAns.tokens_in) || 0) || 0;
     const prevInTok = prevAbsorbed ? 0 : prevInTokRaw;
     const prevOutInUsd = prevAbsorbed ? 0 : (Number(prevAns.cost_in_usd) || 0);
     const prevFromPool = !prevAbsorbed && !!prevAns.from_user_pool;
@@ -603,36 +813,38 @@ function renderRoundTree(rounds, opts) {
       promptIn = Math.max(0, rawUser - prevInTok);
       if (rawUser > 0) promptUsd = (Number(up.cost_in_usd) || 0) * (promptIn / rawUser);
     }
-    const userTreeIn = Number(up.tokens_in ?? up.uncached_est) || (promptIn + (prevFromPool ? prevInTok : 0));
+    // Prefer server tokens_in (prompt + billed peel only). Never invent answer In.
+    const userTreeIn = Number(up.tokens_in ?? up.uncached_est) || promptIn || 0;
     const userTreeUsd = Number(up.cost_in_usd) || 0;
-    let upCache = rereadHit
-      ? (Number(up.tokens_cached ?? up.cached_est) || 0)
+    // Keep User Cached even on round KV miss (unknown which prefix missed).
+    // R1 User Cached is already 0 from server — do not invent it here.
+    const isR1User = Number(r.index) === 1;
+    let upCache = isR1User
+      ? 0
       : (Number(up.tokens_cached ?? up.cached_est ?? priorCache) || 0);
-    let upCacheUsd = Number(up.cost_cached_usd) || 0;
+    let upCacheUsd = isR1User ? 0 : (Number(up.cost_cached_usd) || 0);
     // Answer continuity: peel from Cached display when not taken from user pool
-    if (prevInTok > 0 && upCache >= prevInTok && !rereadHit && !prevFromPool) {
+    if (prevInTok > 0 && upCache >= prevInTok && !prevFromPool) {
       const fullC = Number(up.tokens_cached ?? up.cached_est ?? priorCache) || 1;
       upCache = Math.max(0, upCache - prevInTok);
       if (upCacheUsd > 0 && fullC > 0)
         upCacheUsd = upCacheUsd * (upCache / fullC);
     }
-    const rereadTok = Number(
-      r.reread_in_tokens ?? up.reread_in_tokens ?? up.reread_tokens
-      ?? bd.reread_in_tokens ?? bd.reread_tokens
-    ) || 0;
-    let rereadUsd = Number(r.reread_in_usd ?? up.reread_in_usd ?? bd.reread_in_usd) || 0;
-    // Full miss mass (includes prior answer) — do not peel answer out
-    let missTok = rereadHit ? rereadTok : 0;
-    let missUsd = rereadHit ? rereadUsd : 0;
     const ud = up.user_detail || {};
     // Full text only in title; short ellipsis in-row so hierarchy width stays stable
     const promptFull = String(up.preview || r.user_preview || "");
     const promptPreview = promptFull.length > 48
       ? promptFull.slice(0, 48) + "…"
       : promptFull;
-    // Header In = User tree (prompt + answer-from-pool) + miss
-    const userHeadIn = userTreeIn + missTok;
-    const userHeadInUsd = userTreeUsd + missUsd;
+    // Header In = prompt + billed LLM answer [N-1] + Compact Out (aligned with tree).
+    const coTokHead = Math.round(Number((up.compact_out || {}).tokens_in) || 0);
+    const coUsdHead = Number((up.compact_out || {}).cost_in_usd) || 0;
+    const userHeadIn = Number(up.display_in_tokens)
+      || (userTreeIn + coTokHead)
+      || (promptIn + prevInTok + coTokHead);
+    const userHeadInUsd = Number(up.display_in_usd)
+      || (userTreeUsd + coUsdHead)
+      || (promptUsd + prevOutInUsd + coUsdHead);
     const userHeadTot = userHeadInUsd + upCacheUsd;
     const uid = `${rid}-user`;
     const uOpen = openSteps.has(uid) ? " open" : "";
@@ -649,11 +861,16 @@ function renderRoundTree(rounds, opts) {
           ${eolTokenizerMeta({ tokenizer_tokens: prevTokZ || prevInTok }, prevInTok)}
         </div>`
       : "";
-    const missLine = rereadHit
-      ? `<div class="node warn-restart" title="${esc(up.note || "Prior context re-read as uncached Input (includes last LLM answer)")}">
-          <span class="tag warn">cache miss</span>
-          <span class="sum-gray">${esc(up.warning || "prior re-read as In")}</span>
-          ${partIn(missTok || rereadTok, missUsd || rereadUsd)}
+    const co = up.compact_out || {};
+    const coTok = Math.round(Number(co.tokens_in) || 0);
+    const coUsd = Number(co.cost_in_usd) || 0;
+    const coN = co.compact_index;
+    const coLab = (coN != null && Number(coN) > 0) ? `Compact ${Number(coN)} Out` : "Compact Out";
+    const compactOutLine = (coTok > 0 || coUsd > 0)
+      ? `<div class="node" title="${esc(co.note || "Compacted history re-enters as User In (prior LLM answer already inside)")}">
+          <span class="tag llm-out-in">${esc(coLab)}</span>
+          ${partIn(coTok, coUsd)}
+          ${eolTokenizerMeta({ tokenizer_tokens: coTok }, coTok > 0 ? coTok : null)}
         </div>`
       : "";
     const promptTokZ = Math.round(Number(
@@ -666,8 +883,8 @@ function renderRoundTree(rounds, opts) {
       <div class="node prompt-node" title="${esc(promptFull)}">
         <span class="tag user">prompt</span>
         <span class="sum-gray" title="${esc(promptFull)}">${esc(promptPreview) || ""}</span>
-        ${partIn(promptTokF, promptUsd)}
-        ${eolTokenizerMeta({ tokenizer_tokens: promptTokZ }, promptTokF > 0 ? promptTokF : null)}
+        ${partIn(promptTokZ || promptTokF, promptUsd)}
+        ${eolTokenizerMeta({ tokenizer_tokens: promptTokZ }, promptTokZ || promptTokF || null)}
       </div>`;
     // User-section hooks (user_prompt_submit + future user_prompt_*) after prompt
     const userHooks = (up.hooks || r.user_hooks || []).filter(Boolean);
@@ -682,8 +899,8 @@ function renderRoundTree(rounds, opts) {
           ].filter(Boolean))}
           ${userHeadTot > 0 ? " " + totalPrice(userHeadTot) : ""}
         </summary>
-        ${missLine}
         ${prevAnsLine}
+        ${compactOutLine}
         ${promptLine}
         ${userHookLines}
       </details>`;
@@ -693,15 +910,25 @@ function renderRoundTree(rounds, opts) {
     // Capitals only on mid-level Attribution labels (User/Harness/Reasoning/…);
     // leaf rows under LLM / Harness stay lowercase.
     const attrParts = [];
-    if (rereadTok || rereadUsd)
-      attrParts.push(`Reread${AR}LLM ${partIn(rereadTok, rereadUsd)}`);
+    if (missTok || missUsd)
+      attrParts.push(`Reread${AR}LLM ${partIn(missTok, missUsd)}`);
     if (bd.user_in_tokens || bd.user_in_usd)
       attrParts.push(`${isSuper ? "Super Agent" : "User"}${AR}LLM ${partIn(bd.user_in_tokens, bd.user_in_usd)}`);
     // Harness→LLM = tools/hooks only — subtract LLM→Harness In (Out re-entry)
     // so the same tokens are not attributed twice.
     {
-      const hAllT = Number(bd.harness_in_tokens) || 0;
-      const hAllU = Number(bd.harness_in_usd) || 0;
+      let hAllT = Number(bd.harness_in_tokens) || 0;
+      let hAllU = Number(bd.harness_in_usd) || 0;
+      // Peel between-rounds Compact Out only when call totals still include it.
+      let peelCoT = 0;
+      let peelCoU = 0;
+      for (const s of r.model_steps || []) {
+        const uc = userCompactPeelFromTotals(s);
+        peelCoT += uc.t;
+        peelCoU += uc.u;
+      }
+      hAllT = Math.max(0, hAllT - peelCoT);
+      hAllU = Math.max(0, hAllU - peelCoU);
       const outInT = Number(bd.llm_out_to_harness_in_tokens) || 0;
       const outInU = Number(bd.llm_out_to_harness_in_usd) || 0;
       const hToolsT = Math.max(
@@ -719,19 +946,24 @@ function renderRoundTree(rounds, opts) {
       if (hToolsT || hToolsU)
         attrParts.push(`Harness${AR}LLM ${partIn(hToolsT, hToolsU)}`);
     }
-    // Attribution Out split (new model):
-    //   Reasoning = Encrypted only
+    // Attribution Out split:
+    //   Reasoning = Thought + Enc (merged)
     //   LLM→Harness = Σ Tool Request
     //   LLM→User = Message
+    // So Reasoning + Harness + User = official Round Out.
     {
+      const thT = Number(bd.llm_thought_summary_tokens) || 0;
+      const thU = Number(bd.llm_thought_summary_usd) || 0;
       const encT = Number(
         bd.llm_reasoning_encrypted_tokens ?? bd.llm_reasoning_tokens
       ) || 0;
       const encU = Number(
         bd.llm_reasoning_encrypted_usd ?? bd.llm_reasoning_usd
       ) || 0;
-      if (encT > 0 || encU > 0)
-        attrParts.push(`Reasoning ${partOut(encT, encU)}`);
+      const reasonT = thT + encT;
+      const reasonU = thU + encU;
+      if (reasonT > 0 || reasonU > 0)
+        attrParts.push(`Reasoning ${partOut(reasonT, reasonU)}`);
     }
     if (bd.llm_out_to_harness_tokens || bd.llm_out_to_harness_usd) {
       // Out only = tool requests (not full Out re-entry)
@@ -743,11 +975,17 @@ function renderRoundTree(rounds, opts) {
     if (bd.llm_out_to_user_tokens || bd.llm_out_to_user_usd)
       attrParts.push(`LLM${AR}User ${partOut(bd.llm_out_to_user_tokens, bd.llm_out_to_user_usd)}`);
 
-    const usageBlock = attrParts.length ? `
+    const kvMissBox = (missTok > 0 || missUsd > 0) ? `
+      <div class="usage-line warn-restart" title="${esc(up.note || up.warning || "Prior context re-read as uncached Input (KV miss)")}">
+        <span class="tag warn">Cache Miss context re-read (KV Miss)</span>
+        ${partIn(missTok, missUsd)}
+        ${missUsd > 0 ? totalPrice(missUsd) : ""}
+      </div>` : "";
+    const usageBlock = (attrParts.length || kvMissBox) ? `
       <div class="usage-line">
         <span class="tag">Attribution</span>
         ${attrParts.join(` <span class="sep">/</span> `) || "—"}
-      </div>` : "";
+      </div>${kvMissBox}` : "";
 
     const steps = (r.model_steps || []).map(s => {
       const sid = `${rid}-${s.index}`;
@@ -769,8 +1007,22 @@ function renderRoundTree(rounds, opts) {
           .filter(ch => ch && ch.kind === "phase_harness")
           .reduce((a, ch) => a + (Number(ch.cost_in_usd) || 0), 0);
       }
-      const cacheTok = s.tokens_cached ?? se.logical_cached_tokens ?? se.cached_read_tokens;
-      const cacheUsd = s.cost_cached_usd ?? se.cost_cached_logical_usd ?? se.cost_cached_usd;
+      // Between-rounds Compact Out under User — peel only if Call In still includes it.
+      const uc = userCompactPeelFromTotals(s);
+      if (uc.t > 0 || uc.u > 0) {
+        growthIn = Math.max(0, (Number(growthIn) || 0) - uc.t);
+        growthInUsd = Math.max(0, (Number(growthInUsd) || 0) - uc.u);
+      }
+      const cacheTok = s.tokens_cached
+        ?? s.display_cached_tokens
+        ?? se.display_cached_tokens
+        ?? se.logical_cached_tokens
+        ?? se.cached_read_tokens;
+      const cacheUsd = s.cost_cached_usd
+        ?? s.display_cached_usd
+        ?? se.display_cached_usd
+        ?? se.cost_cached_logical_usd
+        ?? se.cost_cached_usd;
       const outTokLine = s.tokens_out ?? se.output_tokens;
       const outUsdLine = s.cost_out_usd ?? se.cost_out_usd;
       const callLine = joinParts([
@@ -785,51 +1037,32 @@ function renderRoundTree(rounds, opts) {
       const apiCost = (lineSumUsd > 0 || growthIn || cacheTok || outTokLine)
         ? lineSumUsd
         : (s.cost_of_call_usd ?? s.estimate_usd ?? se.cost_of_call_usd ?? se.estimate_usd);
-      // Δctx = caused window (next prompt − this start). Last call skipped
-      // (no harness after it). Never use Call In / warm-scaled harness.
+      // Δctx = same estimated Call In on this line (tree / Cached growth), not
+      // API `_meta.totalTokens` window (ctxB−ctxA). Last call: skip_context.
       const skipCtx = !!s.skip_context;
       const ctxA = s.display_context_start ?? s.context_start;
       const ctxB = s.display_context_end ?? s.context_end;
-      const rawDelta = (!skipCtx && typeof ctxA === "number" && typeof ctxB === "number")
-        ? Math.max(0, ctxB - ctxA)
-        : (!skipCtx && typeof s.context_delta === "number" ? Math.max(0, s.context_delta) : null);
-      const outTok = Number(s.tokens_out ?? se.output_tokens) || 0;
-      const poolU = Number(
-        s.harness_pool_unscaled ?? se.harness_pool_unscaled ?? s.harness_pool_tokens
-      ) || 0;
-      let ctxGrowth = skipCtx ? 0 : (s.context_growth_est ?? se.context_growth_est);
-      if (skipCtx) {
-        ctxGrowth = null;
-      } else if (ctxGrowth == null || ctxGrowth === "") {
-        if (rawDelta != null && rawDelta > 0) ctxGrowth = Math.max(rawDelta, outTok);
-        else ctxGrowth = (outTok + poolU) || null;
-      } else {
-        ctxGrowth = Math.max(0, Number(ctxGrowth) || 0);
-        // Guard stale payloads that still max'd with warm-scaled off_unc harness
-        const callIn = Number(growthIn) || 0;
-        const sane = (rawDelta != null && rawDelta > 0)
-          ? Math.max(rawDelta, outTok)
-          : (outTok + poolU);
-        if (
-          callIn > 0
-          && ctxGrowth > sane + 500
-          && ctxGrowth >= callIn * 0.8
-          && ctxGrowth > Math.max(rawDelta || 0, outTok) * 2
-        ) {
-          ctxGrowth = sane;
-        }
+      let ctxGrowth = null;
+      if (!skipCtx) {
+        const gin = Math.round(Number(growthIn) || 0);
+        if (gin > 0) ctxGrowth = gin;
       }
-      const subCards = (s.subagents_after || []).map(renderSubagentCard).join("");
+      const subCards = (s.subagents_after || []).map((sa) =>
+        renderSubagentCard(sa, opts && opts.subSessions)
+      ).join("");
+      const compactCards = (s.compacts_after || [])
+        .map(c => renderCompactRow(c, `after LLM call [${s.index}]`))
+        .join("");
       return `<details class="step" data-sid="${sid}"${sOpen}>
         <summary>
           <span class="tag">LLM call [${s.index}]</span>
           ${callLine || (skipCtx ? "" : `<span class="muted">ctx ${fmtTokens(ctxA)}${AR}${fmtTokens(ctxB)}</span>`)}
           ${apiCost != null ? " " + totalPrice(apiCost) : ""}
-          ${ctxGrowth != null ? `<span class="muted" title="Window after this call's harness (next LLM prompt). Last call has no harness — its context is shown on the previous call."> · Δctx ${fmtDelta(ctxGrowth)}</span>` : ""}
+          ${ctxGrowth != null ? `<span class="muted" title="Δctx = this call's estimated In (same figure as In on this line). Not API totalTokens Δ."> · Δctx ${fmtDelta(ctxGrowth)}</span>` : ""}
         </summary>
-        ${compBar(s.composition, se)}
+        ${compBar(s.composition, se, s)}
         ${children || `<div class="node muted">—</div>`}
-      </details>${subCards}`;
+      </details>${subCards}${compactCards}`;
     }).join("");
 
     // Newest-first: between-round events sit *after* this card (toward older).
@@ -839,7 +1072,7 @@ function renderRoundTree(rounds, opts) {
     const beforeItems = [];
     for (const rec of (r.recaps_before || []))
       beforeItems.push({ kind: "recap", ev: rec });
-    if (r.compact_before && r.compact_before.kind === "compaction")
+    if (r.compact_before && r.compact_before.kind === "compaction" && !compactOnStep(r.compact_before))
       beforeItems.push({ kind: "compact", ev: r.compact_before });
     beforeItems.sort((a, b) => eventMs(b.ev) - eventMs(a.ev));
     const betweenBefore = beforeItems.map((it) => (
@@ -848,13 +1081,16 @@ function renderRoundTree(rounds, opts) {
         : renderRecapRow(it.ev, `before Round ${r.index} · after previous · fork`)
     )).join("");
     // Newest round: events after it still live on *_after — show *above* the card.
-    const hasNewer = (rounds || []).some(x => Number(x.index) === Number(r.index) + 1);
+    // Use payload position, not index+1: after prune, reused indexes used to
+    // make every card look like the newest (and hide Compact · auto).
+    const rPos = (rounds || []).indexOf(r);
+    const hasNewer = rPos >= 0 && rPos < (rounds || []).length - 1;
     let recapsAbove = "";
     if (!hasNewer) {
       const afterItems = [];
       for (const rec of (r.recaps_after || []))
         afterItems.push({ kind: "recap", ev: rec });
-      if (r.compact_after && r.compact_after.kind === "compaction")
+      if (r.compact_after && r.compact_after.kind === "compaction" && !compactOnStep(r.compact_after))
         afterItems.push({ kind: "compact", ev: r.compact_after });
       afterItems.sort((a, b) => eventMs(b.ev) - eventMs(a.ev));
       recapsAbove = afterItems.map((it) => (

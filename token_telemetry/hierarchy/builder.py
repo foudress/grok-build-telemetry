@@ -17,9 +17,10 @@ Context accounting rules
   lagging payload (not a second bill of the last tool).
 - Gap between step N end and step N+1 start is folded into step N's end
   (late assistant tokens only visible at next stream start).
-- auto_compact_completed updates the session cursor to tokens_after and is
-  recorded as a between-round Compact card (compact_after on previous round,
-  compact_before on next) with tokens_removed + deferred reload In estimate.
+- auto_compact_completed updates the session cursor to tokens_after.
+  Mid-round: card on the live LLM step (`compacts_after`). Between-rounds:
+  compact_after on previous + compact_before on next. Do not stomp
+  round.context_end to tokens_after while pre-compact calls still exist.
 - Cache baseline carries across rounds (and through compact).
 - Call In is *caused* growth (paid on next call), shifted onto call n-1.
 """
@@ -57,12 +58,14 @@ from token_telemetry.hierarchy.finalize import (
     _finalize_step,
     _inject_system_message_residual,
     _load_reasonings_fresh,
+    _load_tool_requests_fresh,
     _load_tool_results_fresh,
     _merge_bootstrap_into_breakdown,
     _patch_reasoning_chars_on_trees,
     _price_bootstrap_prompts,
     _reprice_completed_rounds,
     _stamp_step_reasoning,
+    _stamp_tool_chat_args,
     _stamp_tool_chat_results,
 )
 from token_telemetry.hierarchy.hooks import _hook_slot
@@ -101,10 +104,16 @@ class HierarchyBuilder:
         # Last compaction applied (for open-round bookkeeping)
         self._last_compact: Optional[dict[str, Any]] = None
         self.max_rounds = max(4, int(max_rounds))
+        # Monotonic round number. Never `len(self.rounds)+1` — prune would
+        # reuse the same index (all live cards become "Round 25").
+        self._round_seq: int = 0
         # Bumps when structure changes (for dashboard snapshot cache)
         self.revision: int = 0
         self._session_dir: Optional[Path] = None
         self._child_usage_cache: dict[str, Any] = {}
+        self._subagent_ordinal: dict[str, int] = {}
+        self._subagent_result_n: dict[str, int] = {}
+        self._subagent_next_n: int = 0
         # hook_execution payloads (session-level; first-prompt ones feed bootstrap)
         self._hooks: list[dict[str, Any]] = []
         self._bootstrap_hooks: list[dict[str, Any]] = []
@@ -120,7 +129,9 @@ class HierarchyBuilder:
         self._reasonings_cursor: int = 0
         self._enc_stamp_sig: Optional[tuple] = None
         self._tool_results_cache: Optional[dict[str, dict[str, Any]]] = None
-        self._tool_results_mtime: Optional[float] = None
+        self._tool_results_mtime: Any = None
+        self._tool_requests_cache: Optional[dict[str, dict[str, Any]]] = None
+        self._tool_requests_mtime: Any = None
         # Priced family (grok-4.5 / grok-4.6); None until a session id is seen
         self._pricing_model: Optional[str] = None
         self._models_raw: list[str] = []
@@ -143,7 +154,12 @@ class HierarchyBuilder:
         self._reasonings_cursor = 0
         self._tool_results_cache = None
         self._tool_results_mtime = None
+        self._tool_requests_cache = None
+        self._tool_requests_mtime = None
         self._child_usage_cache = {}
+        self._subagent_ordinal = {}
+        self._subagent_result_n = {}
+        self._subagent_next_n = 0
         # Never carry fork cards / hooks across session dirs
         self._pending_hooks.clear()
         self._pending_recaps.clear()
@@ -152,6 +168,7 @@ class HierarchyBuilder:
 
     def reset(self) -> None:
         self.rounds.clear()
+        self._round_seq = 0
         self._open = None
         self._last_ctx = None
         self._session_peak = None
@@ -170,10 +187,17 @@ class HierarchyBuilder:
         self._reasonings_mtime = None
         self._reasonings_cursor = 0
         self._enc_stamp_sig = None
+        self._tool_results_cache = None
+        self._tool_results_mtime = None
+        self._tool_requests_cache = None
+        self._tool_requests_mtime = None
         self._pricing_model = None
         self._models_raw = []
         self._priced_with = None
         self._child_usage_cache = {}
+        self._subagent_ordinal = {}
+        self._subagent_result_n = {}
+        self._subagent_next_n = 0
         set_pricing_model(None)
         self.revision += 1
 
@@ -289,6 +313,7 @@ class HierarchyBuilder:
                 # Display-only size; never part of billed model In
                 "tokens_est": max(1, count_chars_as_tokens(raw_chars) or 1),
                 "elapsed_ms": elapsed or None,
+                "agent_ms": int(agent_ms) if isinstance(agent_ms, (int, float)) else None,
                 "slot": slot,
                 "to_user": slot in ("user", "to_user"),
                 "display_only": True,
@@ -320,9 +345,13 @@ class HierarchyBuilder:
             r = self._open
             assert r is not None
             r["user_chars"] = int(r.get("user_chars") or 0) + len(text)
+            if isinstance(agent_ms, (int, float)):
+                r["last_user_ms"] = int(agent_ms)
             if text:
-                prev = r.get("user_preview") or ""
-                r["user_preview"] = _preview((prev + text) if prev else text, 160)
+                acc = str(r.get("user_text") or "")
+                if len(acc) < 200_000:
+                    r["user_text"] = acc + text
+                r["user_preview"] = _preview(str(r.get("user_text") or text), 160)
             if prompt_id:
                 r["prompt_id"] = prompt_id
             return
@@ -346,6 +375,10 @@ class HierarchyBuilder:
 
             if kind == "agent_thought_chunk":
                 self._note_ctx(r, step, tt, agent_ms)
+                if isinstance(agent_ms, (int, float)):
+                    if step.get("first_llm_ms") is None:
+                        step["first_llm_ms"] = int(agent_ms)
+                    step["last_llm_ms"] = int(agent_ms)
                 text = _text_of(update)
                 # Always track thought chunks (even empty summary — encrypted lives in history)
                 step["thought_chunks"] = int(step.get("thought_chunks") or 0) + 1
@@ -363,6 +396,10 @@ class HierarchyBuilder:
                     step.setdefault("thought_preview", step.get("thought_preview"))
             elif kind == "agent_message_chunk":
                 self._note_ctx(r, step, tt, agent_ms)
+                if isinstance(agent_ms, (int, float)):
+                    if step.get("first_llm_ms") is None:
+                        step["first_llm_ms"] = int(agent_ms)
+                    step["last_llm_ms"] = int(agent_ms)
                 text = _text_of(update)
                 step["message_chunks"] = int(step.get("message_chunks") or 0) + 1
                 if text:
@@ -398,19 +435,47 @@ class HierarchyBuilder:
             compact_round_inplace(r)
             # After a completed round, cache baseline ≈ real end of last LLM call
             # (not a stale mid-stream under-count). R2+ call1 Cached must resume here.
-            end = r.get("context_end")
-            for s in r.get("model_steps") or []:
-                if isinstance(s, dict) and isinstance(s.get("context_end"), int):
-                    if end is None or s["context_end"] > end:
-                        end = s["context_end"]
-            # Prefer peak if higher (tools may advance past last thought snap)
-            peak = r.get("context_peak")
-            if isinstance(peak, int) and (end is None or peak > end):
-                end = peak
-            if isinstance(end, int):
-                self._cache_baseline = end
-                self._last_ctx = end
-                r["context_end"] = end
+            # After mid-round compact, do NOT max(all step.context_end) — that
+            # restores the pre-compact 180k window as next-round prior.
+            steps = [
+                s for s in (r.get("model_steps") or []) if isinstance(s, dict)
+            ]
+            last_compacts = []
+            if steps:
+                last_compacts = [
+                    c
+                    for c in (steps[-1].get("compacts_after") or [])
+                    if isinstance(c, dict) and c.get("kind") == "compaction"
+                ]
+            mid = bool(r.get("mid_round_compacts")) or bool(last_compacts) or any(
+                isinstance(s.get("compacts_after"), list) and s.get("compacts_after")
+                for s in steps
+            )
+            if mid and last_compacts:
+                after_i = last_compacts[-1].get("tokens_after")
+                if isinstance(after_i, int):
+                    self._cache_baseline = after_i
+                    self._last_ctx = after_i
+                    r["context_after_compact"] = after_i
+            elif mid and steps:
+                end = steps[-1].get("context_end")
+                if isinstance(end, int):
+                    self._cache_baseline = end
+                    self._last_ctx = end
+                    r["context_end"] = end
+            else:
+                end = r.get("context_end")
+                for s in steps:
+                    if isinstance(s.get("context_end"), int):
+                        if end is None or s["context_end"] > end:
+                            end = s["context_end"]
+                peak = r.get("context_peak")
+                if isinstance(peak, int) and (end is None or peak > end):
+                    end = peak
+                if isinstance(end, int):
+                    self._cache_baseline = end
+                    self._last_ctx = end
+                    r["context_end"] = end
             self.rounds.append(r)
             self._prune_rounds()
             self._open = None
@@ -466,6 +531,11 @@ class HierarchyBuilder:
             uh = r.setdefault("user_hooks", [])
             if isinstance(uh, list) and hook not in uh:
                 uh.append(hook)
+            ev = str(hook.get("event_name") or "")
+            ms = hook.get("agent_ms")
+            if ev == "user_prompt_submit" and isinstance(ms, (int, float)):
+                if r.get("user_submit_ms") is None:
+                    r["user_submit_ms"] = int(ms)
             return
         steps = r.get("model_steps") or []
         if steps:
@@ -512,8 +582,9 @@ class HierarchyBuilder:
             if isinstance(prev_end, (int, float)) and isinstance(start_ms, (int, float)):
                 idle_gap_ms = max(0, int(start_ms) - int(prev_end))
 
+        self._round_seq += 1
         self._open = {
-            "index": len(self.rounds) + 1,
+            "index": self._round_seq,
             "prompt_id": prompt_id,
             "turn_start_ms": turn_ms,
             "started_ms": agent_ms,
@@ -647,6 +718,11 @@ class HierarchyBuilder:
         tid = update.get("toolCallId")
         name = _tool_name(update, update_meta) or "tool"
         title = _short_title(update.get("title"))
+        if isinstance(agent_ms, (int, float)):
+            if step.get("first_tool_ms") is None:
+                step["first_tool_ms"] = int(agent_ms)
+            # Declare time — end of LLM emit. Not tool *completion* (execution).
+            step["last_tool_request_ms"] = int(agent_ms)
 
         # First tool declare in this step: jump thought→declare is model_emit
         if step.get("tools_phase_start") is None and isinstance(tt, int):
@@ -742,12 +818,19 @@ class HierarchyBuilder:
             "get_command_or_subagent_output",
             "kill_command_or_subagent",
         ):
-            from token_telemetry.session.subagents import extract_task_ids, parse_subagent_meta
+            from token_telemetry.session.subagents import (
+                extract_resume_from,
+                extract_task_ids,
+                parse_subagent_meta,
+            )
 
             ids = extract_task_ids(raw_in)
             if ids:
                 tool["subagent_ids"] = ids
                 tool["subagent_id"] = ids[0]
+            rf = extract_resume_from(raw_in)
+            if rf:
+                tool["resume_from"] = rf
             meta_s = parse_subagent_meta(
                 raw_in.get("prompt") if isinstance(raw_in, dict) else None
             )
@@ -797,6 +880,9 @@ class HierarchyBuilder:
             tool["status"] = status
         elif title or update.get("kind"):
             tool["status"] = "running"
+        if str(tool.get("status") or "") == "completed" and isinstance(agent_ms, (int, float)):
+            tool["completed_ms"] = int(agent_ms)
+            step["last_tool_ms"] = int(agent_ms)
 
         # Result payload metrics (chars/lines) — more reliable than totalTokens lag
         metrics = _content_metrics(update)
@@ -815,6 +901,7 @@ class HierarchyBuilder:
         ):
             from token_telemetry.session.subagents import (
                 extract_ids_from_text,
+                extract_resume_from,
                 extract_task_ids,
                 parse_subagent_meta,
             )
@@ -825,10 +912,18 @@ class HierarchyBuilder:
                 if ids:
                     tool["subagent_ids"] = ids
                     tool.setdefault("subagent_id", ids[0])
-            blob = tool.get("result_preview") or metrics.get("result_preview") or ""
+                rf = extract_resume_from(raw_in_now)
+                if rf:
+                    tool["resume_from"] = rf
+            from token_telemetry.hierarchy.tools_meta import _wire_content_text_parts
+
             content = update.get("content")
-            if isinstance(content, str) and content.strip():
-                blob = content
+            parts = list(_wire_content_text_parts(content))
+            if isinstance(content, str) and content.strip() and content not in parts:
+                parts.append(content)
+            blob = "\n".join(p for p in parts if p) or (
+                tool.get("result_preview") or metrics.get("result_preview") or ""
+            )
             meta_s = parse_subagent_meta(blob if isinstance(blob, str) else "")
             if not meta_s.get("subagent_id"):
                 ids2 = extract_ids_from_text(blob)
@@ -851,11 +946,11 @@ class HierarchyBuilder:
             tool["offset"] = metrics["offset"]
         if metrics.get("limit") is not None:
             tool["limit"] = metrics["limit"]
-        if metrics.get("arg_chars"):
-            tool["arg_chars"] = max(int(tool.get("arg_chars") or 0), int(metrics["arg_chars"]))
-            tool["arg_tokens_est"] = max(
-                int(tool.get("arg_tokens_est") or 0), int(metrics.get("arg_tokens_est") or 0)
-            )
+        # Args only from first declare — tool_call_update.rawInput often adds
+        # harness fields (variant, is_background) the model never emitted.
+        if metrics.get("arg_chars") and int(tool.get("arg_chars") or 0) <= 0:
+            tool["arg_chars"] = int(metrics["arg_chars"])
+            tool["arg_tokens_est"] = int(metrics.get("arg_tokens_est") or 0)
 
         # Plan (todo_write): refresh create/modify + step statuses from rawIn/rawOut
         raw_in = update.get("rawInput") or {}
@@ -937,8 +1032,14 @@ class HierarchyBuilder:
     def _load_tool_results_fresh(self) -> dict[str, dict[str, Any]]:
         return _load_tool_results_fresh(self)
 
+    def _load_tool_requests_fresh(self) -> dict[str, dict[str, Any]]:
+        return _load_tool_requests_fresh(self)
+
     def _stamp_tool_chat_results(self, tools: list[dict[str, Any]]) -> None:
         return _stamp_tool_chat_results(self, tools)
+
+    def _stamp_tool_chat_args(self, tools: list[dict[str, Any]]) -> None:
+        return _stamp_tool_chat_args(self, tools)
 
     @staticmethod
     def _stamp_step_reasoning(step: dict[str, Any], rs: dict[str, Any]) -> None:

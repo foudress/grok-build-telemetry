@@ -284,7 +284,58 @@ def _wire_content_text_parts(content: Any) -> list[str]:
                 inner = t.get("text") or t.get("content")
                 if isinstance(inner, str) and inner.strip():
                     parts.append(inner)
+                else:
+                    try:
+                        dumped = json.dumps(t, ensure_ascii=False)
+                    except (TypeError, ValueError):
+                        dumped = ""
+                    if dumped.strip():
+                        parts.append(dumped)
+            elif isinstance(t, list) and t:
+                try:
+                    parts.append(json.dumps(t, ensure_ascii=False))
+                except (TypeError, ValueError):
+                    pass
+        elif kind in ("json", "output", "result", "tool_result"):
+            payload = item.get("json") or item.get("content") or item.get("text") or item.get("output")
+            if isinstance(payload, str) and payload.strip():
+                parts.append(payload)
+            elif payload not in (None, "", [], {}):
+                try:
+                    parts.append(json.dumps(payload, ensure_ascii=False))
+                except (TypeError, ValueError):
+                    parts.append(str(payload))
     return parts
+
+
+def _task_output_prompt_body(raw_out: Any) -> Optional[str]:
+    """Parent-facing wait/get_command output (results[].output), not child lifetime."""
+    if not isinstance(raw_out, dict):
+        return None
+    chunks: list[str] = []
+
+    def _one(row: Any) -> None:
+        if not isinstance(row, dict):
+            return
+        out = row.get("output")
+        if isinstance(out, str) and out.strip():
+            chunks.append(out.strip())
+
+    multi = raw_out.get("MultiResult")
+    if isinstance(multi, dict):
+        for row in multi.get("results") or []:
+            _one(row)
+        if chunks:
+            return "\n\n".join(chunks)
+        summary = multi.get("summary")
+        if isinstance(summary, str) and summary.strip():
+            return summary.strip()
+    one = raw_out.get("Result")
+    if isinstance(one, dict):
+        _one(one)
+        if chunks:
+            return "\n\n".join(chunks)
+    return None
 
 
 def _search_replace_prompt_output(raw_out: dict[str, Any]) -> Optional[str]:
@@ -399,6 +450,11 @@ def _primary_raw_payload(raw_out: Any) -> Any:
                 return todos.get("todos")
         return None
 
+    # get_command / wait: parent-facing TaskOutput only (not the child session).
+    task_body = _task_output_prompt_body(raw_out)
+    if task_body:
+        return task_body
+
     # MCP tool result
     if t == "MCP" or raw_out.get("server_name") is not None:
         out = raw_out.get("output")
@@ -504,6 +560,36 @@ def _content_metrics(update: dict[str, Any]) -> dict[str, Any]:
     raw_dump_chars = 0
     if raw_out is not None:
         raw_dump_chars = _json_len(raw_out)
+
+    # Wait / spawn: stream content is often the ACP envelope or empty while
+    # the model re-reads tool_result JSON (tool_call_id + content).
+    name = str(_tool_name(update, update.get("_meta") or {}) or update.get("title") or "")
+    waitish = name in (
+        "get_command_or_subagent_output",
+        "spawn_subagent",
+        "kill_command_or_subagent",
+    ) or "subagent" in name.lower() or "get_command" in name.lower()
+    if text_chars == 0 and waitish and primary is None:
+        env = None
+        if isinstance(content, dict) and (
+            content.get("tool_call_id") or content.get("content") is not None
+        ):
+            env = content
+        elif isinstance(content, str) and content.strip():
+            env = content
+        if env is None and raw_out is not None:
+            env = raw_out
+        if env is not None:
+            if isinstance(env, str):
+                absorb_text(env)
+                content_text = env
+            else:
+                try:
+                    dumped = json.dumps(env, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    dumped = str(env)
+                absorb_text(dumped)
+                content_text = dumped
 
     # If stream content empty (e.g. search_replace only sent UI diff), use
     # primary prompt-facing string (confirmation / error / file body).

@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>call-graph</title>
+  <link rel="stylesheet" href="css/tokens.css" />
+  <link rel="stylesheet" href="css/graph.css" />
+  <style>
+    * { box-sizing: border-box; }
+    html {
+      color-scheme: dark;
+      -webkit-text-size-adjust: 100%;
+      text-size-adjust: 100%;
+      height: 100%;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      min-height: 100dvh;
+      font-family: var(--font-sans);
+      background: var(--bg);
+      color: var(--text);
+      font-size: var(--font-size-base);
+      line-height: var(--line-height-base);
+      -webkit-font-smoothing: antialiased;
+      background-image:
+        radial-gradient(ellipse 120% 80% at 50% -30%, rgba(61, 156, 240, 0.06), transparent 55%),
+        radial-gradient(ellipse 80% 50% at 100% 100%, rgba(62, 207, 142, 0.03), transparent 45%);
+      background-attachment: fixed;
+    }
+    [hidden] { display: none !important; }
+
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px 12px;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--header-border);
+      background: var(--header-bg);
+      -webkit-backdrop-filter: var(--blur-header);
+      backdrop-filter: var(--blur-header);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    header h1 {
+      margin: 0;
+      font-size: var(--font-size-md);
+      font-weight: var(--font-weight-semibold);
+      letter-spacing: var(--tracking-title);
+      line-height: var(--line-height-tight);
+    }
+    .nav {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+      font-size: var(--font-size-sm);
+    }
+    .nav a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+    .nav a[aria-current="page"] {
+      color: var(--text);
+      font-weight: var(--font-weight-semibold);
+    }
+    .nav .dot { color: var(--muted-2); }
+    .meta, .muted { color: var(--muted); font-size: var(--font-size-sm); }
+    .proj-meta {
+      color: var(--text-secondary);
+      font-size: var(--font-size-sm);
+    }
+    .proj-meta b { color: var(--text); font-weight: var(--font-weight-semibold); }
+
+    .badge {
+      font-size: var(--font-size-xs);
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-pill);
+      padding: 2px 8px;
+      background: var(--bg-elevated);
+    }
+    .badge.ok { color: var(--green); border-color: var(--green-border); background: var(--green-soft); }
+    .badge.err { color: var(--rose); border-color: var(--rose-border); background: var(--rose-soft); }
+
+    /* ── Listing ─────────────────────────────────────────────── */
+    #listing main {
+      width: min(100%, 36rem);
+      margin: 0 auto;
+      padding: 12px 16px 40px;
+    }
+    .list-h {
+      margin: 0 0 10px;
+      font-size: var(--font-size-sm);
+      font-weight: var(--font-weight-semibold);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .proj {
+      display: block;
+      text-decoration: none;
+      color: inherit;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      border-radius: var(--radius-md);
+      padding: 12px 14px;
+      margin-bottom: 8px;
+      min-height: 44px;
+      transition: background-color var(--duration-fast) var(--ease-out), border-color var(--duration-fast) var(--ease-out);
+    }
+    .proj:hover { background: var(--panel-hover); border-color: var(--border-strong); }
+    .proj:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+    .proj .name {
+      font-weight: var(--font-weight-semibold);
+      letter-spacing: var(--tracking-tight);
+    }
+    .proj .path {
+      color: var(--muted-2);
+      font-size: var(--font-size-xs);
+      font-family: var(--font-mono);
+      word-break: break-all;
+      margin-top: 2px;
+    }
+    .proj .row {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: var(--font-size-sm);
+    }
+
+    .empty {
+      color: var(--muted-2);
+      font-size: var(--font-size-sm);
+      padding: 24px 8px;
+      text-align: center;
+      line-height: 1.5;
+    }
+
+    /* ── Project column (9:16 primary) ───────────────────────── */
+    body.view-project {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      height: 100dvh;
+      overflow: hidden;
+    }
+    #project {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+    .stage {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+    .graph-host {
+      flex: 1 1 auto;
+      min-height: 48vh;
+      min-height: 48dvh;
+      position: relative;
+    }
+    .overlay {
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      right: 8px;
+      z-index: 4;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      align-items: stretch;
+      pointer-events: none;
+    }
+    .overlay-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      pointer-events: none;
+    }
+    .overlay-bar > * { pointer-events: auto; }
+    .overlay input[type="search"] {
+      flex: 1 1 140px;
+      min-width: 0;
+      min-height: 44px;
+      appearance: none;
+      border: 1px solid var(--border);
+      background: rgba(18, 24, 32, 0.88);
+      color: var(--text);
+      font: 500 12px var(--font-sans);
+      padding: 8px 12px;
+      border-radius: var(--radius-pill);
+    }
+    .overlay input[type="search"]:focus {
+      outline: none;
+      border-color: var(--border-focus);
+      box-shadow: var(--focus-ring);
+    }
+    .overlay button {
+      appearance: none;
+      border: 1px solid var(--border);
+      background: rgba(18, 24, 32, 0.88);
+      color: var(--text-secondary);
+      font: 500 12px var(--font-sans);
+      padding: 8px 12px;
+      border-radius: var(--radius-pill);
+      min-height: 44px;
+      min-width: 44px;
+      cursor: pointer;
+    }
+    .overlay button:hover:not(:disabled) { background: var(--panel-hover); color: var(--text); }
+    .overlay button:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+    .overlay button.on {
+      border-color: var(--accent);
+      color: var(--accent);
+      background: var(--accent-soft);
+    }
+    .overlay button:disabled {
+      opacity: 0.4;
+      cursor: default;
+    }
+    .overlay input[type="range"] {
+      pointer-events: auto;
+      width: 100%;
+      height: 16px;
+      margin: 0;
+      padding: 0;
+      accent-color: var(--accent);
+      background: transparent;
+      cursor: pointer;
+    }
+    .overlay input[type="range"]:disabled {
+      opacity: 0.4;
+      cursor: default;
+    }
+    .badge.replay {
+      color: var(--accent);
+      border-color: var(--accent);
+      background: var(--accent-soft);
+      cursor: pointer;
+    }
+    .chip {
+      font-size: var(--font-size-2xs);
+      color: var(--muted);
+      padding: 4px 8px;
+      pointer-events: none;
+    }
+    .empty-overlay {
+      position: absolute;
+      inset: 0;
+      z-index: 3;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--muted-2);
+      font-size: var(--font-size-sm);
+      pointer-events: none;
+      text-align: center;
+      padding: 48px 16px 16px;
+    }
+
+    .sessions-pane {
+      flex: 0 0 auto;
+      max-height: 28vh;
+      max-height: 28dvh;
+      overflow-y: auto;
+      overflow-x: hidden;
+      border-top: 1px solid var(--border);
+      background: var(--bg-elevated);
+      padding: 10px 12px 16px;
+    }
+    .sessions-pane h2 {
+      margin: 0 0 8px;
+      font-size: var(--font-size-sm);
+      font-weight: var(--font-weight-semibold);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .sess {
+      border: 1px solid var(--border);
+      background: var(--panel);
+      border-radius: var(--radius-md);
+      padding: 10px 12px;
+      margin-bottom: 8px;
+      min-height: 44px;
+      cursor: pointer;
+    }
+    .sess:hover { background: var(--panel-hover); }
+    .sess:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+    .sess.is-on {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }
+    .sess .row {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: baseline;
+    }
+    .sess .title {
+      font-weight: var(--font-weight-semibold);
+      overflow-wrap: anywhere;
+    }
+    .sess .age { color: var(--muted); font-size: var(--font-size-xs); flex-shrink: 0; }
+    .sess .sub {
+      margin-top: 4px;
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: center;
+    }
+    .kind {
+      font-size: var(--font-size-2xs);
+      font-weight: var(--font-weight-semibold);
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      border-radius: var(--radius-xs);
+      padding: 1px 6px;
+      background: var(--panel-active);
+      color: var(--muted);
+    }
+    .kind.sub { background: var(--violet-soft); color: var(--violet); }
+    .cost { color: var(--green); font-variant-numeric: tabular-nums; font-size: var(--font-size-xs); }
+    .open-tel {
+      appearance: none;
+      border: 0;
+      background: none;
+      color: var(--accent);
+      font: 500 11px var(--font-sans);
+      padding: 4px 0;
+      min-height: 32px;
+      cursor: pointer;
+      text-decoration: none;
+    }
+    .open-tel:hover { text-decoration: underline; }
+
+    @media (min-width: 1100px) and (min-aspect-ratio: 4/3) {
+      .stage { flex-direction: row; }
+      .graph-host { min-height: 0; }
+      .sessions-pane {
+        max-height: none;
+        width: 280px;
+        flex: 0 0 280px;
+        border-top: 0;
+        border-left: 1px solid var(--border);
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .proj, .overlay button { transition: none; }
+    }
+  </style>
+</head>
+<body>
+  <div id="listing">
+    <header>
+      <nav class="nav">
+        <a href="/">telemetry</a>
+        <span class="dot">·</span>
+        <a href="/history">history</a>
+        <span class="dot">·</span>
+        <a href="/graph" aria-current="page">graph</a>
+      </nav>
+      <h1>projects</h1>
+      <span id="listBadge" class="badge">connecting…</span>
+    </header>
+    <main>
+      <h2 class="list-h">Workspaces <span id="projCount" class="muted"></span></h2>
+      <div id="projects"></div>
+    </main>
+  </div>
+
+  <div id="project" hidden>
+    <header>
+      <nav class="nav">
+        <a href="/">telemetry</a>
+        <span class="dot">·</span>
+        <a href="/history">history</a>
+        <span class="dot">·</span>
+        <a href="/graph" aria-current="page">graph</a>
+      </nav>
+      <span id="projMeta" class="proj-meta">—</span>
+      <span id="liveBadge" class="badge">connecting…</span>
+    </header>
+    <div class="stage">
+      <div class="graph-host" id="host">
+        <canvas id="g" class="graph-canvas"></canvas>
+        <div class="overlay">
+          <div class="overlay-bar">
+            <input type="search" id="search" placeholder="search files" autocomplete="off" spellcheck="false" aria-label="Search files" />
+            <button type="button" id="fit" title="Fit (f)">Fit</button>
+            <button type="button" id="pause" title="Pause (space)">Pause</button>
+            <button type="button" id="rescan" title="Rescan repo">Rescan</button>
+            <button type="button" id="play" disabled title="no replay">Replay</button>
+            <button type="button" id="speed" disabled title="Replay speed 1×">1×</button>
+            <span id="matchChip" class="chip" hidden></span>
+          </div>
+          <input type="range" id="scrub" min="0" max="0" value="0" step="1" disabled aria-label="Replay position" />
+        </div>
+        <div id="emptyOverlay" class="empty-overlay" hidden>no files</div>
+      </div>
+      <aside class="sessions-pane">
+        <h2>Sessions <span id="sessCount" class="muted"></span></h2>
+        <div id="sessions"></div>
+      </aside>
+    </div>
+  </div>
+
+  <script src="/vendor/d3.min.js"></script>
+  <script type="module" src="js/graph-page.js"></script>
+</body>
+</html>

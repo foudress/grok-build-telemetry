@@ -1,0 +1,84 @@
+/* Call-graph canvas — host, bitmap, tooltip. Colors from tokens.css. */
+
+.graph-host {
+  position: relative;
+  overflow: hidden;
+  background: var(--bg);
+  min-height: 180px;
+  isolation: isolate;
+}
+
+/* Override dashboard `canvas { height: 240px }` — engine owns bitmap size. */
+.graph-host canvas.graph-canvas,
+canvas.graph-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: 180px;
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+canvas.graph-canvas.is-panning,
+canvas.graph-canvas.is-dragging {
+  cursor: grabbing;
+}
+
+canvas.graph-canvas.is-over-node {
+  cursor: pointer;
+}
+
+.graph-tip {
+  position: absolute;
+  z-index: 8;
+  pointer-events: none;
+  max-width: 280px;
+  padding: 6px 8px 7px;
+  border-radius: var(--radius-md, 8px);
+  border: 1px solid var(--border, #1e2a38);
+  background: var(--panel, #121820);
+  color: var(--text, #e6edf3);
+  box-shadow: var(--shadow-tip, 0 6px 20px rgba(0, 0, 0, 0.5));
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: var(--font-size-2xs, 10px);
+  line-height: 1.35;
+  letter-spacing: 0.01em;
+  opacity: 0;
+  transform: translateY(4px);
+  transition:
+    opacity var(--duration-fast, 100ms) var(--ease-out, ease),
+    transform var(--duration-fast, 100ms) var(--ease-out, ease);
+}
+
+.graph-tip.is-visible {
+  opacity: 1;
+  transform: none;
+}
+
+.graph-tip .path {
+  color: var(--text, #e6edf3);
+  word-break: break-all;
+  font-weight: var(--font-weight-medium, 500);
+}
+
+.graph-tip .meta {
+  margin-top: 3px;
+  color: var(--muted, #8b9cb3);
+  font-family: var(--font-sans, system-ui, sans-serif);
+  font-size: var(--font-size-2xs, 10px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .graph-tip {
+    transition-duration: 80ms;
+    transform: none;
+  }
+}

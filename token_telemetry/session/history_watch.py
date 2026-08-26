@@ -19,6 +19,7 @@ from token_telemetry.session.discover import (
     _read_session_summary,
     format_age,
     list_session_dirs,
+    session_has_usage,
 )
 
 
@@ -519,6 +520,10 @@ class HistoryWatcher:
         dated.sort(key=lambda t: t[0], reverse=True)
         for _mtime, session_dir, path in dated:
             sid = session_dir.name
+            if not session_has_usage(session_dir):
+                with self.lock:
+                    self.sessions.pop(sid, None)
+                continue
             try:
                 st = path.stat()
             except OSError:

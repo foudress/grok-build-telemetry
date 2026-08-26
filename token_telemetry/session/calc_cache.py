@@ -1,7 +1,9 @@
 """On-disk calc cache for closed sessions (attr events + aggregate rows).
 
-Invalidates when ``updates.jsonl`` or ``summary.json`` mtime/size change.
-User reset wipes the folder + in-memory maps (callers).
+Invalidates when ``updates.jsonl`` / ``summary.json`` change **or** accounting
+source files change (else old sessions stay frozen after a code edit).
+User reset wipes the folder + in-memory maps; the live tree is rebuilt by
+``SessionMonitor.rebuild_current``.
 """
 
 from __future__ import annotations
@@ -13,10 +15,40 @@ import threading
 from pathlib import Path
 from typing import Any, Optional
 
-CACHE_VER = 1
+CACHE_VER = 26
 CACHE_DIR = Path.home() / ".grok" / "token-telemetry" / "calc-cache"
 
 _lock = threading.Lock()
+_PKG = Path(__file__).resolve().parent.parent
+_CODE_FILES = (
+    "session/calc_cache.py",
+    "hierarchy/builder.py",
+    "hierarchy/bootstrap.py",
+    "hierarchy/tools_meta.py",
+    "hierarchy/gen_rate.py",
+    "hierarchy/finalize.py",
+    "hierarchy/cache_miss.py",
+    "hierarchy/recap_compact.py",
+    "pricing/reconstruct.py",
+    "session/period_attr.py",
+    "session/aggregate.py",
+    "session/monitor.py",
+    "session/subagents.py",
+)
+_code_sig: Optional[str] = None
+
+
+def code_sig() -> str:
+    """Cheap mtime/size stamp of accounting sources (process-cached)."""
+    global _code_sig
+    if _code_sig is not None:
+        return _code_sig
+    parts: list[str] = []
+    for rel in _CODE_FILES:
+        m, s = _stat_pair(_PKG / rel)
+        parts.append(f"{rel}:{m}:{s}")
+    _code_sig = "|".join(parts)
+    return _code_sig
 
 
 def _stat_pair(path: Path) -> tuple[float, int]:
@@ -37,6 +69,7 @@ def fingerprint(session_dir: Path) -> dict[str, Any]:
         "u_size": us,
         "s_mtime": sm,
         "s_size": ss,
+        "code": code_sig(),
     }
 
 
@@ -55,6 +88,7 @@ def _fp_match(blob: dict[str, Any], fp: dict[str, Any]) -> bool:
         and blob.get("u_size") == fp.get("u_size")
         and blob.get("s_mtime") == fp.get("s_mtime")
         and blob.get("s_size") == fp.get("s_size")
+        and blob.get("code") == fp.get("code")
     )
 
 
@@ -102,9 +136,11 @@ def save_calc(session_dir: Path, **fields: Any) -> None:
 
 def reset_all_calcs() -> int:
     """Wipe disk + in-memory period/aggregate caches."""
+    global _code_sig
     from token_telemetry.session.aggregate import clear_file_mem
     from token_telemetry.session.period_attr import clear_attr_mem
 
+    _code_sig = None
     clear_attr_mem()
     clear_file_mem()
     return clear_calc_cache()

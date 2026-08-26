@@ -97,7 +97,8 @@
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   gap: var(--space-2);
-  grid-column: 1 / -1;
+  flex: 0 0 auto;
+  width: 100%;
 }
 
 @media (max-width: 900px) {
@@ -120,6 +121,87 @@
     border-color var(--duration-fast) var(--ease-out),
     box-shadow var(--duration-normal) var(--ease-out),
     background-color var(--duration-fast) var(--ease-out);
+}
+
+/* Official cost card: transparent shell; chrome lives on faces so the whole card flips */
+.card.card-flip {
+  cursor: pointer;
+  perspective: 1200px;
+  padding: 0;
+  min-height: 5.5rem;
+  overflow: visible;
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+.card.card-flip::before { display: none; }
+.card.card-flip:hover {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+.card-flip.card-flip-off { cursor: default; }
+
+.card-flip .card-flip-inner {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 5.5rem;
+  transform-style: preserve-3d;
+  transition: transform 0.55s var(--ease-out, cubic-bezier(0.2, 0.8, 0.2, 1));
+}
+/* Hover tilt + flip share one transform so border/faces stay glued together */
+.card-flip:not(.card-flip-off):not(.is-flipped):hover .card-flip-inner {
+  transform: rotateY(-8deg) rotateX(3deg);
+}
+.card-flip.is-flipped .card-flip-inner {
+  transform: rotateY(180deg);
+}
+.card-flip.is-flipped:not(.card-flip-off):hover .card-flip-inner {
+  transform: rotateY(172deg) rotateX(3deg);
+}
+
+.card-flip .card-face {
+  position: absolute;
+  inset: 0;
+  padding: var(--space-3) var(--space-3) var(--space-3) var(--space-4);
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+  border-radius: var(--radius-lg);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-xs);
+  overflow: hidden;
+  transition:
+    border-color var(--duration-fast) var(--ease-out),
+    box-shadow var(--duration-normal) var(--ease-out),
+    background-color var(--duration-fast) var(--ease-out);
+}
+.card-flip .card-face::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--green);
+  border-radius: 3px 0 0 3px;
+  opacity: 0.85;
+}
+.card-flip:not(.card-flip-off):hover .card-face {
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-sm);
+  background: var(--panel-hover);
+}
+.card-flip .card-face-front {
+  transform: rotateY(0deg) translateZ(1px);
+}
+.card-flip .card-face-back {
+  transform: rotateY(180deg) translateZ(1px);
+}
+@media (prefers-reduced-motion: reduce) {
+  .card-flip:not(.card-flip-off):hover .card-flip-inner { transform: none; }
+  .card-flip.is-flipped:not(.card-flip-off):hover .card-flip-inner { transform: rotateY(180deg); }
 }
 
 /* Left accent bar for metric identity */
@@ -210,6 +292,17 @@ body.scope-period #kpi1Progress { display: none; }
     box-shadow var(--duration-normal) var(--ease-out);
 }
 
+/* Collapsed = title strip only (override default min-height 220). */
+.panel.is-collapsed {
+  min-height: 0;
+  padding-top: var(--space-2);
+  padding-bottom: var(--space-2);
+}
+.panel.is-collapsed .panel-head,
+.panel.is-collapsed .cost-panel-head {
+  margin-bottom: 0;
+}
+
 .panel:hover {
   border-color: var(--border-strong);
   box-shadow: var(--shadow-sm);
@@ -235,22 +328,56 @@ body.scope-period #kpi1Progress { display: none; }
   opacity: 0.9;
 }
 
-.panel.tree-panel,
-.panel.meta-panel {
-  grid-column: 1 / -1;
+.panel.tree-panel {
+  /* Session: size to content; shrink (scroll inside) if it hits the viewport bottom. */
+  flex: 0 1 auto;
+  min-height: 0; /* override .panel 220 — do not stretch empty space */
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-self: stretch;
+}
+
+/* Session: always stack Context above Cost (never side-by-side on wide screens). */
+#ctxPanel,
+#costPanel {
+  flex: 0 0 auto;
+  width: 100%;
+  min-height: 0;
+}
+
+.panel-head-toggle {
+  cursor: pointer;
+  user-select: none;
+}
+.panel-head-toggle h2 {
+  pointer-events: none;
+}
+.panel.is-collapsed > :not(.panel-head) {
+  display: none !important;
+}
+.panel.is-collapsed .panel-head h2::before {
+  content: "▸ ";
+  color: var(--muted);
+  font-weight: var(--font-weight-medium);
+}
+.panel:not(.is-collapsed) .panel-head-toggle h2::before {
+  content: "▾ ";
+  color: var(--muted);
+  font-weight: var(--font-weight-medium);
 }
 
 body.scope-period #ctxPanel,
 body.scope-period #sessionChartToolbar,
 body.scope-period #taskTabs,
-body.scope-period .meta-panel,
 body.scope-period .tree-toolbar {
   display: none !important;
 }
 
-body.scope-period #costPanel,
+/* Period Sessions: same as Round Hierarchy — content height, cap at viewport bottom. */
 body.scope-period .tree-panel {
-  grid-column: 1 / -1;
+  flex: 0 1 auto;
+  min-height: 0;
 }
 
 body.scope-period #costChart {
@@ -262,6 +389,9 @@ body.scope-period #costChart {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow: auto;
 }
 
 .sess-row {
@@ -344,16 +474,13 @@ body.scope-period #costChart {
   .sess-row.is-sub { margin-left: 16px; }
 }
 
-.panel.meta-panel {
-  min-height: 0;
-}
-
 .panel-head {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2) var(--space-4);
   margin: 0 0 var(--space-3);
+  flex: 0 0 auto;
 }
 
 .panel-head h2 {
@@ -516,21 +643,6 @@ body.scope-period #costChart {
   pointer-events: none;
 }
 
-.meta-panel > summary {
-  list-style: none;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
-}
-
-.meta-panel > summary::-webkit-details-marker { display: none; }
-.meta-panel > summary h2 { margin: 0; flex: 0 1 auto; }
-.meta-panel > summary h2::after { display: none; }
-.meta-panel[open] > summary { margin-bottom: var(--space-3); }
-
-.meta-panel .split .meta { line-height: 1.7; }
-
 /* ── Progress bar ───────────────────────────────────────────── */
 .progress {
   height: 6px;
@@ -599,7 +711,10 @@ body.scope-period #costChart {
 
 /* ── Tree hierarchy ─────────────────────────────────────────── */
 .tree {
-  max-height: min(78vh, 920px);
+  /* Content-sized; parent flex shrink caps it against the viewport bottom. */
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: none;
   max-width: 100%;
   width: 100%;
   min-width: 0;
@@ -616,6 +731,11 @@ body.scope-period #costChart {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
+}
+
+body.scope-period .tree,
+body.scope-period .sess-list {
+  flex: 0 1 auto;
 }
 
 .tree details.round,
@@ -961,6 +1081,7 @@ body.scope-period #costChart {
 .tree .tag.phase-llm { color: var(--cat-phase-llm); }
 .tree .tag.phase-harness { color: var(--cat-phase-harness); }
 .tree .tag.compact { color: var(--cat-compact); }
+.tree .tag.compact-auto { color: var(--cat-compact); }
 .tree .tag.recap { color: #7ec8e3; }
 .tree .tag.system { color: var(--cat-system); }
 .tree .tag.hook { color: var(--cat-hook); }
@@ -1091,6 +1212,21 @@ body.scope-period #costChart {
   color: var(--rose);
   font-weight: var(--font-weight-semibold);
   font-size: var(--font-size-sm);
+  padding: 6px var(--space-2);
+  border-radius: var(--radius-sm);
+}
+
+.tree .usage-line:has(+ .usage-line.warn-restart) {
+  margin-bottom: 0;
+  border-bottom: none;
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.tree .usage-line + .usage-line.warn-restart {
+  margin-top: 0;
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
 }
 
 .tree .usage-line.warn-restart .tag.warn,

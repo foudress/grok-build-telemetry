@@ -56,16 +56,11 @@ function ensureSessionDd(sel) {
 
 function fillSessionSelect(state) {
   const sel = $("sessionSelect");
-  const pinHint = $("sessionPinHint");
   if (!sel) return;
   const sessions = state.sessions || [];
   const current = state.session_id || "";
   const pinned = state.pinned_session_id || null;
   const follow = state.follow_active !== false && !pinned;
-  if (pinHint) {
-    pinHint.hidden = !pinned;
-    pinHint.textContent = pinned ? "pinned" : "";
-  }
   const ageBucket = (s) => {
     const a = s.age_seconds != null ? Number(s.age_seconds) : 0;
     if (a < 60) return "s";

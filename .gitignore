@@ -25,6 +25,15 @@ out/
 !/test/test_period_attr.py
 !/test/test_calc_cache.py
 !/test/test_tool_result_body.py
+!/test/test_mid_round_compact.py
+!/test/test_gen_rate.py
+!/test/test_tokz_prefix_kv_miss.py
+!/test/test_features.py
+!/test/test_prev_llm_continuity.py
+!/test/test_graph_scan.py
+!/test/test_graph_projects.py
+!/test/test_graph_activity.py
+!/test/test_graph_api.py
 
 # Maintainer session notes (not required for install)
 .grok/

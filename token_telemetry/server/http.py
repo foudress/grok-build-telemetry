@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
+from token_telemetry import features as feat
+from token_telemetry.graph import api as graph_api
 from token_telemetry.session.aggregate import build_aggregate
 from token_telemetry.session.discover import list_sessions_for_ui
 from token_telemetry.session.history_watch import WATCHER
@@ -19,6 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DASHBOARD_DIR = REPO_ROOT / "dashboard"
 DASHBOARD_HTML = DASHBOARD_DIR / "index.html"
 HISTORY_HTML = DASHBOARD_DIR / "history.html"
+GRAPH_HTML = DASHBOARD_DIR / "graph.html"
 
 # Static dashboard assets (css/, js/, …) under DASHBOARD_DIR only
 _STATIC_MIME = {
@@ -59,6 +62,13 @@ class Handler(BaseHTTPRequestHandler):
         except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError):
             return
 
+    def _send_gated(self, surface: str) -> None:
+        body = json.dumps(
+            {"ok": False, "gated": True, "surface": surface, "note": feat.WIP_NOTE},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        self._send(503, body, "application/json; charset=utf-8")
+
     def do_OPTIONS(self) -> None:  # noqa: N802
         self._send(204, b"", "text/plain")
 
@@ -97,10 +107,27 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, data, "text/html; charset=utf-8")
             return
         if path in ("/history", "/history.html"):
+            if not feat.MUTATION_HISTORY:
+                self._send(200, feat.wip_html("Mutation History"), "text/html; charset=utf-8")
+                return
             if not HISTORY_HTML.is_file():
                 self._send(500, b"dashboard/history.html missing", "text/plain")
                 return
             data = HISTORY_HTML.read_bytes()
+            self._send(200, data, "text/html; charset=utf-8")
+            return
+        if path in ("/graph", "/graph.html"):
+            if not feat.AGENT_ANIMATION_GRAPH:
+                self._send(
+                    200,
+                    feat.wip_html("Agent Animation Graph"),
+                    "text/html; charset=utf-8",
+                )
+                return
+            if not GRAPH_HTML.is_file():
+                self._send(500, b"dashboard/graph.html missing", "text/plain")
+                return
+            data = GRAPH_HTML.read_bytes()
             self._send(200, data, "text/html; charset=utf-8")
             return
         if path == "/api/state":
@@ -123,6 +150,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, b'{"ok":true}', "application/json")
             return
         if path == "/api/history":
+            if not feat.MUTATION_HISTORY:
+                body = json.dumps(
+                    {"ok": False, "gated": True, "note": feat.WIP_NOTE},
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                self._send(503, body, "application/json; charset=utf-8")
+                return
             body = json.dumps(WATCHER.snapshot(), ensure_ascii=False).encode("utf-8")
             self._send(200, body, "application/json; charset=utf-8")
             return
@@ -131,16 +165,54 @@ class Handler(BaseHTTPRequestHandler):
             period = (qs.get("period") or ["daily"])[0]
             grain = (qs.get("grain") or ["day"])[0]
             stack = (qs.get("stack") or ["io"])[0]
+            rate_raw = (qs.get("rate") or ["0"])[0]
+            rate = str(rate_raw).strip().lower() in ("1", "true", "yes", "on")
             try:
                 offset = int((qs.get("offset") or ["0"])[0])
             except ValueError:
                 offset = 0
             try:
-                payload = build_aggregate(period, offset, grain, stack=stack)
+                payload = build_aggregate(period, offset, grain, stack=stack, rate=rate)
             except Exception as exc:  # noqa: BLE001
                 payload = {"error": f"{type(exc).__name__}: {exc}"}
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self._send(200, body, "application/json; charset=utf-8")
+            return
+        if path.startswith("/api/graph"):
+            if not feat.AGENT_ANIMATION_GRAPH:
+                self._send_gated("agent_animation_graph")
+                return
+        if path == "/api/graph/projects":
+            body = json.dumps(graph_api.projects_payload(), ensure_ascii=False).encode(
+                "utf-8"
+            )
+            self._send(200, body, "application/json; charset=utf-8")
+            return
+        if path == "/api/graph/sessions":
+            qs = parse_qs(urlparse(self.path).query)
+            status, payload = graph_api.sessions_payload((qs.get("root") or [""])[0])
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self._send(status, body, "application/json; charset=utf-8")
+            return
+        if path == "/api/graph/activity":
+            qs = parse_qs(urlparse(self.path).query)
+            root = (qs.get("root") or [""])[0]
+            sid = (qs.get("session_id") or [""])[0] or None
+            status, payload = graph_api.activity_payload(root, sid)
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self._send(status, body, "application/json; charset=utf-8")
+            return
+        if path == "/api/graph/replay":
+            qs = parse_qs(urlparse(self.path).query)
+            status, payload = graph_api.replay_payload((qs.get("root") or [""])[0])
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self._send(status, body, "application/json; charset=utf-8")
+            return
+        if path == "/api/graph":
+            qs = parse_qs(urlparse(self.path).query)
+            status, payload = graph_api.graph_payload((qs.get("root") or [""])[0])
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self._send(status, body, "application/json; charset=utf-8")
             return
         # Static assets: /css/*, /js/*, and other files under dashboard/
         if path.startswith("/css/") or path.startswith("/js/") or (
@@ -181,8 +253,33 @@ class Handler(BaseHTTPRequestHandler):
             from token_telemetry.session.calc_cache import reset_all_calcs
 
             n = reset_all_calcs()
-            body = json.dumps({"ok": True, "cleared": n}, ensure_ascii=False).encode("utf-8")
+            rebuilt = MONITOR.rebuild_current()
+            body = json.dumps(
+                {"ok": True, "cleared": n, **rebuilt},
+                ensure_ascii=False,
+            ).encode("utf-8")
             self._send(200, body, "application/json; charset=utf-8")
+            return
+        if path == "/api/graph/rescan":
+            if not feat.AGENT_ANIMATION_GRAPH:
+                self._send_gated("agent_animation_graph")
+                return
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                n = 0
+            raw = self.rfile.read(n) if n > 0 else b"{}"
+            try:
+                data = json.loads(raw.decode("utf-8") or "{}")
+            except json.JSONDecodeError:
+                self._send(400, b'{"error":"invalid json"}', "application/json")
+                return
+            root = data.get("root") if isinstance(data, dict) else None
+            if not isinstance(root, str):
+                root = ""
+            status, payload = graph_api.rescan_payload(root)
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self._send(status, body, "application/json; charset=utf-8")
             return
         self._send(404, b"not found", "text/plain")
 

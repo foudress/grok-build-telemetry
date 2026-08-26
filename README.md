@@ -2,7 +2,7 @@
 
 Live companion dashboard for **[Grok Build](https://x.ai)** sessions: exact token fields Grok already writes, cache vs uncached split, official `$` ticks, and list-price estimates — outside the TUI.
 
-> Package name on PyPI-style installs: `token-telemetry` (`pip install -e .` / `token-telemetry` CLI).
+> Package: `token-telemetry` **v1.0.0** (`pip install -e .` / `token-telemetry` CLI).
 
 ```
 ~/.grok/sessions/.../updates.jsonl  ──tail──►  live dashboard  ──►  http://127.0.0.1:8765/
@@ -12,19 +12,32 @@ Live companion dashboard for **[Grok Build](https://x.ai)** sessions: exact toke
 
 - **Context size** live (`_meta.totalTokens` + `signals.json`)
 - **Official $** from `costUsdTicks` (1 USD = 10¹⁰ ticks)
-- **Estimate $** from published xAI rates (≤200k / >200k); **model-aware cache** (4.5 vs 4.6)
+- **Estimate $** from published xAI rates (≤200k / >200k); **model-aware cache** (4.5 vs 4.6). Session estimate = parent rounds + each sub-agent tab (one `$` per agent, not spawn+resume)
 - **Round tree** — user / system / tools / thoughts with In · Cached · Out · $ (Standard / Expert density). Recap / Compact / System ledgers right-pad like Round heads. Recaps and compacts sit in trigger order (`agent_ms`)
 - **System card** — history parts (system / user info / reminders / MCP) plus one **Tool definitions + Message** bucket so `System + R1 In = context_end` (not a hardcoded 8.2k, not official `Σ uncached`)
 - **Per-call cache** — last LLM call Cached = 0 (no harness after it). R1 ctx line is `0 → end`. R1 official Cached is shared across every call except last (Call 1 = System + User)
 - **Compact / Recap** — compact is Cached **or** In (miss) plus compressed **Out**; recaps and compacts keep trigger order. Compact continuation glue is not treated as the first user prompt
 - **Cost chart** — **I/O · Parts · Tools** stacks on rounds, drill, or **By label**. Recap stays In/Cached/Out in I/O; Parts/Tools fold it. Wheel-zoom only on the X-axis (full unzoom by default). Sub-agent $ stacks on the parent (violet)
-- **Daily / Weekly / Monthly** — same I/O · Parts · Tools. Parts/Tools use our hierarchy cats, bucketed by each turn’s time (not the whole session). Timeframe / grain apply to Time layout only. Session list is parent → sub-agent. Titles come from `summary.json` `session_summary` (UTF-8 BOM-safe). **Hourglass** is a Gantt of duration (LLM/harness vs wait-for-user), with time-window zoom, pan, and drill-select. **← Back** returns from a session opened out of a period. Closed sessions are **cached on disk** so period reloads skip hierarchy replay; **Reset calc** in the header forces a full recompute.
-- Session picker shows the summary title (not the UUID) in the header.
-- **History watch** — `http://127.0.0.1:8765/history` tails `chat_history.jsonl` for prefix mutations vs append (cache-miss risk)
-- **Sub-agents** — child sessions are peeled out of the parent LLM-call math, then shown as tabs + Sub Agent N rows (In / Cached / Out / $). First-round prompt is **Super Agent** (not User). Period totals skip child dirs (parent bill already includes them)
+- **Daily / Weekly / Monthly** — same I/O · Parts · Tools. Parts/Tools use our hierarchy cats, bucketed by each turn’s time (not the whole session). Timeframe / Cumulative / **Normalized**; grains including **Session**. Session list is parent → sub-agent. Titles from `summary.json` `session_summary` (UTF-8 BOM-safe). **← Back** returns from a session opened out of a period. Closed sessions are **cached on disk**; **Reset calc** forces a full recompute
+- Session picker shows the summary title (not the UUID) in the header
+- **Sub-agents** — child sessions are peeled out of the parent LLM-call math, then shown as tabs + Sub Agent N rows (In / Cached / Out / $). **Sub Agent N Sys** sits after the spawn LLM (In = copy of that tab’s System header; display-only, not Round 2 In). Click the line to open the tab; **Sub Agent N RN** opens Round N. `get_command` In is the parent-facing tool_result body. First-round prompt is **Super Agent** (not User / not System Other), including resume tabs. Period totals skip child dirs (parent bill already includes them)
 - **Context over time** chart (200k rate-cliff line) — Session view only
 - Header **KV** chip (warm / stale idle / miss) + context pressure bar
 - Latency & tools from `signals.json`
+
+### Gated (in tree — polish/debug)
+
+These surfaces ship in the codebase but are **off by default** for v1.0.0 UI. Flip flags in `token_telemetry/features.py` and `dashboard/js/features.js` to re-enable:
+
+| Surface | What it is |
+|---------|------------|
+| **Mutation History** | `/history` — tails `chat_history.jsonl` for prefix mutations vs append |
+| **Gantt (hourglass)** | Period ⌛ timeline of session duration (work vs wait) |
+| **Tok/s** | Tokens-per-second charts (session Context + period) |
+| **Agent Animation Graph** | `/graph` + session Context **Graph** mode (file activity animation) |
+| **Period I/O $/M** | Daily/Weekly/Monthly step chart of estimated In/Cached/Out `$` per 1M tokens |
+
+Direct hits to gated pages show a short polish/debug note; gated APIs return `503` with `{ "gated": true }`.
 
 ## Requirements
 
@@ -32,18 +45,27 @@ Live companion dashboard for **[Grok Build](https://x.ai)** sessions: exact toke
 - Grok Build sessions on this machine (`~/.grok/sessions/`)
 - Optional but recommended: `transformers` + local Grok-2 tokenizer under `vendor/grok-2-tokenizer/` (offline weights for In/Out pro-rata). Falls back to bytes÷4 if unavailable.
 
-## Install
+## Install (Grok Build — one line)
+
+Paste in Grok Build (agent follows the doc):
+
+```text
+Follow https://github.com/foudress/grok-build-telemetry/blob/main/docs/install.md exactly.
+```
+
+Works on **Windows, macOS, and Linux**. Clones (if needed), creates `.venv`, `pip install -e .`, and installs **`/telemetry`** under `~/.grok/skills/telemetry/`.
+
+Manual equivalent: [docs/install.md](docs/install.md).
 
 ```bash
 git clone https://github.com/foudress/grok-build-telemetry.git
 cd grok-build-telemetry
-python -m venv .venv
-# Windows: .venv\Scripts\activate
-# Unix:    source .venv/bin/activate
-pip install -e .
+python3 bootstrap_install.py   # or: python bootstrap_install.py
 ```
 
 ## Run
+
+**From Grok Build:** end your first prompt with **`/telemetry`**, or run `/telemetry` alone. The agent kills anything on port **8765**, starts a clean dashboard, opens the browser, then continues your prompt.
 
 ```bash
 token-telemetry
@@ -51,11 +73,12 @@ token-telemetry
 python -m token_telemetry
 ```
 
-Windows helper (same process):
+Launcher (used by `/telemetry`):
 
-```powershell
-.\launch_dashboard.ps1
-# optional: .\launch_dashboard.ps1 -Port 8765 -SessionId <uuid>
+```bash
+python3 launch_dashboard.py              # foreground (Ctrl+C)
+python3 launch_dashboard.py --detached   # background
+# optional: --port 8765 --session-id <uuid> --no-open
 ```
 
 Legacy (no install):
@@ -82,7 +105,7 @@ List rates (docs.x.ai). Session model is read from `signals.modelsUsed` / `_meta
 - `$ ≈ uncached×input + cache×cache_rate + output×out`
 - **Tier** is per LLM call from `context_start` (not multi-call sum)
 - Reasoning is **not** billed on top of output (`totalTokens ≈ input+output` in logs)
-- Attribution Out: `Reasoning Enc + LLM→Harness + LLM→User = official Out` (Thought TokZ is a summary line; leftover Out is inside Enc)
+- Attribution Out: `Reasoning (Thought+Enc) + LLM→Harness + LLM→User = official Out` (tree still shows Thought and Enc as separate lines)
 - Official server `$` is `costUsdTicks / 10¹⁰`. List-rate estimate can diverge when the harness stamps a different internal scale; both cards are shown
 
 ## Data source
@@ -132,18 +155,25 @@ Writes `out/<session-id>-events.jsonl` and summary JSON.
 token_telemetry/                 # installable package
   __main__.py                    # token-telemetry / python -m token_telemetry
   live_dashboard.py              # CLI wiring (session monitor + HTTP server)
+  features.py                    # UI/API feature gates (History/Gantt/tok/s/Graph/I/O $/M)
   tokenizer.py                   # offline token weights
   hierarchy/                     # session reconstruction (bootstrap, builder, …)
   pricing/                       # list rates + usage reconstruct
   session/                       # discovery, live tail, period aggregate
+  graph/                         # agent animation graph (gated)
   server/                        # local HTTP API + static files
+bootstrap_install.py             # venv + pip install -e . + /telemetry skill
+install_skills.py                # copy skills/telemetry → ~/.grok/skills
+launch_dashboard.py              # kill :8765 + clean start (used by /telemetry)
+skills/telemetry/                # Grok Build slash skill source
+docs/install.md                  # OS-independent one-line install procedure
 scripts/                         # thin shims → token_telemetry.* (legacy imports)
   extract_session_events.py      # offline batch extract
   live_dashboard.py, hierarchy.py, pricing.py, tokenizer.py
 dashboard/                       # zero-build UI
-  index.html
-  css/                           # tokens, layout, components, charts
-  js/                            # main, tree, charts, sessions, period, fmt
+  index.html, history.html, graph.html
+  css/                           # tokens, layout, components, charts, …
+  js/                            # main, tree, charts, sessions, period, fmt, features, …
 vendor/grok-2-tokenizer/         # offline tokenizer assets (see vendor note)
 ```
 

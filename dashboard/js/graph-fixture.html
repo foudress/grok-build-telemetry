@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Graph engine fixture</title>
+  <link rel="stylesheet" href="../css/tokens.css" />
+  <link rel="stylesheet" href="../css/graph.css" />
+  <style>
+    html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text); font-family: var(--font-sans); }
+    .graph-host { height: 100%; min-height: 100dvh; }
+    .bar {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 4;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      pointer-events: none;
+    }
+    .bar > * { pointer-events: auto; }
+    .bar h1 {
+      margin: 0 8px 0 2px;
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: -0.015em;
+    }
+    .bar button, .bar .chip {
+      appearance: none;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text-secondary);
+      font: 500 11px var(--font-sans);
+      padding: 6px 10px;
+      border-radius: var(--radius-pill);
+      min-height: 28px;
+      cursor: pointer;
+    }
+    .bar button:hover { background: var(--panel-hover); }
+    .bar button.on { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+    .bar .chip { color: var(--muted); cursor: default; }
+    .hint {
+      position: absolute;
+      right: 12px;
+      bottom: 10px;
+      z-index: 4;
+      color: var(--muted-2);
+      font-size: 11px;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="graph-host" id="host">
+    <canvas id="g" class="graph-canvas"></canvas>
+    <div class="bar">
+      <h1>token-telemetry</h1>
+      <button type="button" id="fit">Fit</button>
+      <button type="button" id="pause">Pause</button>
+      <button type="button" id="hi">Highlight scan</button>
+      <span class="chip" id="stat">demo · 3 bots</span>
+    </div>
+    <div class="hint">wheel zoom · drag pan · drag node · dblclick folder · Esc</div>
+  </div>
+  <script src="../vendor/d3.min.js"></script>
+  <script type="module">
+    import { createGraph } from "./graph-engine.js";
+
+    const BOTS = [
+      "../img/bots/bot-blue.jpg",
+      "../img/bots/bot-green.jpg",
+      "../img/bots/bot-amber.jpg",
+      "../img/bots/bot-rose.jpg",
+      "../img/bots/bot-violet.jpg",
+      "../img/bots/bot-cyan.jpg",
+    ];
+
+    const INLINE = {
+      nodes: [
+        { id: "tt", path: "token_telemetry", dir: "", loc: 0, deg: 0, kind: "cluster" },
+        { id: "tt/graph", path: "token_telemetry/graph", dir: "token_telemetry", loc: 0, deg: 0, kind: "cluster" },
+        { id: "tt/session", path: "token_telemetry/session", dir: "token_telemetry", loc: 0, deg: 0, kind: "cluster" },
+        { id: "tt/server", path: "token_telemetry/server", dir: "token_telemetry", loc: 0, deg: 0, kind: "cluster" },
+        { id: "tt/hierarchy", path: "token_telemetry/hierarchy", dir: "token_telemetry", loc: 0, deg: 0, kind: "cluster" },
+        { id: "tt/pricing", path: "token_telemetry/pricing", dir: "token_telemetry", loc: 0, deg: 0, kind: "cluster" },
+        { id: "tt/__init__.py", path: "token_telemetry/__init__.py", dir: "token_telemetry", loc: 24, deg: 2, kind: "file" },
+        { id: "tt/__main__.py", path: "token_telemetry/__main__.py", dir: "token_telemetry", loc: 18, deg: 3, kind: "file" },
+        { id: "tt/live_dashboard.py", path: "token_telemetry/live_dashboard.py", dir: "token_telemetry", loc: 210, deg: 5, kind: "file" },
+        { id: "tt/tokenizer.py", path: "token_telemetry/tokenizer.py", dir: "token_telemetry", loc: 160, deg: 3, kind: "file" },
+        { id: "tt/graph/__init__.py", path: "token_telemetry/graph/__init__.py", dir: "token_telemetry/graph", loc: 8, deg: 2, kind: "file" },
+        { id: "tt/graph/scan.py", path: "token_telemetry/graph/scan.py", dir: "token_telemetry/graph", loc: 280, deg: 4, kind: "file" },
+        { id: "tt/graph/resolve.py", path: "token_telemetry/graph/resolve.py", dir: "token_telemetry/graph", loc: 190, deg: 3, kind: "file" },
+        { id: "tt/graph/activity.py", path: "token_telemetry/graph/activity.py", dir: "token_telemetry/graph", loc: 140, deg: 3, kind: "file" },
+        { id: "tt/session/monitor.py", path: "token_telemetry/session/monitor.py", dir: "token_telemetry/session", loc: 320, deg: 6, kind: "file" },
+        { id: "tt/session/aggregate.py", path: "token_telemetry/session/aggregate.py", dir: "token_telemetry/session", loc: 240, deg: 3, kind: "file" },
+        { id: "tt/session/discover.py", path: "token_telemetry/session/discover.py", dir: "token_telemetry/session", loc: 180, deg: 3, kind: "file" },
+        { id: "tt/server/http.py", path: "token_telemetry/server/http.py", dir: "token_telemetry/server", loc: 410, deg: 7, kind: "file" },
+        { id: "tt/hierarchy/builder.py", path: "token_telemetry/hierarchy/builder.py", dir: "token_telemetry/hierarchy", loc: 520, deg: 4, kind: "file" },
+        { id: "tt/hierarchy/bootstrap.py", path: "token_telemetry/hierarchy/bootstrap.py", dir: "token_telemetry/hierarchy", loc: 260, deg: 2, kind: "file" },
+        { id: "tt/pricing/rates.py", path: "token_telemetry/pricing/rates.py", dir: "token_telemetry/pricing", loc: 90, deg: 2, kind: "file" },
+        { id: "tt/pricing/reconstruct.py", path: "token_telemetry/pricing/reconstruct.py", dir: "token_telemetry/pricing", loc: 210, deg: 3, kind: "file" },
+      ],
+      edges: [
+        { src: "tt/__main__.py", dst: "tt/live_dashboard.py", kind: "call", w: 1 },
+        { src: "tt/__main__.py", dst: "tt/tokenizer.py", kind: "import", w: 1 },
+        { src: "tt/live_dashboard.py", dst: "tt/session/monitor.py", kind: "call", w: 3 },
+        { src: "tt/live_dashboard.py", dst: "tt/server/http.py", kind: "call", w: 2 },
+        { src: "tt/live_dashboard.py", dst: "tt/tokenizer.py", kind: "import", w: 1 },
+        { src: "tt/session/monitor.py", dst: "tt/session/discover.py", kind: "call", w: 2 },
+        { src: "tt/session/monitor.py", dst: "tt/session/aggregate.py", kind: "call", w: 1 },
+        { src: "tt/session/monitor.py", dst: "tt/hierarchy/builder.py", kind: "call", w: 4 },
+        { src: "tt/session/aggregate.py", dst: "tt/pricing/reconstruct.py", kind: "call", w: 2 },
+        { src: "tt/server/http.py", dst: "tt/session/discover.py", kind: "call", w: 3 },
+        { src: "tt/server/http.py", dst: "tt/session/monitor.py", kind: "call", w: 2 },
+        { src: "tt/server/http.py", dst: "tt/graph/__init__.py", kind: "import", w: 1 },
+        { src: "tt/server/http.py", dst: "tt/graph/activity.py", kind: "call", w: 2 },
+        { src: "tt/graph/scan.py", dst: "tt/graph/resolve.py", kind: "call", w: 5 },
+        { src: "tt/graph/scan.py", dst: "tt/graph/__init__.py", kind: "import", w: 1 },
+        { src: "tt/graph/activity.py", dst: "tt/session/discover.py", kind: "import", w: 1 },
+        { src: "tt/hierarchy/builder.py", dst: "tt/hierarchy/bootstrap.py", kind: "call", w: 2 },
+        { src: "tt/pricing/reconstruct.py", dst: "tt/pricing/rates.py", kind: "call", w: 3 },
+        { src: "tt/tokenizer.py", dst: "tt/__init__.py", kind: "import", w: 1 },
+      ],
+    };
+
+    const AGENTS = [
+      { sid: "019f-scan", name: "scan" },
+      { sid: "019f-activity", name: "activity" },
+      { sid: "019f-http", name: "http" },
+    ];
+
+    const SCRIPT = [
+      { i: 0, path: "token_telemetry/graph/scan.py", kind: "read" },
+      { i: 1, path: "token_telemetry/graph/activity.py", kind: "read" },
+      { i: 2, path: "token_telemetry/server/http.py", kind: "read" },
+      { i: 0, path: "token_telemetry/graph/scan.py", kind: "write" },
+      { i: 0, path: "token_telemetry/graph/resolve.py", kind: "write" },
+      { i: 1, path: "token_telemetry/graph/activity.py", kind: "search" },
+      { i: 2, path: "token_telemetry/session/monitor.py", kind: "read" },
+      { i: 1, path: "token_telemetry/session/discover.py", kind: "list" },
+      { i: 2, path: "token_telemetry/server/http.py", kind: "write" },
+      { i: 0, path: "token_telemetry/graph/__init__.py", kind: "read" },
+      { i: 1, path: "token_telemetry/graph/activity.py", kind: "write" },
+      { i: 2, path: "token_telemetry/session/monitor.py", kind: "exec" },
+      { i: 0, path: "token_telemetry/graph/scan.py", kind: "write" },
+      { i: 2, path: "token_telemetry/graph/activity.py", kind: "read" },
+    ];
+
+    async function loadData() {
+      const urls = [
+        "../../test/fixtures/graph_pkg/expected.json",
+        "/test/fixtures/graph_pkg/expected.json",
+      ];
+      for (const url of urls) {
+        try {
+          const r = await fetch(url);
+          if (!r.ok) continue;
+          const j = await r.json();
+          if (j && Array.isArray(j.nodes)) return j;
+        } catch {
+          /* file:// or missing fixture */
+        }
+      }
+      return INLINE;
+    }
+
+    if (!globalThis.d3) {
+      document.getElementById("stat").textContent = "missing d3 — vendor /vendor/d3.min.js";
+    } else {
+      const data = await loadData();
+      const api = createGraph(document.getElementById("g"), {
+        nodes: data.nodes,
+        edges: data.edges,
+        botSrcs: BOTS,
+      });
+
+      const pauseBtn = document.getElementById("pause");
+      const hiBtn = document.getElementById("hi");
+      let paused = false;
+      let hi = false;
+      let step = 0;
+
+      document.getElementById("fit").addEventListener("click", () => api.fit());
+      pauseBtn.addEventListener("click", () => {
+        paused = !paused;
+        api.setPaused(paused);
+        pauseBtn.classList.toggle("on", paused);
+        pauseBtn.textContent = paused ? "Resume" : "Pause";
+      });
+      hiBtn.addEventListener("click", () => {
+        hi = !hi;
+        api.highlightSession(hi ? "019f-scan" : null);
+        hiBtn.classList.toggle("on", hi);
+      });
+
+      const tick = () => {
+        const ev = SCRIPT[step % SCRIPT.length];
+        const agent = AGENTS[ev.i];
+        api.appendActivity({
+          t: Date.now(),
+          tool: ev.kind === "search" ? "grep" : ev.kind,
+          path: ev.path,
+          kind: ev.kind,
+          sid: agent.sid,
+          name: agent.name,
+        });
+        step += 1;
+        document.getElementById("stat").textContent =
+          `${agent.name} · ${ev.kind} · ${ev.path.split("/").pop()}`;
+      };
+
+      setTimeout(tick, 700);
+      setInterval(tick, 1600);
+    }
+  </script>
+</body>
+</html>

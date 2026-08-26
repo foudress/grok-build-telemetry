@@ -3,19 +3,19 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Grok Token Telemetry</title>
+  <title>Grok Build Telemetry</title>
   <link rel="stylesheet" href="css/tokens.css" />
   <link rel="stylesheet" href="css/layout.css" />
   <link rel="stylesheet" href="css/components.css" />
   <link rel="stylesheet" href="css/charts.css" />
+  <link rel="stylesheet" href="css/graph.css" />
 </head>
 <body>
   <header>
     <button type="button" id="periodBack" class="ghost-btn period-back" hidden title="Back to period view">← Back</button>
-    <h1>Grok Token Telemetry</h1>
-    <a href="/history" class="meta" style="text-decoration:none">history</a>
-    <button type="button" id="cacheReset" class="ghost-btn" title="Recompute every session (ignore saved calcs)">Reset calc</button>
-    <span id="liveBadge" class="badge">connecting…</span>
+    <h1>Grok Build Telemetry</h1>
+    <a href="/history" class="meta" style="text-decoration:none" hidden>history</a>
+    <a href="/graph" class="meta" style="text-decoration:none" hidden>graph</a>
     <div class="session-picker">
       <select id="scopeSelect" title="Session or period aggregate" aria-label="View">
         <option value="session">Session</option>
@@ -26,12 +26,13 @@
       <select id="sessionSelect" title="Active sessions + recent">
         <option value="">loading…</option>
       </select>
-      <span id="sessionPinHint" class="pin-hint" hidden>pinned</span>
     </div>
-    <span id="sessionMeta" class="meta">—</span>
+    <span id="sessionMeta" class="meta"></span>
     <span id="modelBadge" class="badge" hidden></span>
     <span id="kvChip" class="badge kv" hidden></span>
     <span id="phaseMeta" class="meta" hidden></span>
+    <span id="liveBadge" class="badge">connecting…</span>
+    <button type="button" id="cacheReset" class="ghost-btn header-reset" title="Replay this session from disk and wipe saved calcs">Reset calc</button>
     <div id="ctxPressure" class="ctx-pressure" hidden title="Context vs window · notch = 200k rate cliff">
       <span id="ctxPressureFill"></span>
       <span id="ctxPressureNotch" class="tier-notch"></span>
@@ -51,10 +52,19 @@
         <div class="sub" id="ctxSub"></div>
         <div class="progress" id="kpi1Progress"><span id="ctxBar"></span></div>
       </div>
-      <div class="card green" id="kpi2">
-        <div class="label" id="kpi2Label">Session cost (official)</div>
-        <div class="value" id="costOfficial">—</div>
-        <div class="sub" id="costOfficialSub"></div>
+      <div class="card green card-flip" id="kpi2" tabindex="0" role="button" aria-pressed="false" title="Flip: implied $/M ↔ session tokens">
+        <div class="card-flip-inner" id="kpi2Inner">
+          <div class="card-face card-face-front">
+            <div class="label" id="kpi2Label">Session cost (official)</div>
+            <div class="value" id="costOfficial">—</div>
+            <div class="sub" id="costOfficialSub"></div>
+          </div>
+          <div class="card-face card-face-back" aria-hidden="true">
+            <div class="label" id="kpi2TokLabel">Session tokens</div>
+            <div class="value" id="costOfficialTok">—</div>
+            <div class="sub" id="costOfficialTokSub"></div>
+          </div>
+        </div>
       </div>
       <div class="card amber" id="kpi3">
         <div class="label" id="kpi3Label">Session cost (estimate)</div>
@@ -69,16 +79,48 @@
     </section>
 
     <section class="panel" id="ctxPanel">
-      <h2>Context tokens</h2>
-      <div class="chart-wrap">
-        <canvas id="ctxChart" height="320"></canvas>
+      <div class="panel-head panel-head-toggle" data-collapse-panel="ctxPanel" title="Click title area to collapse">
+        <h2 id="ctxPanelTitle">Context tokens</h2>
+        <span class="unit-toggle" title="Context panel view" role="group" aria-label="Context view">
+          <button type="button" id="ctxModeTokens" class="unit-btn active" aria-pressed="true">Context</button>
+          <button type="button" id="ctxModeRate" class="unit-btn" aria-pressed="false" title="Tokens per second" hidden>tok/s</button>
+          <button type="button" id="ctxModeGraph" class="unit-btn" aria-pressed="false" hidden>Graph</button>
+        </span>
+        <span class="unit-toggle" id="ctxRateGrain" hidden title="tok/s grain" role="group" aria-label="Rate grain">
+          <button type="button" id="ctxRateCall" class="unit-btn active" aria-pressed="true">Call</button>
+          <button type="button" id="ctxRateRound" class="unit-btn" aria-pressed="false">Round</button>
+        </span>
+      </div>
+      <div class="chart-wrap" id="ctxChartWrap">
+        <canvas id="ctxYAxis" class="cost-yaxis" hidden></canvas>
+        <div class="chart-scroll" id="ctxChartScroll">
+          <canvas id="ctxChart" height="320"></canvas>
+        </div>
         <div id="ctxTip" class="chart-tip" role="tooltip"></div>
+        <button type="button" id="ctxChartResize" class="chart-resize" title="Drag to resize" aria-label="Resize chart">
+          <svg viewBox="0 0 18 18" width="16" height="16" aria-hidden="true">
+            <path d="M16 7 V16 H7" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+            <path d="M8 16 L16 8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+            <path d="M11.2 16 H16 V11.2" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </div>
+      <div class="chart-wrap" id="ctxGraphWrap" hidden>
+        <canvas id="ctxGraph" class="graph-canvas"></canvas>
+        <div id="ctxGraphEmpty" hidden></div>
+        <button type="button" id="ctxGraphResize" class="chart-resize" hidden title="Drag to resize" aria-label="Resize graph">
+          <svg viewBox="0 0 18 18" width="16" height="16" aria-hidden="true">
+            <path d="M16 7 V16 H7" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+            <path d="M8 16 L16 8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+            <path d="M11.2 16 H16 V11.2" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+          </svg>
+        </button>
       </div>
     </section>
 
     <section class="panel" id="costPanel">
-      <div class="panel-head cost-panel-head">
-        <h2 id="costPanelTitle">Cost per round</h2>
+      <div class="panel-head cost-panel-head panel-head-toggle" data-collapse-panel="costPanel" title="Click title area to collapse">
+        <h2 id="costPanelTitle">Cost Per Turn</h2>
         <div id="periodNav" class="period-nav" hidden>
           <button type="button" id="periodPrev" class="ghost-btn" title="Previous period">←</button>
           <span id="periodLabel" class="mode-pill">—</span>
@@ -103,27 +145,31 @@
         <button type="button" id="costDrillBack" hidden>← Back to rounds</button>
       </div>
       <div class="chart-toolbar" id="periodToolbar" hidden>
-        <span class="unit-toggle" id="periodGrain" hidden title="Bar grain" role="group" aria-label="Period grain">
-          <button type="button" id="grainA" class="unit-btn" data-grain=""></button>
-          <button type="button" id="grainB" class="unit-btn" data-grain=""></button>
+        <span class="unit-toggle" id="aggUnitToggle" title="Y-axis unit" role="group" aria-label="Period chart unit">
+          <button type="button" id="aggUnitUsd" class="unit-btn active" aria-pressed="true">$</button>
+          <button type="button" id="aggUnitTok" class="unit-btn" aria-pressed="false">Tok</button>
+          <button type="button" id="aggUnitIoStep" class="unit-btn" aria-pressed="false" title="Estimated In/Cached/Out $/M per session (step)" hidden>I/O $/M</button>
+          <button type="button" id="aggUnitTime" class="unit-btn hourglass-btn" aria-pressed="false" title="Timeline · session duration" hidden>&#x231B;</button>
+          <button type="button" id="aggUnitRate" class="unit-btn" aria-pressed="false" title="Tokens per second" hidden>tok/s</button>
         </span>
-        <span class="unit-toggle" id="aggTfCum" title="Bar values" role="group" aria-label="Period chart mode">
-          <button type="button" id="aggModeTf" class="unit-btn active" aria-pressed="true">Timeframe</button>
-          <button type="button" id="aggModeCum" class="unit-btn" aria-pressed="false">Cumulative</button>
+        <span class="unit-toggle" id="periodRateGrain" hidden title="tok/s grain" role="group" aria-label="Period rate grain">
+          <button type="button" id="aggRateSession" class="unit-btn active" aria-pressed="true">Session</button>
+          <button type="button" id="aggRateRound" class="unit-btn" aria-pressed="false">Round</button>
         </span>
-        <span class="unit-toggle" title="How each bar is split" role="group" aria-label="Period category stack">
-          <button type="button" id="aggStackIo" class="unit-btn active" data-stack="io" aria-pressed="true" title="In / Cached / Out">I/O</button>
-          <button type="button" id="aggStackParts" class="unit-btn" data-stack="parts" aria-pressed="false" title="User, thought, our reasoning, message… by time bucket">Parts</button>
-          <button type="button" id="aggStackTools" class="unit-btn" data-stack="tools" aria-pressed="false" title="Per-tool + LLM Out→In (our reconstruct, by time bucket)">Tools</button>
-        </span>
-        <span class="unit-toggle" title="X axis" role="group" aria-label="Period X layout">
+        <span class="unit-toggle" id="aggLayoutToggle" title="X axis" role="group" aria-label="Period X layout">
           <button type="button" id="aggLayoutTime" class="unit-btn active" aria-pressed="true">Time</button>
           <button type="button" id="aggLayoutLabel" class="unit-btn" aria-pressed="false">By label</button>
         </span>
-        <span class="unit-toggle" title="Y-axis unit" role="group" aria-label="Period chart unit">
-          <button type="button" id="aggUnitUsd" class="unit-btn active" aria-pressed="true">$</button>
-          <button type="button" id="aggUnitTok" class="unit-btn" aria-pressed="false">Tok</button>
-          <button type="button" id="aggUnitTime" class="unit-btn hourglass-btn" aria-pressed="false" title="Timeline · session duration">&#x231B;</button>
+        <span class="unit-toggle" id="periodGrain" hidden title="Bar grain" role="group" aria-label="Period grain"></span>
+        <span class="unit-toggle" id="aggTfCum" title="Bar values" role="group" aria-label="Period chart mode">
+          <button type="button" id="aggModeTf" class="unit-btn active" aria-pressed="true">Timeframe</button>
+          <button type="button" id="aggModeCum" class="unit-btn" aria-pressed="false">Cumulative</button>
+          <button type="button" id="aggModeNorm" class="unit-btn" aria-pressed="false" title="Each bar = 100% (composition)">Normalized</button>
+        </span>
+        <span class="unit-toggle" id="aggStackToggle" title="How each bar is split" role="group" aria-label="Period category stack">
+          <button type="button" id="aggStackIo" class="unit-btn active" data-stack="io" aria-pressed="true" title="In / Cached / Out">I/O</button>
+          <button type="button" id="aggStackParts" class="unit-btn" data-stack="parts" aria-pressed="false" title="User, thought, our reasoning, message… by time bucket">Parts</button>
+          <button type="button" id="aggStackTools" class="unit-btn" data-stack="tools" aria-pressed="false" title="Per-tool + LLM Out→In (our reconstruct, by time bucket)">Tools</button>
         </span>
       </div>
       <div class="chart-wrap" id="costChartWrap">
@@ -132,7 +178,7 @@
           <canvas id="costChart" class="bars" height="320"></canvas>
         </div>
         <div id="costTip" class="chart-tip" role="tooltip"></div>
-        <button type="button" id="chartResize" class="chart-resize" hidden title="Drag to resize" aria-label="Resize chart">
+        <button type="button" id="chartResize" class="chart-resize" title="Drag to resize" aria-label="Resize chart">
           <svg viewBox="0 0 18 18" width="16" height="16" aria-hidden="true">
             <path d="M16 7 V16 H7" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
             <path d="M8 16 L16 8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
@@ -140,7 +186,7 @@
           </svg>
         </button>
       </div>
-      <div id="costLegend" class="cost-legend" title="Click a category to hide/show it in the bars"></div>
+      <div id="costLegend" class="cost-legend" title="Click to hide/show · drag to reorder stack (bottom→top)"></div>
     </section>
 
     <section class="panel tree-panel">
@@ -158,16 +204,6 @@
       <div class="tree density-standard" id="roundTree"></div>
     </section>
 
-    <details class="panel meta-panel">
-      <summary>
-        <h2>Session signals + pricing</h2>
-        <span class="muted" id="metaSummary">rates · latency · formula</span>
-      </summary>
-      <div class="split">
-        <div id="signalsBox" class="meta"></div>
-        <div id="pricingBox" class="meta"></div>
-      </div>
-    </details>
   </main>
   <script type="module" src="js/main.js"></script>
 </body>

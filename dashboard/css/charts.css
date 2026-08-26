@@ -87,6 +87,71 @@ canvas {
 
 .chart-resize[hidden] { display: none !important; }
 
+/* Embedded repo graph in #ctxPanel — height owned by JS (180–720). */
+#ctxGraphWrap {
+  height: 320px;
+  min-height: 180px;
+  overflow: hidden;
+  background: var(--bg);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-subtle);
+}
+
+#ctxGraphWrap[hidden] { display: none !important; }
+
+#ctxGraphEmpty {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #6b7c92;
+  font-size: 12px;
+  pointer-events: none;
+}
+
+#ctxGraphEmpty[hidden] { display: none !important; }
+
+#ctxChartWrap.is-rate {
+  display: flex;
+  align-items: stretch;
+  overflow: hidden;
+}
+#ctxChartWrap.is-rate .chart-scroll {
+  flex: 1 1 auto;
+  min-width: 0;
+  cursor: grab;
+}
+#ctxChartWrap:not(.is-rate) .chart-scroll {
+  overflow: hidden;
+}
+#ctxChartWrap.is-rate canvas {
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+#ctxChartWrap.is-rate .cost-yaxis {
+  position: relative;
+  left: auto;
+  top: auto;
+  z-index: 1;
+  flex: 0 0 56px;
+  width: 56px;
+  height: 320px;
+  border-radius: 0;
+  border-right: 1px solid var(--border-subtle);
+  user-select: none;
+  touch-action: none;
+}
+#ctxChartWrap.is-panning .chart-scroll,
+#costChartWrap.is-rate.is-panning .chart-scroll {
+  cursor: grabbing;
+}
+#costChartWrap.is-rate .chart-scroll {
+  cursor: grab;
+}
+
 .cost-yaxis {
   position: absolute;
   left: 0;
@@ -247,6 +312,15 @@ canvas {
   transform: scale(0.97);
 }
 
+.cost-legend .leg-chip.leg-dragging {
+  opacity: 0.55;
+}
+
+.cost-legend .leg-chip.leg-drag-over {
+  border-color: var(--accent);
+  box-shadow: var(--focus-ring);
+}
+
 .cost-legend .leg-chip:focus-visible {
   box-shadow: var(--focus-ring);
   outline: none;
@@ -287,6 +361,18 @@ canvas {
 
 .cost-legend .leg-hint {
   display: none;
+}
+
+.cost-legend .leg-chip.leg-reset {
+  border-style: dashed;
+  color: var(--muted);
+  background: transparent;
+  font-weight: var(--font-weight-medium);
+}
+.cost-legend .leg-chip.leg-reset:hover {
+  color: var(--text);
+  border-color: var(--accent);
+  background: var(--accent-soft);
 }
 
 /* ── Unit toggle ────────────────────────────────────────────── */
@@ -357,11 +443,11 @@ canvas {
 }
 
 /* ── Chart tooltip ──────────────────────────────────────────── */
-/* Hidden by default; .is-visible fades in + slight lift (ease-out ~120ms) */
+/* Fixed to viewport so #costChartWrap overflow cannot clip long lists */
 .chart-tip {
-  position: absolute;
+  position: fixed;
   pointer-events: none;
-  z-index: 5;
+  z-index: 10050;
   background: rgba(15, 22, 32, 0.94);
   -webkit-backdrop-filter: blur(12px) saturate(160%);
   backdrop-filter: blur(12px) saturate(160%);
@@ -372,6 +458,9 @@ canvas {
   line-height: 1.45;
   color: var(--text);
   max-width: min(360px, 70vw);
+  max-height: min(70vh, 480px);
+  overflow-x: hidden;
+  overflow-y: auto;
   overflow-wrap: anywhere;
   word-break: break-word;
   box-shadow: var(--shadow-tip);

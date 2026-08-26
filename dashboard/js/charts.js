@@ -3,6 +3,9 @@ import {
   $,
   fmtTokens,
   fmtUsd,
+  fmtUsdPerM,
+  fmtToksPerSec,
+  fmtMs,
   esc,
   AR,
   partIn,
@@ -10,6 +13,7 @@ import {
   partOut,
   joinParts,
   totalPrice,
+  isSubagentKind,
 } from './fmt.js';
 import { focusRound, revealRound } from './tree.js';
 
@@ -24,28 +28,38 @@ const CHART_AXIS = {
 
 /**
  * Show DOM chart tooltip (fade/translate via CSS .is-visible).
- * Set content first so offsetWidth/Height work while still hidden.
+ * Uses fixed viewport coords so #costChartWrap overflow cannot clip it.
  */
 function showChartTip(el, html, leftPx, topPx) {
   if (!el) return;
   el.innerHTML = html;
   el.style.display = "";
+  el.style.position = "fixed";
   el.style.left = Math.max(0, leftPx) + "px";
   el.style.top = Math.max(0, topPx) + "px";
   el.classList.add("is-visible");
 }
 
-/** Position tip in #costChartWrap (viewport), not on the scrolled canvas bitmap. */
+/** Position tip in the viewport (not clipped by the graph window). Prefer below cursor. */
 function placeCostTip(ev, tipEl, html) {
-  const wrap = $("costChartWrap");
-  const wr = wrap ? wrap.getBoundingClientRect() : { left: 0, top: 0, width: 800, height: 240 };
-  const tw = measureChartTip(tipEl, html);
-  let left = ev.clientX - wr.left + 14;
-  let top = ev.clientY - wr.top - tw.th - 10;
-  if (left + tw.tw > wr.width - 6) left = ev.clientX - wr.left - tw.tw - 14;
-  if (left < 4) left = 4;
-  if (top < 4) top = ev.clientY - wr.top + 16;
-  if (top + tw.th > wr.height - 4) top = Math.max(4, wr.height - tw.th - 4);
+  if (!tipEl) return;
+  tipEl.style.maxHeight = "";
+  tipEl.style.overflowY = "";
+  const margin = 6;
+  const maxH = Math.max(96, window.innerHeight - margin * 2);
+  tipEl.style.maxHeight = maxH + "px";
+  const measured = measureChartTip(tipEl, html);
+  const th = Math.min(measured.th, maxH);
+  const tw = measured.tw;
+  if (measured.th > maxH - 1) tipEl.style.overflowY = "auto";
+  let left = ev.clientX + 14;
+  let top = ev.clientY + 16;
+  if (left + tw > window.innerWidth - margin) left = ev.clientX - tw - 14;
+  if (left < margin) left = margin;
+  if (top + th > window.innerHeight - margin) top = ev.clientY - th - 10;
+  if (top < margin) top = margin;
+  if (top + th > window.innerHeight - margin)
+    top = Math.max(margin, window.innerHeight - th - margin);
   showChartTip(tipEl, html, left, top);
 }
 
@@ -54,6 +68,10 @@ function measureChartTip(el, html) {
   if (!el) return { tw: 160, th: 40 };
   el.innerHTML = html;
   el.style.display = "";
+  el.style.position = "fixed";
+  el.style.left = "-9999px";
+  el.style.top = "0px";
+  el.classList.remove("is-visible");
   return {
     tw: el.offsetWidth || 160,
     th: el.offsetHeight || 40,
@@ -100,74 +118,190 @@ function drawChartEmpty(ctx, w, h, message) {
   ctx.textBaseline = "alphabetic";
 }
 
+/** Call In/Cached/Out — same priorities as round hierarchy (estimate, not harness tt). */
+function callHierarchyMetrics(s) {
+  const se = (s && s.estimate) || {};
+  let tokIn = s.tokens_in != null ? s.tokens_in
+    : (se.uncached_input_tokens != null ? se.uncached_input_tokens : se.logical_uncached_tokens);
+  let usdIn = s.cost_in_usd != null ? s.cost_in_usd
+    : (se.cost_in_usd != null ? se.cost_in_usd : se.cost_in_logical_usd);
+  const harnessIn = (s.children || [])
+    .filter((ch) => ch && ch.kind === "phase_harness")
+    .reduce((a, ch) => a + (Number(ch.tokens_in) || 0), 0);
+  if ((!tokIn || tokIn <= 0) && harnessIn > 0) {
+    tokIn = harnessIn;
+    usdIn = (s.children || [])
+      .filter((ch) => ch && ch.kind === "phase_harness")
+      .reduce((a, ch) => a + (Number(ch.cost_in_usd) || 0), 0);
+  }
+  const tokCache = s.tokens_cached
+    ?? s.display_cached_tokens
+    ?? se.display_cached_tokens
+    ?? se.logical_cached_tokens
+    ?? se.cached_read_tokens;
+  const usdCache = s.cost_cached_usd
+    ?? s.display_cached_usd
+    ?? se.display_cached_usd
+    ?? se.cost_cached_logical_usd
+    ?? se.cost_cached_usd;
+  const tokOut = s.tokens_out ?? se.output_tokens;
+  const usdOut = s.cost_out_usd ?? se.cost_out_usd;
+  return {
+    tokIn: Number(tokIn) || 0,
+    usdIn: Number(usdIn) || 0,
+    tokCache: Number(tokCache) || 0,
+    usdCache: Number(usdCache) || 0,
+    tokOut: tokOut != null ? Number(tokOut) || 0 : null,
+    usdOut: usdOut != null ? Number(usdOut) || 0 : null,
+    estimate_usd: s.estimate_usd ?? se.api_call_usd ?? se.estimate_usd,
+    thought_tokens: se.output_thought_tokens ?? s.composition?.thought_out,
+    thought_chars: s.thought_chars,
+  };
+}
+
 /**
- * Context chart points: one point per LLM call only.
- * X labels: "R1" on first call of round, then "1","2","3"… reset at next RX.
+ * Context chart: User(R{n} X-label) → each call@Cached(est) → round_end (no X label).
+ * No Sys. No Round Start (end already marks the round; start==prev end).
  */
 function buildCtxPoints(rounds) {
   const pts = [];
-  (rounds || []).forEach(r => {
+  (rounds || []).forEach((r) => {
     const ri = r.index ?? "?";
     const steps = r.model_steps || [];
-    // System baseline (bootstrap) before first LLM call of the session
     const sp = r.system_prompt;
-    if (sp && (sp.tokens_in || sp.logical_tokens)) {
-      const sysTok = Number(sp.tokens_in ?? sp.logical_tokens) || 0;
-      if (sysTok > 0) {
-        pts.push({
-          label: "Sys",
-          v: sysTok,
-          kind: "system",
-          round: ri,
-          call: 0,
-          tokens_in: sysTok,
-          tokens_cached: 0,
-          tokens_out: null,
-          cost_in_usd: sp.cost_in_usd,
-          cost_cached_usd: 0,
-          cost_out_usd: null,
-          estimate_usd: sp.estimate_usd ?? sp.cost_in_usd,
-          tool_definitions_tokens: sp.tool_definitions_tokens,
-          parts: sp.parts,
-        });
-      }
-    }
+    const sysTok = (sp && (sp.tokens_in || sp.logical_tokens))
+      ? (Number(sp.tokens_in ?? sp.logical_tokens) || 0)
+      : 0;
+
+    const plottable = [];
     steps.forEach((s, i) => {
-      const li = s.index ?? (i + 1);
-      // Last call: no harness after it — skip. Call i plots next prompt
-      // (display_context_start). Call 1 opening lives on Sys / User.
       if (s.skip_context) return;
-      const v = s.display_context_start ?? s.context_start;
-      if (v == null || Number.isNaN(v)) return;
-      const se = s.estimate || {};
-      // Display In = caused (tree); cache/out from call bill
-      const tokIn = s.tokens_in ?? se.uncached_input_tokens ?? se.logical_uncached_tokens;
-      const tokCache = s.tokens_cached ?? se.cached_read_tokens ?? se.logical_cached_tokens;
-      const tokOut = s.tokens_out ?? se.output_tokens;
-      const usdIn = s.cost_in_usd ?? se.cost_in_usd;
-      const usdCache = s.cost_cached_usd ?? se.cost_cached_usd;
-      const usdOut = s.cost_out_usd ?? se.cost_out_usd;
-      const th = se.output_thought_tokens ?? s.composition?.thought_out;
-      pts.push({
-        // First call of round → "R3", subsequent → "1","2",…
-        label: i === 0 ? `R${ri}` : String(li),
-        v: v,
-        kind: "call",
-        round: ri,
-        call: li,
-        context_end: s.display_context_end ?? s.context_end,
-        tokens_in: tokIn,
-        tokens_cached: tokCache,
-        tokens_out: tokOut,
-        cost_in_usd: usdIn,
-        cost_cached_usd: usdCache,
-        cost_out_usd: usdOut,
-        estimate_usd: s.estimate_usd ?? se.api_call_usd ?? se.estimate_usd,
-        thought_tokens: th,
-        thought_chars: s.thought_chars,
-        system_tokens: i === 0 && sp ? (sp.tokens_in ?? sp.logical_tokens) : null,
+      const ctxA = s.display_context_start ?? s.context_start;
+      const ctxB = s.display_context_end ?? s.context_end;
+      // Keep calls even when start is 0 (cold R1).
+      if (ctxA == null || Number.isNaN(Number(ctxA))) return;
+      plottable.push({
+        s, i, li: s.index ?? (i + 1),
+        ctxA: Number(ctxA),
+        ctxB: ctxB != null ? Number(ctxB) : null,
+        ownStart: Number(s.context_start),
       });
     });
+
+    const roundCtxA = Number(r.context_start);
+    const roundCtxB = Number(r.context_end);
+    const hasRoundA = Number.isFinite(roundCtxA);
+
+    const up = r.user_prompt || {};
+    const bd = r.breakdown || {};
+    const priorCache = r.cache_baseline_at_start;
+    const isR1 = Number(r.index) === 1;
+    const promptIn = Number(
+      up.prompt_tokens_in != null ? up.prompt_tokens_in : up.tokens_in ?? up.uncached_est ?? bd.user_in_tokens
+    ) || 0;
+    const prevAns = up.prev_llm_answer || {};
+    const prevInTok = Math.round(Number(prevAns.tokens_in || prevAns.tokenizer_tokens || 0)) || 0;
+    const coTok = Math.round(Number((up.compact_out || {}).tokens_in) || 0);
+    const userHeadIn = Number(up.display_in_tokens) || (promptIn + prevInTok + coTok) || promptIn;
+    const userHeadUsd = Number(up.display_in_usd)
+      || (Number(up.prompt_cost_in_usd ?? up.cost_in_usd) || 0)
+      || 0;
+    let upCache = isR1 ? 0 : (Number(up.tokens_cached ?? up.cached_est ?? priorCache) || 0);
+    let upCacheUsd = isR1 ? 0 : (Number(up.cost_cached_usd) || 0);
+    if (prevInTok > 0 && upCache >= prevInTok && !prevAns.from_user_pool) {
+      const fullC = Number(up.tokens_cached ?? up.cached_est ?? priorCache) || 1;
+      upCache = Math.max(0, upCache - prevInTok);
+      if (upCacheUsd > 0 && fullC > 0) upCacheUsd = upCacheUsd * (upCache / fullC);
+    }
+    // Absolute context after User In (baseline = hierarchy round.context_start).
+    let userV = null;
+    if (hasRoundA) userV = roundCtxA + userHeadIn;
+    else if (plottable.length && Number.isFinite(plottable[0].ownStart))
+      userV = plottable[0].ownStart;
+    else if (isR1 && sysTok > 0) userV = sysTok + userHeadIn;
+    else if (upCache > 0 || userHeadIn > 0) userV = upCache + userHeadIn;
+    // Skip User@0 (live mid-calc / empty) — avoids a floor spike until cache lands.
+    // X label R{n} sits under the User point (not round-end).
+    if (userV != null && userV > 0) {
+      pts.push({
+        label: `R${ri}`,
+        v: userV,
+        kind: "user",
+        round: ri,
+        call: 0,
+        tokens_in: userHeadIn,
+        tokens_cached: upCache,
+        tokens_out: null,
+        cost_in_usd: userHeadUsd,
+        cost_cached_usd: upCacheUsd,
+        cost_out_usd: null,
+        estimate_usd: userHeadUsd + upCacheUsd,
+      });
+    }
+
+    if (!plottable.length) {
+      if (Number.isFinite(roundCtxB) && roundCtxB > 0) {
+        pts.push({
+          label: "",
+          v: roundCtxB,
+          kind: "round_end",
+          round: ri,
+          call: 0,
+          context_start: hasRoundA ? roundCtxA : null,
+          context_end: roundCtxB,
+        });
+      }
+      return;
+    }
+
+    plottable.forEach((p) => {
+      const m = callHierarchyMetrics(p.s);
+      // Calls Y = Cached. Last call / reminder-only LLM (no harness) is 0 —
+      // R{n} end already marks the round; plotting Call@0 is noise.
+      if (!(m.tokCache > 0)) return;
+      pts.push({
+        label: String(p.li),
+        v: m.tokCache,
+        kind: "call",
+        round: ri,
+        call: p.li,
+        context_start: p.ctxA,
+        context_end: p.ctxB,
+        tokens_in: m.tokIn,
+        tokens_cached: m.tokCache,
+        tokens_out: m.tokOut,
+        cost_in_usd: m.usdIn,
+        cost_cached_usd: m.usdCache,
+        cost_out_usd: m.usdOut,
+        estimate_usd: m.estimate_usd,
+        thought_tokens: m.thought_tokens,
+        thought_chars: m.thought_chars,
+      });
+    });
+
+    const last = plottable[plottable.length - 1];
+    const endV = Number.isFinite(roundCtxB)
+      ? roundCtxB
+      : (last.ctxB != null && !Number.isNaN(last.ctxB) ? last.ctxB : null);
+    if (endV != null && !Number.isNaN(endV) && endV > 0) {
+      const mL = callHierarchyMetrics(last.s);
+      pts.push({
+        label: "",
+        v: endV,
+        kind: "round_end",
+        round: ri,
+        call: last.li,
+        context_start: hasRoundA ? roundCtxA : last.ctxA,
+        context_end: endV,
+        tokens_in: mL.tokIn,
+        tokens_cached: mL.tokCache,
+        tokens_out: mL.tokOut,
+        cost_in_usd: mL.usdIn,
+        cost_cached_usd: mL.usdCache,
+        cost_out_usd: mL.usdOut,
+        estimate_usd: mL.estimate_usd,
+      });
+    }
   });
   return pts;
 }
@@ -211,14 +345,7 @@ function niceCostYMax(rawMax) {
 }
 
 function drawLineChart(canvas, series, color, rounds) {
-  const dpr = window.devicePixelRatio || 1;
-  const w = canvas.clientWidth;
-  const h = canvas.clientHeight || 200;
-  canvas.width = Math.floor(w * dpr);
-  canvas.height = Math.floor(h * dpr);
-  const ctx = canvas.getContext("2d");
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, w, h);
+  if (canvas) canvas._ratePts = null;
 
   // One point per LLM call only
   let pts = buildCtxPoints(rounds);
@@ -229,9 +356,33 @@ function drawLineChart(canvas, series, color, rounds) {
       .map((p, i) => ({ label: "", v: p.v, kind: "stream" }));
   }
 
-  const left = 48, right = 10, top = 22, bottom = 28;
+  const left = 48, right = 10, top = 22;
+  const baseH = storedCtxChartH();
+  const wGuess = canvas.clientWidth || 600;
+  const plotWGuess = Math.max(1, wGuess - left - right);
+  const avgPxGuess = pts.length > 1 ? plotWGuess / (pts.length - 1) : plotWGuess;
+  // Same X-label planner as Cost / tok/s — rotate + grow bottom pad when cramped.
+  const measure = document.createElement("canvas").getContext("2d");
+  const xPlan = planXLabels(
+    measure,
+    (pts || []).map((p) => p.label || ""),
+    avgPxGuess,
+    { temporal: false }
+  );
+  const bottom = Math.max(28, xPlan.padB || 28);
+  canvas.style.height = (baseH + Math.max(0, bottom - 28)) + "px";
+
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || wGuess;
+  const h = canvas.clientHeight || baseH;
+  canvas.width = Math.floor(w * dpr);
+  canvas.height = Math.floor(h * dpr);
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
   const plotW = w - left - right;
-  const plotH = h - top - bottom;
+  const plotH = Math.max(10, h - top - bottom);
 
   if (!pts || pts.length < 1) {
     drawChartEmpty(ctx, w, h, "No LLM calls yet");
@@ -242,7 +393,7 @@ function drawLineChart(canvas, series, color, rounds) {
 
   const vals = pts.map(p => p.v).filter(v => v != null && !Number.isNaN(v));
   const { min, max, step } = niceCtxYRange(vals);
-  const yOf = (v) => top + plotH - ((v - min) / (max - min)) * plotH;
+  const yOf = (v) => top + plotH - ((v - min) / (max - min || 1)) * plotH;
   const xOf = (i) => left + (pts.length === 1 ? plotW / 2 : (i / (pts.length - 1)) * plotW);
 
   // Grid + Y labels at 50k steps
@@ -292,39 +443,41 @@ function drawLineChart(canvas, series, color, rounds) {
   ctx.fillStyle = color + "22";
   ctx.fill();
 
-  // X label density: always show Sys / R* anchors; call numbers every 2, then every 5 if cramped
-  const minLabelPx = 22;
+  // X label density: always R{n} under User point; thin call nums via planXLabels.every + stride
   const avgPx = pts.length > 1 ? plotW / (pts.length - 1) : plotW;
-  const callStride = avgPx >= minLabelPx * 2 ? 1 : (avgPx >= minLabelPx ? 2 : 5);
+  const callStride = avgPx >= 22 ? 1 : (avgPx >= 14 ? 2 : 5);
+  const every = Math.max(1, xPlan.every || 1, callStride);
   let callInRound = 0;
   pts.forEach((p, i) => {
-    const lab = String(p.label || "");
-    const isSys = p.kind === "system";
-    const isRoundAnchor = lab.startsWith("R");
-    if (isSys || isRoundAnchor) callInRound = 0;
+    const isUser = p.kind === "user";
+    const isRoundAnchor = p.kind === "round_end" || p.kind === "round_start";
+    if (isUser || isRoundAnchor) callInRound = 0;
     else callInRound += 1;
-    // Keep Sys + first call of round (R*); subsequent call nums: every callStride
-    p._showX = isSys || isRoundAnchor || (callInRound % callStride === 0)
-      || i === pts.length - 1;
+    // Round-end has no X label (R{n} is on the User point).
+    p._showX = !!(p.label) && !isRoundAnchor && (isUser
+      || (callInRound % every === 0) || i === pts.length - 1);
   });
 
-  // Points + X labels (Sys, R1, 1, 2, 3, R2, 1, …) — skip when cramped
+  // Points + X labels — y sits in bottom pad (same as Cost / tok/s: h - padB + 6)
+  // Round End = same dot as calls (no larger stroked "anchor" ball). User keeps a ring.
+  const labelY = h - bottom + 6;
   pts.forEach((p, i) => {
     const x = xOf(i), y = yOf(p.v);
     p._x = x; p._y = y;
-    const isSys = p.kind === "system";
-    ctx.fillStyle = isSys ? COST_COLORS.system : color;
+    const isUser = p.kind === "user";
+    const isRoundAnchor = p.kind === "round_end" || p.kind === "round_start";
+    ctx.fillStyle = isUser ? COST_COLORS.user : color;
     ctx.beginPath();
-    ctx.arc(x, y, isSys ? 4 : 3.2, 0, Math.PI * 2);
+    ctx.arc(x, y, isUser ? 4 : 3.2, 0, Math.PI * 2);
     ctx.fill();
-    if (isSys) {
+    if (isUser) {
       ctx.strokeStyle = "#e6edf3";
       ctx.lineWidth = 1;
       ctx.stroke();
     }
     if (p.label && p._showX) {
-      const isAnchor = isSys || String(p.label).startsWith("R");
-      drawXLabel(ctx, p.label, x, h - 10, avgPx < 16 && !isAnchor);
+      // User / R{n} must tilt too — excluding them caused collisions while call nums tilted alone.
+      drawXLabel(ctx, p.label, x, labelY, !!xPlan.rotate);
     }
   });
 
@@ -338,8 +491,7 @@ function drawLineChart(canvas, series, color, rounds) {
     canvas.addEventListener("mousemove", (ev) => {
       canvas._ctxPtr = { clientX: ev.clientX, clientY: ev.clientY };
       const t = tip();
-      if (document.body.classList.contains("scope-period")) {
-        hideChartTip(t);
+      if (document.body.classList.contains("scope-period") || canvas._ratePts) {
         return;
       }
       const list = canvas._ctxPts;
@@ -355,24 +507,49 @@ function drawLineChart(canvas, series, color, rounds) {
       }
       if (!t || !best) return hideChartTip(t);
       const yVal = best.v;
-      const lines = best.kind === "system"
-        ? [
-            `<b>System</b> · R${esc(best.round)} bootstrap`,
-            `<span class="muted">Y context</span> <b>${fmtTokens(yVal)}</b>`,
-            joinParts([partIn(best.tokens_in, best.cost_in_usd)].filter(Boolean)) || "—",
-            best.tool_definitions_tokens
-              ? `<span class="muted">tool defs + message ${fmtTokens(best.tool_definitions_tokens)}</span>`
-              : "",
-          ]
-        : [
-            `<b>${esc(best.label || "call")}</b> · R${esc(best.round)} call ${esc(best.call)}`,
-            `<span class="muted">Y context</span> <b>${fmtTokens(yVal)}</b>` +
-              (best.context_end != null ? ` <span class="muted">→ ${fmtTokens(best.context_end)}</span>` : ""),
-          ];
-      if (best.kind === "call") {
-        if (best.system_tokens) {
-          lines.push(`<span class="muted">System card</span> ${fmtTokens(best.system_tokens)}`);
-        }
+      const ctxY = `<span class="muted">Context</span> <b>${fmtTokens(yVal)}</b>`;
+      let lines;
+      if (best.kind === "system") {
+        lines = [
+          `<b>System</b> · R${esc(best.round)} bootstrap`,
+          ctxY,
+          joinParts([partIn(best.tokens_in, best.cost_in_usd)].filter(Boolean)) || "—",
+          Number(best.message_residual_tokens ?? best.tool_definitions_tokens) > 0
+            ? `<span class="muted">tool defs + message ${fmtTokens(Number(best.message_residual_tokens ?? best.tool_definitions_tokens))}</span>`
+            : "",
+        ];
+        if (best.estimate_usd != null) lines.push(totalPrice(best.estimate_usd));
+      } else if (best.kind === "user") {
+        lines = [
+          `<b>User</b> · R${esc(best.round)}`,
+          ctxY,
+          joinParts([
+            partIn(best.tokens_in, best.cost_in_usd),
+            partCached(best.tokens_cached, best.cost_cached_usd),
+          ].filter(Boolean)) || "—",
+        ];
+        if (best.estimate_usd != null) lines.push(totalPrice(best.estimate_usd));
+      } else if (best.kind === "round_start" || best.kind === "round_end") {
+        lines = [
+          `<b>R${esc(best.round)}</b> · end`,
+          ctxY + (best.context_start != null
+            ? ` <span class="muted">(${fmtTokens(best.context_start)}→${fmtTokens(best.context_end ?? yVal)})</span>`
+            : ""),
+          joinParts([
+            partIn(best.tokens_in, best.cost_in_usd),
+            partCached(best.tokens_cached, best.cost_cached_usd),
+            partOut(best.tokens_out, best.cost_out_usd),
+          ].filter(Boolean)) || "—",
+        ];
+        if (best.estimate_usd != null) lines.push(totalPrice(best.estimate_usd));
+      } else {
+        lines = [
+          `<b>${esc(best.label || "call")}</b> · R${esc(best.round)} call ${esc(best.call)}`,
+          ctxY + (best.context_start != null && best.context_end != null
+            ? ` <span class="muted">(${fmtTokens(best.context_start)}→${fmtTokens(best.context_end)})</span>`
+            : (best.context_end != null
+              ? ` <span class="muted">→ ${fmtTokens(best.context_end)}</span>` : "")),
+        ];
         lines.push(joinParts([
           partIn(best.tokens_in, best.cost_in_usd),
           partCached(best.tokens_cached, best.cost_cached_usd),
@@ -387,24 +564,19 @@ function drawLineChart(canvas, series, color, rounds) {
           lines.push(`<span class="lbl-thought">thought</span> <span class="muted">${meta}</span>`);
         }
         if (best.estimate_usd != null) lines.push(totalPrice(best.estimate_usd));
-      } else if (best.kind === "system" && best.estimate_usd != null) {
-        lines.push(totalPrice(best.estimate_usd));
       }
       t.style.whiteSpace = "normal";
       t.style.maxWidth = "280px";
-      // Position near cursor (right-biased); measure while still CSS-hidden
-      const html = lines.filter(Boolean).join("<br>");
-      const { tw } = measureChartTip(t, html);
-      let leftPx = mx + 12;
-      if (leftPx + tw > rect.width - 4) leftPx = mx - tw - 8;
-      showChartTip(t, html, Math.max(4, leftPx), Math.max(4, my - 10));
+      // Viewport-fixed tip (canvas-relative + fixed was too high / clipped).
+      placeCostTip(ev, t, lines.filter(Boolean).join("<br>"));
     });
     canvas.addEventListener("mouseleave", () => {
       canvas._ctxPtr = null;
-      hideChartTip(tip());
+      if (!canvas._ratePts) hideChartTip(tip());
       canvas.style.cursor = "default";
     });
     canvas.addEventListener("click", (ev) => {
+      if (canvas._ratePts) return;
       const list = canvas._ctxPts;
       if (!list || !list.length) return;
       const rect = canvas.getBoundingClientRect();
@@ -457,14 +629,26 @@ function normToolCatName(raw) {
 function costSegKey(seg) {
   if (!seg) return "";
   const k = String(seg.k || "");
+  // Stable keys (by-label folds Compact N / LLM Answer RN → one chip).
   if (k === "in" || k === "cached" || k === "out" || k === "system"
-      || k === "recap" || k === "compact" || k === "official")
+      || k === "recap" || k === "compact" || k === "official"
+      || k === "cache_miss" || k === "prompt" || k === "llm_answer"
+      || k === "compact_out" || k === "user")
+    return k;
+  if (k === "sys_prompt" || k === "user_info" || k === "reminders" || k === "tool_def")
     return k;
   if (seg.legendKey) {
     const lk = String(seg.legendKey);
     const low = lk.toLowerCase();
-    if (low === "in" || low === "cached" || low === "out" || low === "system")
-      return low;
+    if (low === "in" || low === "cached" || low === "out" || low === "system"
+        || low === "prompt" || low === "llm answer" || low === "llm_answer"
+        || low === "compact out" || low === "compact_out")
+      return low === "llm answer" ? "llm_answer"
+        : low === "compact out" ? "compact_out"
+        : low;
+    if (low.startsWith("llm answer")) return "llm_answer";
+    if (low.startsWith("compact ") && low.endsWith(" out")) return "compact_out";
+    if (low === "compact out") return "compact_out";
     return lk;
   }
   if (k === "tool" || k === "toolreq")
@@ -473,21 +657,37 @@ function costSegKey(seg) {
   const low = lab.toLowerCase();
   if (low === "in" || low === "cached" || low === "out" || low === "system")
     return low;
+  if (low.startsWith("llm answer")) return "llm_answer";
+  if (low === "compact out" || (low.startsWith("compact ") && low.endsWith(" out")))
+    return "compact_out";
+  if (low === "prompt") return "prompt";
   return lab || k || "";
 }
 
-/** In / Cached / Out and LLM Out→In keep that casing; everything else lowercase. */
+/** I/O: first letter capital. Other stacks: all lowercase. */
 function costDisplayLabel(seg) {
   if (!seg) return "";
+  const io = currentCostStack() === "io";
   const k = String(seg.k || "");
-  if (k === "llm_out_in" || seg.legendKey === "llm_out_in") return "LLM Out→In";
-  if (k === "in") return "In";
-  if (k === "cached") return "Cached";
-  if (k === "out") return "Out";
-  const raw = String(seg.label || k || "");
-  if (raw === "LLM Out→In" || raw === "LLM Out->In") return "LLM Out→In";
-  if (raw === "In" || raw === "Cached" || raw === "Out") return raw;
-  return raw.toLowerCase();
+  let raw;
+  if (k === "llm_out_in" || seg.legendKey === "llm_out_in") raw = "llm out→in";
+  else if (k === "in") raw = "in";
+  else if (k === "cached") raw = "cached";
+  else if (k === "out") raw = "out";
+  else if (k === "cache_miss") raw = "cache miss";
+  else if (k === "prompt") raw = "prompt";
+  else if (k === "llm_answer") raw = "llm answer";
+  else if (k === "compact_out") raw = "compact out";
+  else if (k === "sys_prompt") raw = "system prompt";
+  else if (k === "user_info") raw = "user info";
+  else if (k === "reminders") raw = "reminders & skills";
+  else if (k === "tool_def") raw = "tool def";
+  else if (k === "sub") raw = String(seg.label || "sub agent");
+  else raw = String(seg.label || k || "");
+  if (raw === "LLM Out→In" || raw === "LLM Out->In") raw = "llm out→in";
+  raw = String(raw).toLowerCase();
+  if (!io) return raw;
+  return raw ? raw.charAt(0).toUpperCase() + raw.slice(1) : raw;
 }
 
 function isCostSegHidden(seg, hidden) {
@@ -513,9 +713,17 @@ const COST_COLORS = {
   cached: "#f0b429",
   out: "#f07178",
   system: "#8ab4f8",
+  sys_prompt: "#8ab4f8",
+  user_info: "#7aa2f7",
+  reminders: "#9d7cd8",
+  tool_def: "#6d8fd6",
   user: "#5ccfe6",       /* same blue as message */
+  prompt: "#5ccfe6",
+  llm_answer: "#7dcfff",
+  compact_out: "#e0b060",
   harness: "#3ecf8e",     /* same green as In / tool results */
   residual: "#8fd3a8",
+  cache_miss: "#d97757",  /* leftover uncached KV reread — not user, not residual */
   thought: "#c4a5e8",
   reasoning: "#a78bfa",
   toolreq: "#e88a90",    /* light red — tool request */
@@ -529,7 +737,12 @@ const COST_COLORS = {
   official: "#3d9cf0",
   sub: "#8b7cf7",
 };
-const SUB_SHADES = ["#8b7cf7", "#a78bfa", "#6d5ae6", "#c4b5fd"];
+const SUB_SHADES = ["#c4b5fd", "#a78bfa", "#8b7cf7", "#6d5ae6", "#5b21b6", "#4c1d95"];
+
+function subShade(n) {
+  const i = Math.max(1, Number(n) || 1);
+  return SUB_SHADES[(i - 1) % SUB_SHADES.length];
+}
 
 function costSegMetric(seg, unit) {
   if (!seg) return 0;
@@ -543,6 +756,11 @@ function costSegMetric(seg, unit) {
 }
 
 function fmtCostAxis(v, unit) {
+  if (unit === "pct") {
+    const n = Number(v) || 0;
+    if (Math.abs(n - Math.round(n)) < 1e-6) return `${Math.round(n)}%`;
+    return `${n.toFixed(1)}%`;
+  }
   if (unit === "tokens") return fmtTokens(v);
   const n = Number(v) || 0;
   if (n === 0) return "$0";
@@ -556,6 +774,9 @@ function fmtCostAxis(v, unit) {
 
 /** Token Y-axis: ~5–8 ticks (same Round overview + Drill — no dense 500-step grids). */
 function niceCostYMaxForUnit(m, unit) {
+  if (unit === "pct") {
+    return { min: 0, max: 100, step: 20 };
+  }
   if (unit === "tokens") {
     m = Math.max(0, Number(m) || 0);
     if (m <= 0) return { min: 0, max: 1000, step: 200 };
@@ -630,16 +851,15 @@ function turnCostParts(t, round, { detail, peelSystem } = {}) {
   ccache = Number(ccache) || 0;
   cout = Number(cout) || 0;
 
-  // R1 peeled total = tree In + Cached + Out (matches hierarchy white $).
-  // Prefer round.estimate_usd when already peeled; never scale to API+System.
-  let tot;
+  // Stack totals = raw hierarchy In/Cached/Out. Never scale modes to match each other.
   const partsSum = cin + ccache + cout;
+  let tot = partsSum;
   if (peelSystem || bd.round_total_peeled_system) {
-    tot = (round && round.estimate_usd != null && bd.round_total_peeled_system)
-      ? Number(round.estimate_usd)
-      : (partsSum > 0 ? partsSum : Math.max(0, Number(t.estimate_usd || bd.total_usd || 0) - sys));
-    // Do not rescale — stack must match hierarchy In/Cached/Out
-  } else {
+    if (round && round.estimate_usd != null && bd.round_total_peeled_system)
+      tot = Number(round.estimate_usd) || partsSum;
+    else if (!(partsSum > 0))
+      tot = Math.max(0, Number(t.estimate_usd || bd.total_usd || 0) - sys);
+  } else if (!(partsSum > 0)) {
     tot = Number(
       (round && round.estimate_usd != null ? round.estimate_usd : null)
       ?? t.estimate_usd
@@ -647,26 +867,8 @@ function turnCostParts(t, round, { detail, peelSystem } = {}) {
       ?? bd.total
       ?? 0
     ) || 0;
-    // Warm rounds: light align only when parts are empty or tiny drift
-    let sum = partsSum;
-    if (sum <= 0 && tot > 0) { cout = tot; sum = tot; }
-    else if (tot > 0 && Math.abs(sum - tot) > 1e-6 && sum > 0) {
-      const restTarget = Math.max(0, tot - cin);
-      const rest = ccache + cout;
-      if (rest > 0 && restTarget > 0) {
-        const s = restTarget / rest;
-        ccache *= s;
-        cout *= s;
-      } else {
-        const s = tot / sum;
-        cin *= s; ccache *= s; cout *= s;
-      }
-    }
   }
-  const sum = cin + ccache + cout;
-  if (peelSystem || bd.round_total_peeled_system) {
-    tot = sum > 0 ? sum : tot;
-  }
+  const sum = partsSum > 0 ? partsSum : tot;
 
   // Token counts for Tok unit mode
   const tinTok = Number(bd.tree_in_tokens)
@@ -681,25 +883,53 @@ function turnCostParts(t, round, { detail, peelSystem } = {}) {
     ?? 0;
   const userTokN = userTok || 0;
   const harnessTokN = Number(bd.harness_in_tokens) || 0;
+  const missTokN = Number(bd.cache_miss_in_tokens)
+    || Number(round && round.cache_miss_in_tokens) || 0;
   let thoughtTokN = Number(bd.llm_thought_summary_tokens) || 0;
-  const reasonTokN = Number(bd.llm_reasoning_encrypted_tokens)
-    || Number(bd.llm_reasoning_tokens) || 0;
+  let reasonTokN = Number(bd.llm_reasoning_tokens ?? bd.llm_reasoning_encrypted_tokens) || 0;
   const emitTokN = Number(bd.llm_out_to_harness_tokens) || 0;
   const msgTokN = Number(bd.llm_out_to_user_tokens) || 0;
 
   const segs = [];
 
   if (detail) {
-    const harness = Number(bd.harness_in_usd) || 0;
-    // Thought = pure Out (summary); Reasoning enc separate; tools from reason budget
+    let harness = Number(bd.harness_in_usd) || 0;
+    let harnessTok = harnessTokN;
+    // Compact Out → User in Parts. Between-rounds is already off harness_in
+    // (owned by user.compact_out); only mid-round compact still sits in harness.
+    let coUsd = 0;
+    let coTok = 0;
+    const upCo = (round && round.user_prompt && round.user_prompt.compact_out) || {};
+    const coUserUsd = Number(upCo.cost_in_usd) || 0;
+    const coUserTok = Number(upCo.tokens_in) || 0;
+    let coMidUsd = 0;
+    let coMidTok = 0;
+    for (const step of (round && round.model_steps) || []) {
+      for (const ch of step.children || []) {
+        if (!ch || ch.kind !== "phase_harness") continue;
+        for (const sub of ch.children || []) {
+          if (!sub || sub.kind !== "compact_out_in") continue;
+          if (String(sub.attribution || "") === "user") continue;
+          coMidUsd += Number(sub.cost_in_usd) || 0;
+          coMidTok += Number(sub.tokens_in || sub.context_delta) || 0;
+        }
+      }
+    }
+    coUsd = coUserUsd + coMidUsd;
+    coTok = coUserTok + coMidTok;
+    if (coMidUsd > 0 || coMidTok > 0) {
+      harness = Math.max(0, harness - coMidUsd);
+      harnessTok = Math.max(0, harnessTok - coMidTok);
+    }
+    const missUsd = Number(bd.cache_miss_in_usd)
+      || Number(round && round.cache_miss_in_usd) || 0;
     let thought = Number(bd.llm_thought_summary_usd) || 0;
     if (!(thought > 0 || thoughtTokN > 0)) {
       const fromSteps = _sumThoughtFromSteps(round);
       thought = fromSteps.usd;
       thoughtTokN = fromSteps.tok;
     }
-    const reasoningEnc = Number(bd.llm_reasoning_encrypted_usd)
-      || (Number(bd.llm_reasoning_usd) || 0);
+    const reasoningEnc = Number(bd.llm_reasoning_usd ?? bd.llm_reasoning_encrypted_usd) || 0;
     const emit = Number(bd.llm_out_to_harness_usd) || 0;
     const msg = Number(bd.llm_out_to_user_usd) || 0;
     // System is a separate chart bar when peelSystem — omit from R1 stack
@@ -709,61 +939,38 @@ function turnCostParts(t, round, { detail, peelSystem } = {}) {
         color: COST_COLORS.system, tokens: sysTok || null,
       });
     }
+    // Parts = tree aggregation only (same User fold as Tools: prompt + answer + compact).
+    const uFold = userToolsSegs(up, round && round.index);
+    let userPartsUsd = uFold.reduce((a, s) => a + (Number(s.v) || 0), 0);
+    let userPartsTok = uFold.reduce((a, s) => a + (Number(s.tok) || 0), 0);
+    if (!(userPartsUsd > 0 || userPartsTok > 0)) {
+      userPartsUsd = user + coUserUsd;
+      userPartsTok = userTokN + coUserTok;
+    }
+    userPartsUsd += coMidUsd;
+    userPartsTok += coMidTok;
     let inParts = [
-      { k: "user", label: "user", v: user, tok: userTokN, color: COST_COLORS.user },
-      { k: "harness", label: "harness", v: harness, tok: harnessTokN, color: COST_COLORS.harness },
-    ];
-    const inSum = inParts.reduce((a, p) => a + p.v, 0);
-    const inTokSum = inParts.reduce((a, p) => a + (p.tok || 0), 0);
-    if (cin > 0 || tinTok > 0) {
-      if (inSum > 0) {
-        const scale = cin > 0 ? cin / inSum : 1;
-        const tscale = inTokSum > 0 && tinTok > 0 ? tinTok / inTokSum : 1;
-        inParts = inParts.map(p => ({
-          ...p,
-          v: p.v * scale,
-          tok: (p.tok || 0) * tscale,
-        }));
-        const used = inParts.reduce((a, p) => a + p.v, 0);
-        const usedT = inParts.reduce((a, p) => a + (p.tok || 0), 0);
-        if (cin - used > 1e-9 || tinTok - usedT > 1)
-          inParts.push({
-            k: "residual", label: "in residual",
-            v: Math.max(0, cin - used),
-            tok: Math.max(0, tinTok - usedT),
-            color: COST_COLORS.residual,
-          });
-      } else {
-        inParts = [{ k: "in", label: "in", v: cin, tok: tinTok, color: COST_COLORS.in }];
-      }
-    } else {
-      inParts = [];
+      { k: "user", label: "user", v: userPartsUsd, tok: userPartsTok, color: COST_COLORS.user },
+      { k: "harness", label: "harness", v: harness, tok: harnessTok, color: COST_COLORS.harness },
+      { k: "cache_miss", label: "cache miss", legendKey: "cache_miss",
+        v: missUsd, tok: missTokN, color: COST_COLORS.cache_miss },
+    ].filter((p) => p.v > 0 || p.tok > 0);
+    if (!inParts.length && (cin > 0 || tinTok > 0)) {
+      inParts = [{ k: "in", label: "in", v: cin, tok: tinTok, color: COST_COLORS.in }];
     }
     let outParts = [
       { k: "thought", label: "thought", v: thought, tok: thoughtTokN, color: COST_COLORS.thought },
       { k: "reasoning", label: "reasoning", v: reasoningEnc, tok: reasonTokN, color: COST_COLORS.reasoning },
       { k: "toolreq", label: "tool req", v: emit, tok: emitTokN, color: COST_COLORS.toolreq },
       { k: "message", label: "message", v: msg, tok: msgTokN, color: COST_COLORS.message },
-    ];
-    const outSum = outParts.reduce((a, p) => a + p.v, 0);
-    const outTokSum = outParts.reduce((a, p) => a + (p.tok || 0), 0);
-    if (cout > 0 || toutTok > 0) {
-      if (outSum > 0) {
-        const scale = cout > 0 ? cout / outSum : 1;
-        const tscale = outTokSum > 0 && toutTok > 0 ? toutTok / outTokSum : 1;
-        outParts = outParts.map(p => ({
-          ...p,
-          v: p.v * scale,
-          tok: (p.tok || 0) * tscale,
-        }));
-      } else {
-        outParts = [{ k: "out", label: "out", v: cout, tok: toutTok, color: COST_COLORS.out }];
-      }
-    } else outParts = [];
-    segs.push(...inParts.filter(p => p.v > 0 || p.tok > 0));
+    ].filter((p) => p.v > 0 || p.tok > 0);
+    if (!outParts.length && (cout > 0 || toutTok > 0)) {
+      outParts = [{ k: "out", label: "out", v: cout, tok: toutTok, color: COST_COLORS.out }];
+    }
+    segs.push(...inParts);
     if (ccache > 0 || tcacheTok > 0)
       segs.push({ k: "cached", label: "cached", v: ccache, tok: tcacheTok, color: COST_COLORS.cached });
-    segs.push(...outParts.filter(p => p.v > 0 || p.tok > 0));
+    segs.push(...outParts);
   } else {
     // Simple stack: In / Cached / Out only (User folded into global In).
     // System only inside this bar when NOT a separate chart bar.
@@ -820,28 +1027,199 @@ function turnCostPartsTools(t, round, { peelSystem } = {}) {
   let segs = [];
   steps.forEach((s, i) => {
     const b = callCostParts(s, s.index ?? i + 1, round);
-    segs = mergeCostSegs(segs, b.segs || []);
+    // Drop per-call cached — Σ call prefixes ≠ official round when cache miss.
+    const withoutCache = (b.segs || []).filter((x) => x.k !== "cached");
+    segs = mergeCostSegs(segs, withoutCache);
   });
   if (!segs.length)
     return turnCostParts(t, round, { detail: true, peelSystem });
+  // Round-level KV miss + official Cached (same as Parts) — not Σ calls.
+  const bd = (round && round.breakdown) || {};
+  const missUsd = Number(bd.cache_miss_in_usd)
+    || Number(round && round.cache_miss_in_usd) || 0;
+  const missTok = Number(bd.cache_miss_in_tokens)
+    || Number(round && round.cache_miss_in_tokens) || 0;
+  if (missUsd > 0 || missTok > 0) {
+    segs = mergeCostSegs(segs, [{
+      k: "cache_miss",
+      label: "cache miss",
+      legendKey: "cache_miss",
+      v: missUsd,
+      tok: missTok,
+      color: COST_COLORS.cache_miss,
+    }]);
+  }
+  const cacheUsd = Number(bd.cached_usd)
+    || Number(round && round.cost_cached_usd)
+    || Number(base.cached) || 0;
+  const cacheTok = Number(bd.cached_tokens)
+    || Number(round && round.cached_read_tokens)
+    || Number(base.cached_tokens) || 0;
+  if (cacheUsd > 0 || cacheTok > 0) {
+    segs = mergeCostSegs(segs, [{
+      k: "cached",
+      label: "cached",
+      legendKey: "cached",
+      v: cacheUsd,
+      tok: cacheTok,
+      color: COST_COLORS.cached,
+    }]);
+  }
   return { ...base, segs };
 }
 
-function systemCostBar(round) {
+/** User Tools cats: prompt / LLM Answer RN-1 / Compact [N] Out. */
+function userToolsSegs(up, roundIndex) {
+  if (!up) return [];
+  const out = [];
+  const prev = up.prev_llm_answer || {};
+  const ansT = Number(prev.tokens_in) || 0;
+  const ansU = Number(prev.cost_in_usd) || 0;
+  let promptT = Number(
+    up.prompt_tokens_in != null ? up.prompt_tokens_in : (up.tokens_in ?? up.uncached_est)
+  ) || 0;
+  let promptU = Number(
+    up.prompt_cost_in_usd != null ? up.prompt_cost_in_usd : up.cost_in_usd
+  ) || 0;
+  const co = up.compact_out || {};
+  const coT = Number(co.tokens_in) || 0;
+  const coU = Number(co.cost_in_usd) || 0;
+  if (promptT > 0 || promptU > 0) {
+    out.push({
+      k: "prompt",
+      label: "prompt",
+      legendKey: "prompt",
+      v: promptU || 0,
+      tok: promptT || 0,
+      color: COST_COLORS.prompt,
+    });
+  }
+  if (ansT > 0 || ansU > 0) {
+    const rn = Number(prev.round_index) || Math.max(0, Number(roundIndex || 1) - 1);
+    out.push({
+      k: "llm_answer",
+      label: rn > 0 ? ("LLM Answer R" + rn) : "LLM Answer",
+      legendKey: "llm_answer",
+      v: ansU || 0,
+      tok: ansT || 0,
+      color: COST_COLORS.llm_answer,
+    });
+  }
+  if (coT > 0 || coU > 0) {
+    const cn = co.compact_index;
+    out.push({
+      k: "compact_out",
+      label: (cn != null && Number(cn) > 0) ? ("Compact " + Number(cn) + " Out") : "Compact Out",
+      legendKey: "compact_out",
+      v: coU || 0,
+      tok: coT || 0,
+      color: COST_COLORS.compact_out,
+    });
+  }
+  if (!out.length) {
+    const userU = Number(up.cost_in_usd) || 0;
+    const userT = Number(up.tokens_in ?? up.uncached_est) || 0;
+    if (userU > 0 || userT > 0) {
+      out.push({
+        k: "user",
+        label: "user",
+        legendKey: "user",
+        v: userU || 0,
+        tok: userT || 0,
+        color: COST_COLORS.user,
+      });
+    }
+  }
+  return out;
+}
+
+/** System Tools cats from bootstrap parts. */
+function systemToolsSegs(sp, sysUsd, sysTok) {
+  const raw = (sp && sp.parts) || [];
+  const mapKind = (kind, label) => {
+    const k = String(kind || "");
+    if (k === "system") return { k: "sys_prompt", label: "System Prompt", color: COST_COLORS.sys_prompt };
+    if (k === "user_info") return { k: "user_info", label: "User info", color: COST_COLORS.user_info };
+    if (k === "reminders") return { k: "reminders", label: "Reminders & Skills", color: COST_COLORS.reminders };
+    if (k === "tool_definitions" || k === "tool_defs_message")
+      return { k: "tool_def", label: "Tool Def", color: COST_COLORS.tool_def };
+    if (k === "mcp") return { k: "tool_def", label: "Tool Def", color: COST_COLORS.tool_def };
+    return { k: "sys_prompt", label: label || k || "System Prompt", color: COST_COLORS.sys_prompt };
+  };
+  const segs = [];
+  let sumT = 0;
+  let sumU = 0;
+  for (const p of raw) {
+    if (!p || p.kind === "hooks") continue;
+    const tok = Number(p.tokens ?? p.tokens_in) || 0;
+    const usd = Number(p.cost_in_usd);
+    const m = mapKind(p.kind, p.label);
+    if (!(tok > 0 || (Number.isFinite(usd) && usd > 0))) continue;
+    sumT += tok;
+    const v = Number.isFinite(usd) ? usd : 0;
+    sumU += v;
+    segs.push({
+      k: m.k,
+      label: m.label,
+      legendKey: m.k,
+      v,
+      tok,
+      color: m.color,
+    });
+  }
+  // Only fill missing $ from tokens (tree parts often have tokens, no cost_in_usd).
+  // Never rescale priced parts to force Σ = System card total.
+  if (segs.length && sysUsd > 0 && !(sumU > 0) && sumT > 0) {
+    for (const s of segs) s.v = sysUsd * ((Number(s.tok) || 0) / sumT);
+  }
+  if (!segs.length && (sysUsd > 0 || sysTok > 0)) {
+    segs.push({
+      k: "system",
+      label: "system",
+      legendKey: "system",
+      v: sysUsd || 0,
+      tok: sysTok || 0,
+      color: COST_COLORS.system,
+    });
+  }
+  return segs.filter((s) => s.v > 0 || s.tok > 0);
+}
+
+function systemCostBar(round, { stack } = {}) {
   const sp = round && round.system_prompt;
   const bd = (round && round.breakdown) || {};
   const sys = Number(bd.system_in_usd) || Number(sp && sp.cost_in_usd) || 0;
   const sysTok = Number(bd.system_in_tokens) || Number(sp && (sp.tokens_in ?? sp.logical_tokens)) || 0;
   if (sys <= 0 && sysTok <= 0) return null;
-  return {
-    segs: [{
+  const st = (stack || (window.__costChart && window.__costChart.stack) || "io");
+  let segs;
+  if (st === "io") {
+    // Rounds I/O: Sys bar = green In only.
+    segs = [{
+      k: "in",
+      label: "In",
+      legendKey: "in",
+      v: sys || 0,
+      tok: sysTok || 0,
+      color: COST_COLORS.in,
+      tokens: sysTok || null,
+    }];
+  } else if (st === "tools") {
+    segs = systemToolsSegs(sp, sys, sysTok);
+  } else {
+    // Parts: single system (blue).
+    segs = [{
       k: "system",
       label: "system",
+      legendKey: "system",
       v: sys || 0,
       tok: sysTok || 0,
       color: COST_COLORS.system,
       tokens: sysTok || null,
-    }],
+    }];
+  }
+  return {
+    segs,
     in: sys,
     cached: 0,
     out: 0,
@@ -857,7 +1235,122 @@ function systemCostBar(round) {
   };
 }
 
-function callCostParts(step, callIndex, round) {
+/** Separate User bar for Cost drill (like Sys on overview). */
+function userCostBar(round, { stack } = {}) {
+  const up = round && round.user_prompt;
+  if (!up || up.kind !== "user_prompt") return null;
+  const bd = (round && round.breakdown) || {};
+  const st = (stack || (window.__costChart && window.__costChart.stack) || "io");
+  const isR1 = Number(round && round.index) === 1;
+
+  const co = up.compact_out || {};
+  const coTok = Number(co.tokens_in) || 0;
+  const coUsd = Number(co.cost_in_usd) || 0;
+  let inTok = Number(up.display_in_tokens)
+    || Number(bd.user_in_tokens)
+    || Number(up.tokens_in ?? up.uncached_est)
+    || 0;
+  let inUsd = Number(up.display_in_usd)
+    || Number(bd.user_in_usd)
+    || Number(up.cost_in_usd)
+    || 0;
+  if (!(inTok > 0) && coTok > 0) inTok = coTok;
+  if (!(inUsd > 0) && coUsd > 0) inUsd = coUsd;
+
+  // Keep User Cached even on round KV miss (Σ User+calls may exceed round Cached).
+  // R1 User never has Cached — leave at 0.
+  let cacheTok = isR1
+    ? 0
+    : (Number(up.tokens_cached ?? up.cached_est ?? bd.user_cached_tokens) || 0);
+  let cacheUsd = isR1
+    ? 0
+    : (Number(up.cost_cached_usd ?? bd.user_cached_usd) || 0);
+
+  let segs = [];
+  if (st === "tools") {
+    segs = userToolsSegs(up, round && round.index).slice();
+    if (cacheTok > 0 || cacheUsd > 0) {
+      segs.push({
+        k: "cached",
+        label: "cached",
+        legendKey: "cached",
+        v: cacheUsd || 0,
+        tok: cacheTok || 0,
+        color: COST_COLORS.cached,
+      });
+    }
+  } else if (st === "parts") {
+    const fold = userToolsSegs(up, round && round.index);
+    let userUsd = fold.reduce((a, s) => a + (Number(s.v) || 0), 0);
+    let userTok = fold.reduce((a, s) => a + (Number(s.tok) || 0), 0);
+    if (!(userUsd > 0 || userTok > 0)) {
+      userUsd = inUsd;
+      userTok = inTok;
+    }
+    if (userUsd > 0 || userTok > 0) {
+      segs.push({
+        k: "user",
+        label: "user",
+        legendKey: "user",
+        v: userUsd || 0,
+        tok: userTok || 0,
+        color: COST_COLORS.user,
+      });
+    }
+    if (cacheTok > 0 || cacheUsd > 0) {
+      segs.push({
+        k: "cached",
+        label: "cached",
+        legendKey: "cached",
+        v: cacheUsd || 0,
+        tok: cacheTok || 0,
+        color: COST_COLORS.cached,
+      });
+    }
+  } else {
+    if (inTok > 0 || inUsd > 0) {
+      segs.push({
+        k: "in",
+        label: "In",
+        legendKey: "in",
+        v: inUsd || 0,
+        tok: inTok || 0,
+        color: COST_COLORS.in,
+      });
+    }
+    if (cacheTok > 0 || cacheUsd > 0) {
+      segs.push({
+        k: "cached",
+        label: "Cached",
+        legendKey: "cached",
+        v: cacheUsd || 0,
+        tok: cacheTok || 0,
+        color: COST_COLORS.cached,
+      });
+    }
+  }
+  segs = segs.filter((s) => (Number(s.v) || 0) > 0 || (Number(s.tok) || 0) > 0);
+  if (!segs.length) return null;
+  const total = segs.reduce((a, s) => a + (Number(s.v) || 0), 0);
+  const totalTok = segs.reduce((a, s) => a + (Number(s.tok) || 0), 0);
+  return {
+    segs,
+    in: inUsd || 0,
+    cached: cacheUsd || 0,
+    out: 0,
+    total: total || 0,
+    total_tok: totalTok || 0,
+    official: null,
+    index: "user",
+    label: "User",
+    kind: "user",
+    uncached_tokens: inTok || 0,
+    cached_tokens: cacheTok || 0,
+    out_tokens: 0,
+  };
+}
+
+function callCostParts(step, callIndex, round, opts) {
   const se = step.estimate || {};
   // Stack draw order: first segment = bottom of bar.
   // Desired top→bottom (hierarchy colors): thought · reasoning · message ·
@@ -872,31 +1365,24 @@ function callCostParts(step, callIndex, round) {
 
   // Cached (this call prompt prefix)
   const ccache = Number(step.cost_cached_usd ?? se.cost_cached_usd) || 0;
-  // First LLM call: User paid@start only. System stays on the System card.
+  // First LLM call: User Tools = prompt / LLM Answer RN-1 / Compact Out.
+  // Skip when drill draws a separate User bar (omitUser).
   const isFirstCall = Number(callIndex) === 1;
   const up = round && round.user_prompt;
-  if (isFirstCall && up && (up.tokens_in || up.uncached_est || up.cost_in_usd)) {
-    const userU = Number(up.cost_in_usd) || 0;
-    const userT = Number(up.tokens_in ?? up.uncached_est) || 0;
-    if (userU > 0 || userT > 0) {
-      bottomExtra.push({
-        k: "user",
-        label: (window.__costChart && window.__costChart.superAgent) ? "super agent" : "user",
-        v: userU || 0,
-        tok: userT || 0,
-        color: COST_COLORS.user,
-        tokens: userT || null,
-      });
+  if (isFirstCall && up && !(opts && opts.omitUser)) {
+    for (const s of userToolsSegs(up, round && round.index)) {
+      bottomExtra.push(s);
     }
   }
   // Caused In (tree) — LLM Out→In + tools split by name (same rules as toolreqs)
-  const causedIn = Number(step.cost_in_usd ?? se.cost_in_usd) || 0;
-  const causedInTok = Number(step.uncached_input_tokens ?? se.uncached_input_tokens) || 0;
+  let causedIn = Number(step.cost_in_usd ?? se.cost_in_usd) || 0;
+  let causedInTok = Number(step.uncached_input_tokens ?? se.uncached_input_tokens) || 0;
   let harnessUsd = 0;
   let harnessTok = 0;
   const toolAgg = new Map(); // normName → {v, tok, n}
   let llmOutUsd = 0;
   let llmOutTok = 0;
+  const compactOutSegs = [];
   for (const ch of step.children || []) {
     if (ch.kind !== "phase_harness") continue;
     for (const sub of ch.children || []) {
@@ -904,6 +1390,32 @@ function callCostParts(step, callIndex, round) {
       if (sub.kind === "hook") continue; // Hook not on Cost per Round graph
       const u = Number(sub.cost_in_usd) || 0;
       const tk = Number(sub.tokens_in || sub.context_delta) || 0;
+      if (sub.kind === "compact_out_in") {
+        // Between-rounds: User owns it (already in bottomExtra). Mid-round: own cat.
+        if (String(sub.attribution || "") === "user") {
+          // Accounted under User — peel out of Call In so it is not "in residual".
+          causedIn = Math.max(0, causedIn - u);
+          causedInTok = Math.max(0, causedInTok - tk);
+          continue;
+        }
+        if (u > 0 || tk > 0) {
+          const cn = sub.compact_index;
+          const lab = (cn != null && Number(cn) > 0)
+            ? ("Compact " + Number(cn) + " Out")
+            : "Compact Out";
+          compactOutSegs.push({
+            k: "compact_out",
+            label: lab,
+            legendKey: "compact_out",
+            v: u || 0,
+            tok: tk || 0,
+            color: COST_COLORS.compact_out,
+          });
+          harnessUsd += u;
+          harnessTok += tk;
+        }
+        continue;
+      }
       if (u <= 0 && tk <= 0) continue;
       harnessUsd += u;
       harnessTok += tk;
@@ -921,6 +1433,7 @@ function callCostParts(step, callIndex, round) {
       toolAgg.set(name, prev);
     }
   }
+  for (const s of compactOutSegs) toolSegs.push(s);
   // One segment per tool name (label stable → legend consolidates grep / grep x2)
   for (const [name, g] of toolAgg) {
     if (!(g.v > 0 || g.tok > 0)) continue;
@@ -945,34 +1458,13 @@ function callCostParts(step, callIndex, round) {
     });
   }
 
-  if (causedIn > 0 || causedInTok > 0) {
-    if (harnessUsd > 0 && harnessUsd <= causedIn + 1e-9) {
-      const scale = harnessUsd > 0 ? Math.min(1, causedIn / harnessUsd) : 1;
-      const tscale = harnessTok > 0 && causedInTok > 0
-        ? Math.min(1, causedInTok / harnessTok) : 1;
-      toolSegs.forEach(s => { s.v *= scale; s.tok = (s.tok || 0) * tscale; });
-      llmOutSegs.forEach(s => { s.v *= scale; s.tok = (s.tok || 0) * tscale; });
-      const used =
-        toolSegs.reduce((a, s) => a + s.v, 0) +
-        llmOutSegs.reduce((a, s) => a + s.v, 0);
-      const usedT =
-        toolSegs.reduce((a, s) => a + (s.tok || 0), 0) +
-        llmOutSegs.reduce((a, s) => a + (s.tok || 0), 0);
-      if (causedIn - used > 1e-9 || causedInTok - usedT > 1)
-        bottomExtra.push({
-          k: "residual",
-          label: "in residual",
-          legendKey: "in residual",
-          v: Math.max(0, causedIn - used),
-          tok: Math.max(0, causedInTok - usedT),
-          color: COST_COLORS.residual,
-        });
-    } else if (!(toolSegs.length || llmOutSegs.length)) {
-      bottomExtra.push({
-        k: "in", label: "in", legendKey: "in",
-        v: causedIn, tok: causedInTok, color: COST_COLORS.in,
-      });
-    }
+  // Tools In = harness children as in the tree. No scale / residual to Call In.
+  if (!(toolSegs.length || llmOutSegs.length || compactOutSegs.length)
+    && (causedIn > 0 || causedInTok > 0)) {
+    bottomExtra.push({
+      k: "in", label: "in", legendKey: "in",
+      v: causedIn, tok: causedInTok, color: COST_COLORS.in,
+    });
   }
   const ccacheTok = Number(step.cached_read_tokens ?? se.cached_read_tokens) || 0;
   if (ccache > 0 || ccacheTok > 0) {
@@ -1077,15 +1569,21 @@ function callCostParts(step, callIndex, round) {
       }
     }
   }
+  const cout = Number(step.cost_out_usd ?? se.cost_out_usd) || 0;
+  const coutT = Number(step.output_tokens ?? se.output_tokens) || 0;
   if (!(thoughtU || encU || msgU || reqAgg.size || thoughtT || encT || msgT)) {
-    const cout = Number(step.cost_out_usd ?? se.cost_out_usd) || 0;
-    const coutT = Number(step.output_tokens ?? se.output_tokens) || 0;
     if (cout > 0 || coutT > 0)
       thoughtSegs.push({
         k: "out", label: "out", legendKey: "out",
         v: cout, tok: coutT, color: COST_COLORS.out,
       });
   } else {
+    // Out cats = tree LLM children as priced. No scale to official Out.
+    const estReT = Number(
+      se.output_reasoning_tokens
+      ?? (step.composition && step.composition.reasoning_encrypted_out)
+    ) || 0;
+    if (estReT > 0 && !(encT > 0)) encT = estReT;
     if (thoughtU > 0 || thoughtT > 0)
       thoughtSegs.push({
         k: "thought", label: "thought", legendKey: "thought",
@@ -1167,8 +1665,13 @@ function foldCallToIo(bar) {
     const t = Number(s.tok) || 0;
     if (s.k === "cached") { cache += v; cacheT += t; }
     else if (s.k === "in" || s.k === "user" || s.k === "harness" || s.k === "tool"
-        || s.k === "llm_out_in" || s.k === "residual") {
+        || s.k === "llm_out_in" || s.k === "residual" || s.k === "cache_miss"
+        || s.k === "prompt" || s.k === "llm_answer" || s.k === "compact_out"
+        || s.k === "sys_prompt" || s.k === "user_info" || s.k === "reminders"
+        || s.k === "tool_def" || s.k === "system") {
       inn += v; innT += t;
+    } else if (s.k === "sub") {
+      /* I/O folds child In/Cached/Out before this; ignore leftover sub segs */
     } else {
       out += v; outT += t;
     }
@@ -1189,8 +1692,14 @@ function foldCallToParts(bar) {
     let k = s.k, lab = s.label, key = costSegKey(s);
     if (s.k === "tool" || s.k === "llm_out_in") {
       k = "harness"; lab = "harness"; key = "harness";
+    } else if (s.k === "prompt" || s.k === "llm_answer" || s.k === "compact_out" || s.k === "user") {
+      k = "user"; lab = "user"; key = "user";
+    } else if (s.k === "sys_prompt" || s.k === "user_info" || s.k === "reminders" || s.k === "tool_def") {
+      k = "system"; lab = "system"; key = "system";
     } else if (s.k === "toolreq") {
       k = "toolreq"; lab = "tool req"; key = "toolreq";
+    } else if (s.k === "sub") {
+      k = "sub"; lab = "Sub Agent"; key = "sub";
     }
     const prev = map.get(key);
     if (!prev) {
@@ -1233,13 +1742,14 @@ function subagentCostBar(sa) {
     : Math.max(0, Number(u.inputTokens || 0) - Number(u.cachedReadTokens || 0));
   const cacheTok = Number.isFinite(tcache) ? tcache : Number(u.cachedReadTokens || 0);
   const outTok = Number.isFinite(tout) ? tout : Number(u.outputTokens || 0);
+  const official = sa.official_usd != null ? Number(sa.official_usd) : null;
   const cin = Number(sa.cost_in_usd) || 0;
   const ccache = Number(sa.cost_cached_usd) || 0;
   const cout = Number(sa.cost_out_usd) || 0;
-  const official = sa.official_usd != null ? Number(sa.official_usd) : null;
   const est = Number(sa.estimate_usd) || (cin + ccache + cout);
-  const total = (official != null && official > 0) ? official : est;
-  const totalTok = Math.max(0, inTok) + Math.max(0, cacheTok) + Math.max(0, outTok);
+  const sumT = Math.max(0, inTok) + Math.max(0, cacheTok) + Math.max(0, outTok);
+  const total = est;
+  const totalTok = sumT;
   if (!(total > 0) && !(totalTok > 0)) return null;
   const n = sa.n != null ? sa.n : "";
   const title = sa.title || sa.label || sa.agent_name || "Sub Agent";
@@ -1267,6 +1777,7 @@ function subagentCostBar(sa) {
     uncached_tokens: inTok,
     cached_tokens: cacheTok,
     out_tokens: outTok,
+    n: Number(n) || 0,
   };
 }
 
@@ -1278,8 +1789,10 @@ function collectRoundSubagentBars(round) {
     if (!step) continue;
     for (const sa of step.subagents_after || []) {
       const id = sa && sa.session_id;
-      if (!id || seen.has(id)) continue;
-      seen.add(id);
+      if (!id) continue;
+      const key = `${id}:${sa.is_sys ? "sys" : (sa.resume_index || 0)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
       const bar = subagentCostBar(sa);
       if (bar) out.push(bar);
     }
@@ -1287,27 +1800,82 @@ function collectRoundSubagentBars(round) {
   return out;
 }
 
-/** Rounds overview: fold each child bill into that turn's stack (not its own X slot). */
-function attachSubagentSegsToTurn(turnBar, round) {
+/** Fold child bills into the parent round bar according to stack mode. */
+function attachSubagentSegsToTurn(turnBar, round, stack) {
   if (!turnBar) return turnBar;
   const kids = collectRoundSubagentBars(round);
   if (!kids.length) return turnBar;
   if (!turnBar.segs) turnBar.segs = [];
-  kids.forEach((sb, i) => {
-    const n = String(sb.label || "").replace(/^S/, "") || String(i + 1);
-    turnBar.segs.push({
-      k: "sub",
-      label: "S" + n,
-      legendKey: "sub:" + (sb.session_id || n),
-      v: sb.total || 0,
-      tok: sb.total_tok || 0,
-      color: SUB_SHADES[i % SUB_SHADES.length],
-      session_id: sb.session_id,
-      title: sb.title,
-    });
-    turnBar.total = (Number(turnBar.total) || 0) + (sb.total || 0);
-    turnBar.total_tok = (Number(turnBar.total_tok) || 0) + (sb.total_tok || 0);
-  });
+  const mode = stack || (window.__costChart && window.__costChart.stack) || "io";
+  const byN = new Map();
+  for (const sb of kids) {
+    const n = String(sb.label || "").replace(/^S/, "") || "1";
+    const prev = byN.get(n);
+    if (!prev) {
+      byN.set(n, {
+        n,
+        in: Number(sb.in) || 0,
+        cached: Number(sb.cached) || 0,
+        out: Number(sb.out) || 0,
+        total: Number(sb.total) || 0,
+        total_tok: Number(sb.total_tok) || 0,
+        uncached_tokens: Number(sb.uncached_tokens) || 0,
+        cached_tokens: Number(sb.cached_tokens) || 0,
+        out_tokens: Number(sb.out_tokens) || 0,
+        session_id: sb.session_id,
+        title: sb.title,
+      });
+    } else {
+      prev.in += Number(sb.in) || 0;
+      prev.cached += Number(sb.cached) || 0;
+      prev.out += Number(sb.out) || 0;
+      prev.total += Number(sb.total) || 0;
+      prev.total_tok += Number(sb.total_tok) || 0;
+      prev.uncached_tokens += Number(sb.uncached_tokens) || 0;
+      prev.cached_tokens += Number(sb.cached_tokens) || 0;
+      prev.out_tokens += Number(sb.out_tokens) || 0;
+    }
+  }
+  const agents = [...byN.values()].sort((a, b) => Number(a.n) - Number(b.n));
+  if (mode === "io") {
+    let inn = 0, cache = 0, out = 0, innT = 0, cacheT = 0, outT = 0;
+    for (const a of agents) {
+      inn += a.in; cache += a.cached; out += a.out;
+      innT += a.uncached_tokens; cacheT += a.cached_tokens; outT += a.out_tokens;
+    }
+    const add = [];
+    if (inn > 0 || innT > 0) add.push({ k: "in", label: "In", legendKey: "in", v: inn, tok: innT, color: COST_COLORS.in });
+    if (cache > 0 || cacheT > 0) add.push({ k: "cached", label: "Cached", legendKey: "cached", v: cache, tok: cacheT, color: COST_COLORS.cached });
+    if (out > 0 || outT > 0) add.push({ k: "out", label: "Out", legendKey: "out", v: out, tok: outT, color: COST_COLORS.out });
+    turnBar.segs = mergeCostSegs(turnBar.segs, add);
+  } else if (mode === "parts") {
+    let tot = 0, tok = 0;
+    for (const a of agents) { tot += a.total; tok += a.total_tok; }
+    turnBar.segs = mergeCostSegs(turnBar.segs, [{
+      k: "sub", label: "Sub Agent", legendKey: "sub",
+      v: tot, tok, color: COST_COLORS.sub,
+    }]);
+  } else {
+    for (const a of agents) {
+      turnBar.segs.push({
+        k: "sub",
+        label: "Sub Agent " + a.n,
+        legendKey: "sub:" + a.n,
+        v: a.total || 0,
+        tok: a.total_tok || 0,
+        color: subShade(a.n),
+        session_id: a.session_id,
+        title: a.title,
+      });
+    }
+  }
+  for (const a of agents) {
+    turnBar.total = (Number(turnBar.total) || 0) + (a.total || 0);
+    turnBar.total_tok = (Number(turnBar.total_tok) || 0) + (a.total_tok || 0);
+    turnBar.in = (Number(turnBar.in) || 0) + (a.in || 0);
+    turnBar.cached = (Number(turnBar.cached) || 0) + (a.cached || 0);
+    turnBar.out = (Number(turnBar.out) || 0) + (a.out || 0);
+  }
   turnBar.has_subagents = true;
   return turnBar;
 }
@@ -1422,6 +1990,8 @@ function recapCostBar(c, recapIndex, { detail } = {}) {
 const COST_Y_LEFT = 56;
 const PLOT_PAD_L = 6;
 const COST_CHART_H = 240;
+const CTX_CHART_H = 260;
+const TREE_FLOOR_PX = 120;
 const COST_MIN_SLOT = 36;
 const COST_MAX_SLOT = 420;
 const MIN_COST_SLOTS = 8;
@@ -1430,6 +2000,58 @@ const GANTT_MIN_SPAN = 5 * 60;
 const GANTT_MAX_H = 920;
 const GANTT_MIN_H = 160;
 const X_AXIS_BAND = 40;
+
+/** Max chart height so cards + charts + Sessions/tree still fit in one viewport. */
+function viewportChartCap(resizingPanelId) {
+  const main = document.querySelector("main");
+  if (!main) return GANTT_MAX_H;
+  const mainH = main.clientHeight || (window.innerHeight - 64);
+  let used = 0;
+  let visible = 0;
+  for (const el of main.children) {
+    if (!el || el.id === resizingPanelId) continue;
+    if (el.classList && el.classList.contains("tree-panel")) continue;
+    const st = window.getComputedStyle(el);
+    if (st.display === "none" || el.hidden) continue;
+    used += el.offsetHeight || 0;
+    visible += 1;
+  }
+  const gap = parseFloat(window.getComputedStyle(main).rowGap || main.style.gap) || 12;
+  // +1 gap for the resized panel itself among visible rows
+  used += gap * Math.max(0, visible);
+  const headSlop = 72; // panel head + toolbar/legend approx inside resized panel
+  return Math.max(GANTT_MIN_H, Math.floor(mainH - used - TREE_FLOOR_PX - headSlop));
+}
+
+function clampChartH(h, fallback, resizingPanelId) {
+  const n = Number(h);
+  const base = Number.isFinite(n) ? n : fallback;
+  const cap = Math.min(GANTT_MAX_H, viewportChartCap(resizingPanelId));
+  return Math.min(cap, Math.max(GANTT_MIN_H, base));
+}
+
+function storedCostChartH() {
+  try {
+    const n = parseInt(localStorage.getItem("tt-cost-chart-h") || "", 10);
+    if (Number.isFinite(n)) return clampChartH(n, COST_CHART_H, "costPanel");
+  } catch { /* ignore */ }
+  return clampChartH(COST_CHART_H, COST_CHART_H, "costPanel");
+}
+
+function storedCtxChartH() {
+  try {
+    const n = parseInt(localStorage.getItem("tt-ctx-chart-h") || "", 10);
+    if (Number.isFinite(n)) return clampChartH(n, CTX_CHART_H, "ctxPanel");
+  } catch { /* ignore */ }
+  return clampChartH(CTX_CHART_H, CTX_CHART_H, "ctxPanel");
+}
+
+function ensureCostChartH(store) {
+  const st = store || zoomStore() || (window.__costChart = window.__costChart || {});
+  if (!st._chartH) st._chartH = storedCostChartH();
+  else st._chartH = clampChartH(st._chartH, COST_CHART_H, "costPanel");
+  return st._chartH;
+}
 
 function resetChartZoom(store) {
   const st = store || zoomStore();
@@ -1443,7 +2065,7 @@ function resetChartZoom(store) {
 function chartViewKey() {
   if (document.body.classList.contains("scope-period")) {
     const ag = window.__aggChart || {};
-    return ["p", ag.stack || "io", ag.byLabel ? 1 : 0, ag.cumulative ? 1 : 0, ag.timeline ? 1 : 0].join(":");
+    return ["p", ag.stack || "io", ag.byLabel ? 1 : 0, ag.cumulative ? 1 : 0, ag.normalized ? 1 : 0, ag.timeline ? 1 : 0, ag.rate ? 1 : 0, ag.ioStep ? 1 : 0, ag.rateGrain || "-"].join(":");
   }
   const st = window.__costChart || {};
   return ["s", st.stack || "io", st.byLabel ? 1 : 0, st.drillTurn == null ? "-" : String(st.drillTurn)].join(":");
@@ -1456,7 +2078,9 @@ function planXLabels(ctx, labels, groupW, { temporal } = {}) {
     const w = ctx.measureText(String(lab || "")).width;
     if (w > maxW) maxW = w;
   }
-  const collide = maxW > Math.max(4, groupW - 6);
+  // Center-aligned labels collide when half-widths overlap.
+  // Require a little slack so we do not tilt on near-miss spacing.
+  const collide = maxW > Math.max(4, groupW + 2);
   if (temporal) {
     let every = 1;
     if (groupW < 8) every = 8;
@@ -1505,7 +2129,7 @@ function guessXPlan(labels, barCount, temporal) {
 function applyXPadHeight(canvas, padB) {
   if (!canvas) return;
   const store = zoomStore() || {};
-  const base = store._chartH || COST_CHART_H;
+  const base = ensureCostChartH(store);
   const extra = Math.max(0, (padB || 28) - 28);
   canvas.style.height = (base + extra) + "px";
 }
@@ -1558,6 +2182,16 @@ function slotRange(viewW, barCount, maxSlot) {
 
 function clampYViewZoom(z) {
   return Math.min(12, Math.max(1, z));
+}
+
+function applyRateYZoom(store, next) {
+  if (!store) return;
+  const z1 = clampYViewZoom(next);
+  if (Math.abs(z1 - (store._rateYZoom || 1)) < 0.001) return;
+  store._rateYZoom = z1;
+  const canvas = $("costChart");
+  if (canvas && canvas._rateRedraw) canvas._rateRedraw();
+  else redrawCostChart();
 }
 
 function applyYViewZoom(store, next, anchorClientY) {
@@ -1613,6 +2247,10 @@ function bindYStretch() {
     ev.stopPropagation();
     const store = zoomStore();
     if (!store) return;
+    if (store.rate || store.ioStep) {
+      applyRateYZoom(store, (store._rateYZoom || 1) * Math.pow(1.12, -ev.deltaY / 80));
+      return;
+    }
     const cur = store._yViewZoom || 1;
     applyYViewZoom(store, cur * Math.pow(1.12, -ev.deltaY / 80), ev.clientY);
   }, { passive: false });
@@ -1624,7 +2262,8 @@ function bindYStretch() {
     y.setPointerCapture(ev.pointerId);
     y._ydrag = {
       y0: ev.clientY,
-      z0: store._yViewZoom || 1,
+      z0: (store.rate || store.ioStep) ? (store._rateYZoom || 1) : (store._yViewZoom || 1),
+      rate: !!(store.rate || store.ioStep),
       moved: false,
     };
   });
@@ -1636,7 +2275,9 @@ function bindYStretch() {
     const store = zoomStore();
     if (!store) return;
     const dy = drag.y0 - ev.clientY;
-    applyYViewZoom(store, drag.z0 * Math.pow(1.02, dy / 4), drag.y0);
+    const next = drag.z0 * Math.pow(1.02, dy / 4);
+    if (drag.rate || store.rate || store.ioStep) applyRateYZoom(store, next);
+    else applyYViewZoom(store, next, drag.y0);
   });
   const endY = (ev) => {
     const drag = y._ydrag;
@@ -1658,29 +2299,68 @@ function bindChartResize() {
   const wrap = $("costChartWrap");
   if (!btn || !wrap || btn._bound) return;
   btn._bound = true;
+  btn.hidden = false;
   btn.addEventListener("pointerdown", (ev) => {
     if (ev.button !== 0) return;
     ev.preventDefault();
     ev.stopPropagation();
     btn.setPointerCapture(ev.pointerId);
-    const store = zoomStore();
+    const store = zoomStore() || window.__costChart || (window.__costChart = {});
     btn._rd = {
       y0: ev.clientY,
-      h0: (store && store._chartH) || wrap.getBoundingClientRect().height || COST_CHART_H,
+      h0: ensureCostChartH(store),
     };
   });
   btn.addEventListener("pointermove", (ev) => {
     const d = btn._rd;
     if (!d) return;
-    const store = zoomStore();
-    if (!store) return;
-    const next = Math.min(GANTT_MAX_H, Math.max(GANTT_MIN_H, d.h0 + (ev.clientY - d.y0)));
+    const store = zoomStore() || window.__costChart || (window.__costChart = {});
+    const next = clampChartH(d.h0 + (ev.clientY - d.y0), COST_CHART_H, "costPanel");
     store._chartH = next;
+    if (window.__aggChart) window.__aggChart._chartH = next;
+    if (window.__costChart) window.__costChart._chartH = next;
     const canvas = $("costChart");
     if (canvas) canvas.style.height = next + "px";
     const y = $("costYAxis");
     if (y) y.style.height = next + "px";
     redrawCostChart();
+  });
+  const end = () => {
+    if (btn._rd) {
+      try {
+        const store = zoomStore() || window.__costChart;
+        if (store && store._chartH)
+          localStorage.setItem("tt-cost-chart-h", String(Math.round(store._chartH)));
+      } catch { /* ignore */ }
+    }
+    btn._rd = null;
+  };
+  btn.addEventListener("pointerup", end);
+  btn.addEventListener("pointercancel", end);
+}
+
+function bindCtxChartResize(redrawFn) {
+  const btn = $("ctxChartResize");
+  const wrap = $("ctxChartWrap");
+  if (!btn || !wrap || btn._bound) return;
+  btn._bound = true;
+  btn.addEventListener("pointerdown", (ev) => {
+    if (ev.button !== 0) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    btn.setPointerCapture(ev.pointerId);
+    btn._rd = { y0: ev.clientY, h0: storedCtxChartH() };
+  });
+  btn.addEventListener("pointermove", (ev) => {
+    const d = btn._rd;
+    if (!d) return;
+    const next = clampChartH(d.h0 + (ev.clientY - d.y0), CTX_CHART_H, "ctxPanel");
+    try { localStorage.setItem("tt-ctx-chart-h", String(Math.round(next))); } catch { /* ignore */ }
+    const canvas = $("ctxChart");
+    if (canvas) canvas.style.height = next + "px";
+    const y = $("ctxYAxis");
+    if (y) y.style.height = next + "px";
+    if (typeof redrawFn === "function") redrawFn();
   });
   const end = () => { btn._rd = null; };
   btn.addEventListener("pointerup", end);
@@ -1691,7 +2371,7 @@ function setGanttChrome(on) {
   const wrap = $("costChartWrap");
   if (wrap) wrap.classList.toggle("is-gantt", !!on);
   const btn = $("chartResize");
-  if (btn) btn.hidden = !on;
+  if (btn) btn.hidden = false;
   bindChartResize();
 }
 
@@ -1702,8 +2382,7 @@ function layoutGanttCanvas(canvas) {
   let viewW = (scroller && scroller.clientWidth) || 0;
   if (!viewW) viewW = (canvas.parentElement && canvas.parentElement.clientWidth) || 600;
   const store = zoomStore();
-  const h = Math.min(GANTT_MAX_H, Math.max(GANTT_MIN_H, store._chartH || COST_CHART_H));
-  store._chartH = h;
+  const h = ensureCostChartH(store);
   canvas.style.width = viewW + "px";
   canvas.style.height = h + "px";
   if (yAxis) yAxis.style.height = h + "px";
@@ -1725,9 +2404,11 @@ function layoutCostCanvas(canvas, barCount, { forceFit, maxSlot } = {}) {
   const scroller = $("costChartScroll");
   let viewW = (scroller && scroller.clientWidth) || 0;
   if (!viewW) viewW = (canvas.parentElement && canvas.parentElement.clientWidth) || 600;
-  let h = canvas.clientHeight;
-  if (!h || h < 80) h = COST_CHART_H;
   const store = zoomStore();
+  let h = ensureCostChartH(store);
+  canvas.style.height = h + "px";
+  if (yAxis) yAxis.style.height = h + "px";
+  bindChartResize();
   const vk = chartViewKey();
   if (store._zoomViewKey !== vk) {
     resetChartZoom(store);
@@ -1790,6 +2471,14 @@ function redrawCostChart() {
   if (!canvas) return;
   if (document.body.classList.contains("scope-period")) {
     const ag = window.__aggChart;
+    if (ag && ag.ioStep && ag.ioStepPts) {
+      drawIoStepChart(canvas, ag.ioStepPts, ag.ioStepOpts || {});
+      return;
+    }
+    if (ag && ag.rate && ag.ratePts) {
+      drawRateChart(canvas, ag.ratePts, ag.rateOpts || { host: "cost" });
+      return;
+    }
     if (ag && ag.timeline && ag.agg) drawTimeline(canvas, ag.agg);
     else if (ag) drawAggBars(canvas, ag.buckets, ag);
     return;
@@ -1812,6 +2501,7 @@ function bindCostZoom() {
   wrap.addEventListener("wheel", (ev) => {
     if (ev.shiftKey) return;
     if (Math.abs(ev.deltaX) > Math.abs(ev.deltaY)) return;
+    if (ev.target && ev.target.id === "costYAxis") return;
     const canvas = $("costChart");
     const scroller = $("costChartScroll");
     if (!canvas) return;
@@ -1836,7 +2526,7 @@ function bindCostZoom() {
       if (store.agg) drawTimeline(canvas, store.agg);
       return;
     }
-    if (!pointerInXAxis(ev, wrap)) return;
+    if (!pointerInXAxis(ev, wrap) && !(store && (store.rate || store.ioStep))) return;
     const barCount = canvas._zoomBars || 1;
     const viewW = (scroller && scroller.clientWidth) || wrap.clientWidth || 600;
     const { nSlots, minSlot, maxSlot } = slotRange(viewW, barCount, canvas._zoomMaxSlot);
@@ -1921,23 +2611,164 @@ function eachCostYTick(yMin, max, step, unit, fn) {
   if (!seen.size) fn(yMin);
 }
 
-function _legendRank(key, meta) {
-  const lab = (meta && meta.label) || key;
-  const k = (meta && meta.k) || "";
-  const fixed = [
-    "system", "System", "user", "super agent", "User", "Super Agent",
-    "in", "In", "cached", "Cached",
-    "thought", "reasoning", "message", "LLM Out→In", "llm_out_in",
-    "out", "Out", "recap", "compact", "sub", "Sub", "official",
-    "in residual", "harness", "reload", "pre-read",
-  ];
-  const fi = fixed.indexOf(key) >= 0 ? fixed.indexOf(key) : fixed.indexOf(lab);
+/** Parts stack bottom→top (legend: bottom first, top last). */
+const PARTS_STACK_ORDER = [
+  "cached", "cache_miss", "harness", "reasoning", "toolreq",
+  "message", "thought", "user", "compact", "recap",
+  "in", "out", "system", "sys_prompt", "user_info", "reminders", "tool_def",
+  "llm_out_in", "official", "sub",
+];
+
+/** User Tools breakdown keys (after toolreq:* and tool:* in Tools mode). */
+const USER_BREAKDOWN_ORDER = ["prompt", "llm_answer", "compact_out"];
+
+function currentCostStack() {
+  if (document.body.classList.contains("scope-period"))
+    return (window.__aggChart && window.__aggChart.stack) || "io";
+  return (window.__costChart && window.__costChart.stack) || "io";
+}
+
+function loadLegendOrder(stack) {
+  try {
+    const raw = localStorage.getItem("tt-leg-order-" + (stack || "io"));
+    if (!raw) return null;
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) && arr.length ? arr.map(String) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveLegendOrder(stack, keys) {
+  try {
+    localStorage.setItem("tt-leg-order-" + (stack || "io"), JSON.stringify(keys || []));
+  } catch { /* ignore */ }
+}
+
+function clearLegendOrder(stack) {
+  try {
+    localStorage.removeItem("tt-leg-order-" + (stack || "io"));
+  } catch { /* ignore */ }
+}
+
+/** Default rank: bottom of bar = low. Tools: fixed → toolreq:* → tool:* → user breakdown. */
+function defaultStackRank(key, meta, stack) {
+  const k = String((meta && meta.k) || key || "");
+  const lab = String((meta && meta.label) || key || "");
+  const sk = String(key || "");
+  const st = stack || "io";
+
+  if (st === "io") {
+    const ioOrder = ["system", "in", "cached", "out", "sub", "official"];
+    let fi = ioOrder.indexOf(sk);
+    if (fi < 0) fi = ioOrder.indexOf(k);
+    if (fi < 0) fi = ioOrder.indexOf(lab.toLowerCase());
+    if (fi >= 0) return fi;
+    if (sk.startsWith("sub:")) return 10 + (Number(sk.slice(4)) || 0);
+    return 50;
+  }
+
+  if (st === "tools") {
+    // Non-breakdown cats use PARTS order below; then toolreq:* · tool:* · user breakdown.
+    if (sk.startsWith("toolreq:")) return 1000;
+    if (k === "toolreq") return 999;
+    if (sk.startsWith("tool:")) return 2000;
+    if (k === "tool") return 1999;
+    const ub = USER_BREAKDOWN_ORDER.indexOf(k);
+    if (ub >= 0) return 3000 + ub;
+    if (k === "llm_out_in" || sk === "llm_out_in") return 1950;
+  }
+
+  let fi = PARTS_STACK_ORDER.indexOf(sk);
+  if (fi < 0) fi = PARTS_STACK_ORDER.indexOf(k);
+  if (fi < 0) {
+    const low = lab.toLowerCase();
+    fi = PARTS_STACK_ORDER.indexOf(low);
+    if (fi < 0 && low === "cache miss") fi = PARTS_STACK_ORDER.indexOf("cache_miss");
+    if (fi < 0 && low === "tool req") fi = PARTS_STACK_ORDER.indexOf("toolreq");
+  }
   if (fi >= 0) return fi;
-  if (k === "toolreq" || String(key).startsWith("toolreq:")) return 50;
-  if (k === "llm_out_in" || key === "llm_out_in" || lab === "LLM Out→In") return 80;
-  if (k === "tool" || String(key).startsWith("tool:")) return 90;
-  if (k === "hook" || String(key).startsWith("hook:")) return 999;
-  return 100;
+  if (sk.startsWith("sub:")) return 400 + (Number(sk.slice(4)) || 0);
+  if (k === "sub") return 400;
+  if (k === "hook" || sk.startsWith("hook:")) return 9000;
+  return 500 + lab.toLowerCase().charCodeAt(0) / 1000;
+}
+
+function _legendRank(key, meta) {
+  const custom = loadLegendOrder(currentCostStack());
+  if (custom && custom.length) {
+    const i = custom.indexOf(String(key));
+    if (i >= 0) return i;
+    return custom.length + 1 + defaultStackRank(key, meta, currentCostStack());
+  }
+  return defaultStackRank(key, meta, currentCostStack());
+}
+
+function orderCostSegs(segs, stack) {
+  const st = stack || currentCostStack();
+  const custom = loadLegendOrder(st);
+  return (segs || []).slice().sort((a, b) => {
+    const ka = costSegKey(a), kb = costSegKey(b);
+    const ra = custom && custom.length && custom.indexOf(ka) >= 0
+      ? custom.indexOf(ka)
+      : (custom && custom.length ? custom.length + 1 : 0) + defaultStackRank(ka, a, st);
+    const rb = custom && custom.length && custom.indexOf(kb) >= 0
+      ? custom.indexOf(kb)
+      : (custom && custom.length ? custom.length + 1 : 0) + defaultStackRank(kb, b, st);
+    if (ra !== rb) return ra - rb;
+    return String(costDisplayLabel(a)).localeCompare(String(costDisplayLabel(b)));
+  });
+}
+
+function sortLegendItems(items, stack) {
+  const st = stack || currentCostStack();
+  return (items || []).slice().sort((a, b) => {
+    const ra = _legendRank(a[0], a[1]), rb = _legendRank(b[0], b[1]);
+    if (ra !== rb) return ra - rb;
+    return String((a[1] && a[1].label) || a[0]).localeCompare(String((b[1] && b[1].label) || b[0]));
+  });
+}
+
+/** Tooltip rows: I/O keeps stack order; Parts/Tools sort small→large. */
+function tipOrderedSegs(segs, stack, unit) {
+  const list = (segs || []).filter((s) => {
+    if (s && s._raw != null) return Number(s._raw) > 0 || Number(s.v) > 0;
+    return costSegMetric(s, unit) > 0 || Number(s && s.v) > 0;
+  });
+  if ((stack || "io") === "io") return orderCostSegs(list, "io");
+  return list.slice().sort((a, b) => {
+    const va = a._raw != null ? Number(a._raw) : costSegMetric(a, unit);
+    const vb = b._raw != null ? Number(b._raw) : costSegMetric(b, unit);
+    if (va !== vb) return va - vb;
+    return String(costDisplayLabel(a)).localeCompare(String(costDisplayLabel(b)));
+  });
+}
+
+function formatTipSegLine(seg, unit, opts) {
+  const color = (seg && seg.color) || "#aaa";
+  const label = costDisplayLabel(seg);
+  const cnt = seg && seg.n > 1 ? ` ×${seg.n}` : "";
+  const extra = seg && seg.title ? " · " + seg.title : "";
+  const raw = seg && seg._raw != null ? Number(seg._raw) : costSegMetric(seg, unit);
+  if (opts && opts.normalized) {
+    const pct = Number(seg.v) || 0;
+    const pctTxt = fmtCostAxis(pct, "pct");
+    return `<span style="color:${color}">${esc(pctTxt)}</span> `
+      + `<span style="color:${color}">●</span> ${esc(label)}${esc(extra)}${cnt} `
+      + `${fmtCostAxis(raw, unit)}`;
+  }
+  return `<span style="color:${color}">●</span> ${esc(label)}${esc(extra)}${cnt} ${fmtCostAxis(raw, unit)}`;
+}
+
+function periodSessionTipHead(b) {
+  if (!b) return "";
+  const sl = String(b.session_label || "");
+  if (/^Session\s+/i.test(sl)) return sl;
+  if (/^Sub Agent\s+/i.test(sl)) {
+    const parent = String(b.label || "").split(".")[0];
+    return parent ? `${parent} ${sl}` : sl;
+  }
+  return sl || String(b.label || "");
 }
 
 /** One bar per legend category — totals for the current view. */
@@ -1988,6 +2819,7 @@ function drawBars(canvas, turns, rounds, opts) {
     clearCostPointerProps(canvas);
     setCostTipOwner(canvas, "session");
   }
+  clearRateHost("cost");
   const st = window.__costChart;
   st.turns = turns || [];
   st.rounds = rounds || [];
@@ -2007,18 +2839,14 @@ function drawBars(canvas, turns, rounds, opts) {
     const round = findRound(st.rounds, st.drillTurn);
     const steps = (round && round.model_steps) || [];
     bars = [];
+    const userBar = userCostBar(round, { stack: st.stack || "io" });
+    if (userBar) bars.push(userBar);
     steps.forEach((s, i) => {
-      const raw = callCostParts(s, s.index ?? i + 1, round);
+      const raw = callCostParts(s, s.index ?? i + 1, round, { omitUser: !!userBar });
       const b = applyDrillStack(raw, st.stack || "io");
       b.turnIndex = st.drillTurn;
+      attachSubagentSegsToTurn(b, { model_steps: [s] }, st.stack);
       bars.push(b);
-      for (const sa of s.subagents_after || []) {
-        const sb = subagentCostBar(sa);
-        if (sb) {
-          sb.turnIndex = st.drillTurn;
-          bars.push(sb);
-        }
-      }
     });
   } else {
     const slice = turns || [];
@@ -2028,7 +2856,9 @@ function drawBars(canvas, turns, rounds, opts) {
       || null;
     const hasR1InSlice = slice.some(t => Number(t.index) === 1)
       || (r1 && slice.length && Number(slice[0].index) === Number(r1.index));
-    const sysBar = (r1 && hasR1InSlice) ? systemCostBar(r1) : null;
+    const sysBar = (r1 && hasR1InSlice)
+      ? systemCostBar(r1, { stack: st.stack || "io" })
+      : null;
     bars = [];
     if (sysBar) bars.push(sysBar);
 
@@ -2049,6 +2879,8 @@ function drawBars(canvas, turns, rounds, opts) {
       for (const it of items) {
         if (it.kind === "compact") {
           compactN += 1;
+          if (it.ev && it.ev.compact_index == null) it.ev.compact_index = compactN;
+          // Stamp N onto following User.compact_out when this compact is between-rounds.
           const unify = st.stack === "parts" || st.stack === "tools";
           const cb = compactCostBar(it.ev, compactN, { detail: unify });
           if (cb) bars.push(cb);
@@ -2081,14 +2913,31 @@ function drawBars(canvas, turns, rounds, opts) {
         pushBetween(before);
       }
       const stack = st.stack || "io";
+      // Propagate Compact N onto User.compact_out for Tools labels.
+      if (round && round.compact_before && round.compact_before.kind === "compaction") {
+        const cn = round.compact_before.compact_index;
+        const up = round.user_prompt;
+        if (cn != null && up && up.compact_out && up.compact_out.compact_index == null)
+          up.compact_out.compact_index = cn;
+      }
       const parts = stack === "tools"
         ? turnCostPartsTools(t, round, { peelSystem })
         : turnCostParts(t, round, { detail: stack === "parts", peelSystem });
-      bars.push(attachSubagentSegsToTurn(parts, round));
+      bars.push(attachSubagentSegsToTurn(parts, round, stack));
       // Events after this round (between R[n] and R[n+1]), chronological
       const after = [];
+      const seenCompactMs = new Set();
       if (round && round.compact_after && round.compact_after.kind === "compaction") {
         after.push({ kind: "compact", ev: round.compact_after });
+        if (round.compact_after.agent_ms != null) seenCompactMs.add(round.compact_after.agent_ms);
+      }
+      for (const s of (round && round.model_steps) || []) {
+        for (const c of s.compacts_after || []) {
+          if (!c || c.kind !== "compaction") continue;
+          if (c.agent_ms != null && seenCompactMs.has(c.agent_ms)) continue;
+          after.push({ kind: "compact", ev: c });
+          if (c.agent_ms != null) seenCompactMs.add(c.agent_ms);
+        }
       }
       for (const rec of (round && round.recaps_after) || []) {
         after.push({ kind: "recap", ev: rec });
@@ -2107,6 +2956,25 @@ function drawBars(canvas, turns, rounds, opts) {
   const labelLegend = st.byLabel ? collectLabelLegend(bars, unit0) : [];
   if (st.byLabel && bars.length) {
     bars = aggregateBarsByLabel(bars, st.hiddenLegend, unit0);
+    const customOrd = loadLegendOrder(st.stack);
+    if (customOrd && customOrd.length) {
+      bars = bars.slice().sort((a, b) => {
+        const ka = costSegKey((a.segs || [])[0]) || a.label;
+        const kb = costSegKey((b.segs || [])[0]) || b.label;
+        const ia = customOrd.indexOf(ka);
+        const ib = customOrd.indexOf(kb);
+        const ra = ia >= 0 ? ia : customOrd.length + defaultStackRank(ka, (a.segs || [])[0], st.stack);
+        const rb = ib >= 0 ? ib : customOrd.length + defaultStackRank(kb, (b.segs || [])[0], st.stack);
+        return ra - rb;
+      });
+    } else if (st.stack === "parts" || st.stack === "tools") {
+      const metric = (b) => {
+        const vis = (b.segs || []).reduce((a, s) => a + costSegMetric(s, unit0), 0);
+        if (vis > 0) return vis;
+        return unit0 === "tokens" ? (Number(b.total_tok) || 0) : (Number(b.total) || 0);
+      };
+      bars = bars.slice().sort((a, b) => metric(a) - metric(b));
+    }
   }
   applyXPadHeight(canvas, guessXPlan(
     bars.map((p) => p.label || String(p.index)),
@@ -2144,10 +3012,11 @@ function drawBars(canvas, turns, rounds, opts) {
     const raw = p.segs && p.segs.length
       ? p.segs
       : [{ k: "out", label: "—", v: p.total || 0, tok: p.total_tok || 0, color: COST_COLORS.out }];
-    return raw.filter(s => {
+    const filtered = raw.filter(s => {
       const m = costSegMetric(s, unit);
       return m > 0 && !isCostSegHidden(s, hidden);
     });
+    return orderCostSegs(filtered, st.stack);
   });
   let rawMax = 0;
   bars.forEach((p, i) => {
@@ -2253,15 +3122,15 @@ function drawBars(canvas, turns, rounds, opts) {
     legendItems = labelLegend.slice();
   } else if (st.drillTurn == null && st.stack === "io") {
     legendItems = [
-      ["system", { label: "system", color: COST_COLORS.system, k: "system" }],
+      ["system", { label: "System", color: COST_COLORS.system, k: "system" }],
       ["in", { label: "In", color: COST_COLORS.in, k: "in" }],
       ["cached", { label: "Cached", color: COST_COLORS.cached, k: "cached" }],
       ["out", { label: "Out", color: COST_COLORS.out, k: "out" }],
     ];
     if (bars.some((b) => b.kind === "subagent" || (b.segs || []).some((s) => s.k === "sub")))
-      legendItems.push(["sub", { label: "sub", color: COST_COLORS.sub, k: "sub" }]);
+      legendItems.push(["sub", { label: "Sub agent", color: COST_COLORS.sub, k: "sub" }]);
     if (unit === "usd")
-      legendItems.push(["official", { label: "official", color: COST_COLORS.official }]);
+      legendItems.push(["official", { label: "Official", color: COST_COLORS.official }]);
   } else if (st.drillTurn == null && unit === "usd") {
     if (!legendItems.some(([key]) => key === "official"))
       legendItems.unshift(["official", { label: "official", color: COST_COLORS.official }]);
@@ -2283,12 +3152,7 @@ function drawBars(canvas, turns, rounds, opts) {
       legendItems.push([name, { label: name, color: fallback }]);
     }
   }
-  // Order: fixed cats → toolreqs (alpha) → LLM Out→In → tools (alpha) → rest
-  legendItems.sort((a, b) => {
-    const ra = _legendRank(a[0], a[1]), rb = _legendRank(b[0], b[1]);
-    if (ra !== rb) return ra - rb;
-    return String((a[1] && a[1].label) || a[0]).localeCompare(String((b[1] && b[1].label) || b[0]));
-  });
+  legendItems = sortLegendItems(legendItems, st.stack);
   renderCostLegend(legendItems, hidden);
 
   canvas._barHit = hit;
@@ -2302,8 +3166,6 @@ function drawBars(canvas, turns, rounds, opts) {
       const tipEl = $("costTip");
       if (!tipEl || !canvas._barHit) return;
       const rect = canvas.getBoundingClientRect();
-      const wrap = $("costChartWrap");
-      const wrapRect = wrap ? wrap.getBoundingClientRect() : rect;
       const mx = ev.clientX - rect.left;
       const my = ev.clientY - rect.top;
       const found = canvas._barHit.find(b => mx >= b.x0 && mx <= b.x1 && my >= b.y0 && my <= b.y1);
@@ -2320,12 +3182,13 @@ function drawBars(canvas, turns, rounds, opts) {
       const head = p.kind === "call"
         ? ("LLM call " + p.index)
         : (p.kind === "system" ? "System"
-          : (p.kind === "compact" ? ("Compact " + p.label)
-            : (p.kind === "recap" ? ("Recap " + p.label)
-              : (p.kind === "agg-label" ? String(p.label || "")
-              : (p.kind === "subagent"
-                ? ("Sub Agent " + String(p.label || "").replace(/^S/, "") + (p.title ? " · " + p.title : ""))
-                : ("Round " + p.index))))));
+          : (p.kind === "user" ? "User"
+            : (p.kind === "compact" ? ("Compact " + p.label)
+              : (p.kind === "recap" ? ("Recap " + p.label)
+                : (p.kind === "agg-label" ? String(p.label || "")
+                : (p.kind === "subagent"
+                  ? ("Sub Agent " + String(p.label || "").replace(/^S/, "") + (p.title ? " · " + p.title : ""))
+                  : ("Round " + p.index)))))));
       const lines = [`<b>${esc(head)}</b>`];
       if (p.kind === "compact" && (p.tokens_before != null || p.tokens_after != null)) {
         lines.push(
@@ -2333,6 +3196,7 @@ function drawBars(canvas, turns, rounds, opts) {
         );
       }
       const u = p._unit || window.__costChart.unit || "usd";
+      const stackMode = (window.__costChart && window.__costChart.stack) || "io";
       if (p.kind === "subagent") {
         if (p.uncached_tokens || p.in)
           lines.push(`<span style="color:${COST_COLORS.in}">●</span> In ${fmtTokens(p.uncached_tokens)} · ${fmtUsd(p.in)}`);
@@ -2341,14 +3205,8 @@ function drawBars(canvas, turns, rounds, opts) {
         if (p.out_tokens || p.out)
           lines.push(`<span style="color:${COST_COLORS.out}">●</span> Out ${fmtTokens(p.out_tokens)} · ${fmtUsd(p.out)}`);
       } else {
-        (p.segs || []).forEach(s => {
-          const mv = costSegMetric(s, u);
-          if (!(mv > 0)) return;
-          const cnt = s.n > 1 ? ` ×${s.n}` : "";
-          const extra = s.title ? " · " + s.title : "";
-          lines.push(
-            `<span style="color:${s.color}">●</span> ${esc(costDisplayLabel(s))}${esc(extra)}${cnt} ${fmtCostAxis(mv, u)}`
-          );
+        tipOrderedSegs(p.segs || [], stackMode, u).forEach((s) => {
+          lines.push(formatTipSegLine(s, u, null));
         });
       }
       lines.push(`<b>→ ${fmtCostAxis(p.total || 0, u)}</b>`);
@@ -2356,14 +3214,7 @@ function drawBars(canvas, turns, rounds, opts) {
         lines.push(`<span class="muted">official ${fmtUsd(p.official)}</span>`);
       if (p.kind === "turn") lines.push(`<span class="muted">click: tree + drill calls</span>`);
       if (p.kind === "subagent") lines.push(`<span class="muted">click: open this sub-agent tab</span>`);
-      const html = lines.join("<br>");
-      // Tooltip top-right of cursor (above + to the right) — keep existing placement
-      const { tw, th } = measureChartTip(tipEl, html);
-      let leftPx = ev.clientX - wrapRect.left + 12;
-      if (leftPx + tw > wrapRect.width - 4) leftPx = Math.max(4, ev.clientX - wrapRect.left - tw - 8);
-      let topPx = ev.clientY - wrapRect.top - th - 8;
-      if (topPx < 4) topPx = Math.min(wrapRect.height - th - 4, ev.clientY - wrapRect.top + 12);
-      showChartTip(tipEl, html, leftPx, Math.max(4, topPx));
+      placeCostTip(ev, tipEl, lines.join("<br>"));
     });
     canvas.addEventListener("mouseleave", () => {
       canvas._ptr = null;
@@ -2401,6 +3252,16 @@ function drawBars(canvas, turns, rounds, opts) {
   }
 }
 
+function _redrawCostAfterLegend() {
+  const canvas = $("costChart");
+  if (!canvas) return;
+  if (document.body.classList.contains("scope-period")) redrawCostChart();
+  else {
+    const st = window.__costChart;
+    if (st) drawBars(canvas, st.turns, st.rounds);
+  }
+}
+
 function renderCostLegend(legendItems, hidden) {
   const el = $("costLegend");
   if (!el) return;
@@ -2417,40 +3278,95 @@ function renderCostLegend(legendItems, hidden) {
       label = entry[0];
       color = entry[1];
     }
-    // Distinguish toolreq vs tool when same display name (color already differs)
-    let show = label;
-    if (String(key).startsWith("toolreq:") && !/req$/i.test(show))
-      show = show; // orange swatch = request; keep clean name
-    else if (String(key).startsWith("tool:") && !/in$/i.test(show))
-      show = show; // green swatch = result
+    const show = label;
     const hid = hidden.has(key) || hidden.has(label);
-    return `<button type="button" class="leg-chip${hid ? " hid" : ""}" data-leg="${esc(key)}" aria-pressed="${hid ? "false" : "true"}" title="${hid ? "Show" : "Hide"} ${esc(show)}">
+    return `<button type="button" class="leg-chip${hid ? " hid" : ""}" draggable="true" data-leg="${esc(key)}" aria-pressed="${hid ? "false" : "true"}" title="${hid ? "Show" : "Hide"} ${esc(show)} · drag to reorder stack">
       <span class="leg-sw" style="background:${color}"></span>${esc(show)}
     </button>`;
   }).join("");
-  el.innerHTML = chips;
+  const hasCustom = !!(loadLegendOrder(currentCostStack()) || []).length;
+  el.innerHTML = chips + (chips
+    ? `<button type="button" class="leg-chip leg-reset" data-leg-reset="1" title="Reset label order to default" ${hasCustom ? "" : "hidden"}>Reset</button>`
+    : "");
   if (!el._bound) {
     el._bound = true;
     el.addEventListener("click", (ev) => {
+      if (el._legDragMoved) {
+        el._legDragMoved = false;
+        return;
+      }
+      const resetBtn = ev.target.closest("[data-leg-reset]");
+      if (resetBtn) {
+        clearLegendOrder(currentCostStack());
+        _redrawCostAfterLegend();
+        return;
+      }
       const btn = ev.target.closest(".leg-chip");
-      if (!btn) return;
+      if (!btn || btn.hasAttribute("data-leg-reset")) return;
       const name = btn.getAttribute("data-leg");
       if (!name) return;
-      const canvas = $("costChart");
       if (document.body.classList.contains("scope-period")) {
         const ag = window.__aggChart || {};
         if (!(ag.hiddenLegend instanceof Set)) ag.hiddenLegend = new Set();
         if (ag.hiddenLegend.has(name)) ag.hiddenLegend.delete(name);
         else ag.hiddenLegend.add(name);
         window.__aggChart = ag;
-        if (canvas) redrawCostChart();
+        _redrawCostAfterLegend();
         return;
       }
       const st = window.__costChart;
       if (!(st.hiddenLegend instanceof Set)) st.hiddenLegend = new Set();
       if (st.hiddenLegend.has(name)) st.hiddenLegend.delete(name);
       else st.hiddenLegend.add(name);
-      if (canvas) drawBars(canvas, st.turns, st.rounds);
+      _redrawCostAfterLegend();
+    });
+    el.addEventListener("dragstart", (ev) => {
+      const btn = ev.target.closest(".leg-chip");
+      if (!btn || btn.hasAttribute("data-leg-reset")) return;
+      el._legDragKey = btn.getAttribute("data-leg");
+      el._legDragMoved = false;
+      btn.classList.add("leg-dragging");
+      try {
+        ev.dataTransfer.effectAllowed = "move";
+        ev.dataTransfer.setData("text/plain", el._legDragKey || "");
+      } catch { /* ignore */ }
+    });
+    el.addEventListener("dragover", (ev) => {
+      const over = ev.target.closest(".leg-chip:not([data-leg-reset])");
+      if (!over || !el._legDragKey) return;
+      ev.preventDefault();
+      el.querySelectorAll(".leg-chip.leg-drag-over").forEach((n) => n.classList.remove("leg-drag-over"));
+      over.classList.add("leg-drag-over");
+      try { ev.dataTransfer.dropEffect = "move"; } catch { /* ignore */ }
+    });
+    el.addEventListener("dragleave", (ev) => {
+      const over = ev.target.closest(".leg-chip");
+      if (over) over.classList.remove("leg-drag-over");
+    });
+    el.addEventListener("drop", (ev) => {
+      ev.preventDefault();
+      const over = ev.target.closest(".leg-chip:not([data-leg-reset])");
+      const fromKey = el._legDragKey;
+      el.querySelectorAll(".leg-chip.leg-drag-over").forEach((n) => n.classList.remove("leg-drag-over"));
+      if (!over || !fromKey) return;
+      const toKey = over.getAttribute("data-leg");
+      if (!toKey || toKey === fromKey) return;
+      const keys = [...el.querySelectorAll(".leg-chip:not([data-leg-reset])")]
+        .map((b) => b.getAttribute("data-leg")).filter(Boolean);
+      const from = keys.indexOf(fromKey);
+      const to = keys.indexOf(toKey);
+      if (from < 0 || to < 0) return;
+      keys.splice(from, 1);
+      keys.splice(to, 0, fromKey);
+      el._legDragMoved = true;
+      saveLegendOrder(currentCostStack(), keys);
+      _redrawCostAfterLegend();
+    });
+    el.addEventListener("dragend", () => {
+      el._legDragKey = null;
+      el.querySelectorAll(".leg-chip.leg-dragging, .leg-chip.leg-drag-over").forEach((n) => {
+        n.classList.remove("leg-dragging", "leg-drag-over");
+      });
     });
   }
 }
@@ -2492,7 +3408,7 @@ function _mergeCatLists(into, extra) {
 
 function _cumBuckets(buckets) {
   const out = [];
-  let tin = 0, tc = 0, tout = 0, tr = 0, ci = 0, cc = 0, co = 0, cr = 0, tot = 0;
+  let tin = 0, tc = 0, tout = 0, tr = 0, ci = 0, cc = 0, co = 0, cr = 0, tot = 0, est = 0;
   let parts = [], tools = [];
   for (const b of buckets || []) {
     tin += Number(b.tokens_in) || 0;
@@ -2504,6 +3420,9 @@ function _cumBuckets(buckets) {
     co += Number(b.cost_out_usd) || 0;
     cr += Number(b.cost_reason_usd) || 0;
     tot += Number(b.official_usd) || 0;
+    est += Number(b.estimate_usd) || ((Number(b.cost_in_usd) || 0)
+      + (Number(b.cost_cached_usd) || 0)
+      + (Number(b.cost_out_usd) || 0));
     parts = _mergeCatLists(parts, b.parts);
     tools = _mergeCatLists(tools, b.tools);
     out.push({
@@ -2518,6 +3437,7 @@ function _cumBuckets(buckets) {
       cost_out_usd: co,
       cost_reason_usd: cr,
       official_usd: tot,
+      estimate_usd: est,
       parts: parts.map((s) => ({ ...s })),
       tools: tools.map((s) => ({ ...s })),
     });
@@ -2535,14 +3455,19 @@ function drawAggBars(canvas, buckets, opts) {
     return;
   }
   setGanttChrome(false);
+  clearRateHost("cost");
   setCostTipOwner(canvas, "period");
   const unit = (opts && opts.unit) || (window.__costChart && window.__costChart.unit) || "usd";
   const cumulative = !!(opts && opts.cumulative);
+  // Normalized = 100% stacked composition; mutually exclusive with cumulative.
+  const normalized = !!(opts && opts.normalized) && !cumulative;
   const byLabel = !!(opts && opts.byLabel);
   const stack = (opts && opts.stack) || "io";
   const prev = window.__aggChart || {};
   const hidden = prev.hiddenLegend instanceof Set ? prev.hiddenLegend : new Set();
   let src = cumulative ? _cumBuckets(buckets) : (buckets || []).slice();
+  // By-label collapses to one segment per bar — skip 100% stack (all bars = 100%).
+  const doNorm = normalized && !byLabel;
   const segsFromCats = (list) => (list || []).map((s) => ({
     k: s.k,
     label: s.label,
@@ -2581,27 +3506,48 @@ function drawAggBars(canvas, buckets, opts) {
         if (!isCostSegHidden(s, hidden)) add(accVis);
       }
     }
-    periodLabelLegend = [...accAll.entries()].map(([key, s]) => [key, {
+    periodLabelLegend = sortLegendItems([...accAll.entries()].map(([key, s]) => [key, {
       label: costDisplayLabel(s), color: s.color, k: s.k,
-    }]);
+    }]), stack);
     src = [...accVis.values()].map((s) => ({
       label: costDisplayLabel(s),
       _oneSeg: s,
       official_usd: s.v,
     }));
+    const customOrd = loadLegendOrder(stack);
+    if (customOrd && customOrd.length) {
+      src.sort((a, b) => {
+        const ka = costSegKey(a._oneSeg), kb = costSegKey(b._oneSeg);
+        const ia = customOrd.indexOf(ka), ib = customOrd.indexOf(kb);
+        const ra = ia >= 0 ? ia : customOrd.length + defaultStackRank(ka, a._oneSeg, stack);
+        const rb = ib >= 0 ? ib : customOrd.length + defaultStackRank(kb, b._oneSeg, stack);
+        return ra - rb;
+      });
+    } else if (stack === "parts" || stack === "tools") {
+      src.sort((a, b) => (Number(a._oneSeg && a._oneSeg.v) || 0) - (Number(b._oneSeg && b._oneSeg.v) || 0));
+    }
   }
   window.__aggChart = {
+    ...prev,
     buckets: buckets || [],
     unit,
     cumulative,
+    normalized: doNorm,
     byLabel,
     stack,
     timeline: false,
+    rate: false,
+    ratePts: null,
     hiddenLegend: hidden,
     slotPx: prev.slotPx,
     _costUserZoom: prev._costUserZoom,
     _costStickEnd: prev._costStickEnd,
     _scrollLeft: prev._scrollLeft,
+    _yViewZoom: prev._yViewZoom,
+    _yViewPan: prev._yViewPan,
+    _zoomViewKey: prev._zoomViewKey,
+    _ganttGeom: null,
+    _ganttRows: null,
   };
 
   const tip = $("costTip");
@@ -2629,7 +3575,7 @@ function drawAggBars(canvas, buckets, opts) {
   const plotW = Math.max(10, w - padL - padR);
   const plotH = Math.max(10, h - padT - padB);
 
-  const legendItems = periodLabelLegend.length
+  let legendItems = periodLabelLegend.length
     ? periodLabelLegend
     : stack === "io"
     ? [
@@ -2638,9 +3584,7 @@ function drawAggBars(canvas, buckets, opts) {
         ["out", { label: "Out", color: COST_COLORS.out, k: "out" }],
       ]
     : null;
-  if (legendItems)
-    renderCostLegend(legendItems, hidden);
-  else {
+  if (!legendItems) {
     const live = new Map();
     for (const b of src) {
       for (const s of segsOfBucket(b)) {
@@ -2649,8 +3593,9 @@ function drawAggBars(canvas, buckets, opts) {
           live.set(key, { label: costDisplayLabel(s), color: s.color, k: s.k });
       }
     }
-    renderCostLegend([...live.entries()], hidden);
+    legendItems = [...live.entries()];
   }
+  renderCostLegend(sortLegendItems(legendItems, stack), hidden);
 
   if (!src.length) {
     const yAxis = $("costYAxis");
@@ -2661,21 +3606,36 @@ function drawAggBars(canvas, buckets, opts) {
     return;
   }
 
-  const visSegs = (b) => segsOfBucket(b).filter((s) => {
+  const visSegs = (b) => orderCostSegs(segsOfBucket(b).filter((s) => {
     if (!(s.v > 0)) return false;
     return !hidden.has(s.legendKey) && !hidden.has(s.label) && !hidden.has(s.k);
-  });
+  }), stack);
 
   let yMax = 0;
-  const bars = src.map((b) => {
+  let bars = src.map((b) => {
     const segs = visSegs(b);
     const total = segs.reduce((a, s) => a + s.v, 0);
     if (total > yMax) yMax = total;
     return { b, segs, total };
   });
-  if (yMax <= 0) yMax = unit === "tokens" ? 1000 : 0.01;
-  yMax = yMax / clampYViewZoom((window.__aggChart && window.__aggChart._yViewZoom) || 1);
-  const y = niceCostYMaxForUnit(yMax, unit);
+  const axisUnit = doNorm ? "pct" : unit;
+  if (doNorm) {
+    bars = bars.map((bar) => {
+      const t = bar.total;
+      if (!(t > 0)) return { ...bar, segs: [], total: 0 };
+      return {
+        ...bar,
+        segs: bar.segs.map((s) => ({ ...s, v: (s.v / t) * 100, _raw: s.v })),
+        total: 100,
+      };
+    });
+    yMax = 100;
+  } else if (yMax <= 0) {
+    yMax = unit === "tokens" ? 1000 : 0.01;
+  }
+  if (!doNorm)
+    yMax = yMax / clampYViewZoom((window.__aggChart && window.__aggChart._yViewZoom) || 1);
+  const y = niceCostYMaxForUnit(yMax, axisUnit);
   const max = y.max || 1;
 
   ctx.strokeStyle = CHART_AXIS.grid;
@@ -2684,14 +3644,14 @@ function drawAggBars(canvas, buckets, opts) {
   ctx.font = "10px system-ui, Segoe UI, sans-serif";
   ctx.textAlign = "right";
   ctx.textBaseline = "middle";
-  eachCostYTick(0, max, y.step, unit, (v) => {
+  eachCostYTick(0, max, y.step, axisUnit, (v) => {
     const yy = padT + plotH - (v / max) * plotH;
     ctx.beginPath();
     ctx.moveTo(0, yy);
     ctx.lineTo(w - padR, yy);
     ctx.stroke();
   });
-  drawCostYOverlay({ min: 0, max, step: y.step, unit, top: padT, bottom: padB, h });
+  drawCostYOverlay({ min: 0, max, step: y.step, unit: axisUnit, top: padT, bottom: padB, h });
 
   const n = bars.length;
   const nSlots = Math.max(n, 1);
@@ -2733,13 +3693,53 @@ function drawAggBars(canvas, buckets, opts) {
         return;
       }
       const b = found.bar.b;
-      const html = b._oneSeg
-        ? `<b>${esc(b.label || "")}</b><br>${fmtCostAxis(found.bar.total, (window.__aggChart && window.__aggChart.unit) || "usd")}`
-        : `<b>${esc(b.label || "")}</b><br>
-      <span class="tok-in">In</span> ${fmtTokens(b.tokens_in)} · ${fmtUsd(b.cost_in_usd)}<br>
-      <span class="tok-cached">Cached</span> ${fmtTokens(b.tokens_cached)} · ${fmtUsd(b.cost_cached_usd)}<br>
-      <span class="tok-out">Out</span> ${fmtTokens(b.tokens_out)} · ${fmtUsd(b.cost_out_usd)}<br>
-      ${fmtUsd(b.official_usd)}`;
+      const ag = window.__aggChart || {};
+      const unit = ag.unit || "usd";
+      const stackMode = ag.stack || "io";
+      const isNorm = !!ag.normalized;
+      const head = b.session_label
+        ? periodSessionTipHead(b)
+        : (b.label || "");
+      let html;
+      const estUsd = Number(b.estimate_usd) > 0
+        ? Number(b.estimate_usd)
+        : ((Number(b.cost_in_usd) || 0)
+          + (Number(b.cost_cached_usd) || 0)
+          + (Number(b.cost_out_usd) || 0));
+      const tokTot = Number(b.tokens_all) > 0
+        ? Number(b.tokens_all)
+        : ((Number(b.tokens_in) || 0)
+          + (Number(b.tokens_cached) || 0)
+          + (Number(b.tokens_out) || 0));
+      const tipTotal = isNorm
+        ? found.bar.total
+        : (found.bar.total > 0
+          ? found.bar.total
+          : (unit === "tokens" ? tokTot : estUsd));
+      if (b._oneSeg) {
+        html = `<b>${esc(head)}</b><br>${fmtCostAxis(tipTotal, unit)}`;
+      } else if (stackMode === "io" && !isNorm) {
+        const lines = [
+          `<b>${esc(head)}</b>`,
+          `<span class="tok-in">In</span> ${fmtTokens(b.tokens_in)} · ${fmtUsd(b.cost_in_usd)}`,
+          `<span class="tok-cached">Cached</span> ${fmtTokens(b.tokens_cached)} · ${fmtUsd(b.cost_cached_usd)}`,
+          `<span class="tok-out">Out</span> ${fmtTokens(b.tokens_out)} · ${fmtUsd(b.cost_out_usd)}`,
+          `<b>→ ${fmtCostAxis(tipTotal, unit)}</b>`,
+        ];
+        if (unit === "usd" && b.official_usd != null)
+          lines.push(`<span class="muted">official ${fmtUsd(b.official_usd)}</span>`);
+        html = lines.join("<br>");
+      } else {
+        const lines = [`<b>${esc(head)}</b>`];
+        tipOrderedSegs(found.bar.segs || [], stackMode, unit).forEach((s) => {
+          lines.push(formatTipSegLine(s, unit, { normalized: isNorm }));
+        });
+        if (!isNorm)
+          lines.push(`<b>→ ${fmtCostAxis(tipTotal, unit)}</b>`);
+        if (!isNorm && unit === "usd" && b.official_usd != null)
+          lines.push(`<span class="muted">official ${fmtUsd(b.official_usd)}</span>`);
+        html = lines.join("<br>");
+      }
       placeCostTip(ev, tipEl, html);
     });
     canvas.addEventListener("mouseleave", () => {
@@ -2899,7 +3899,7 @@ function planGanttYLabels(rows, padT, plotH) {
     r,
     i,
     y: r._cy != null ? r._cy : (padT + (i + 0.5) * (plotH / Math.max(rows.length, 1))),
-    isSub: Number(r.depth) > 0 || r.session_kind === "subagent",
+    isSub: Number(r.depth) > 0 || isSubagentKind(r.session_kind),
     n: Number(r.n) || 0,
     mode: "num",
   }));
@@ -3085,6 +4085,7 @@ function drawTimeline(canvas, agg) {
   }
   setCostTipOwner(canvas, "period");
   setGanttChrome(true);
+  clearRateHost("cost");
   const prev = window.__aggChart || {};
   const all = (agg && agg.sessions) || [];
   const selected = prev.selected instanceof Set ? prev.selected : new Set();
@@ -3193,7 +4194,7 @@ function drawTimeline(canvas, agg) {
     rowMid[i] = padT + (i - yPan + 0.5) * rowH;
   });
   sessions.forEach((s, i) => {
-    if (!(s.depth > 0) && s.session_kind !== "subagent") return;
+    if (!(s.depth > 0) && !isSubagentKind(s.session_kind)) return;
     const pid = (s.parent_id || "").toLowerCase();
     if (!pid) return;
     const pi = sessions.findIndex((p) => String(p.session_id).toLowerCase() === pid);
@@ -3293,6 +4294,721 @@ function fitGanttToSessions(rows) {
   store._gt1 = win.t1;
 }
 
+function ctxRateStore() {
+  if (!window.__ctxRateChart) window.__ctxRateChart = {};
+  return window.__ctxRateChart;
+}
+
+function rateHostIds(host) {
+  if (host === "ctx") {
+    return {
+      wrap: "ctxChartWrap",
+      scroll: "ctxChartScroll",
+      yAxis: "ctxYAxis",
+      tip: "ctxTip",
+      store: ctxRateStore(),
+    };
+  }
+  return {
+    wrap: "costChartWrap",
+    scroll: "costChartScroll",
+    yAxis: "costYAxis",
+    tip: "costTip",
+    store: zoomStore(),
+  };
+}
+
+function niceRateYMax(rawMax) {
+  const m = Math.max(Number(rawMax) || 0, 0.01);
+  const targetTicks = 6;
+  const rough = m / targetTicks;
+  const mag = Math.pow(10, Math.floor(Math.log10(Math.max(rough, 1e-6))));
+  const r = rough / mag;
+  let nice = 1;
+  if (r <= 1) nice = 1;
+  else if (r <= 2) nice = 2;
+  else if (r <= 5) nice = 5;
+  else nice = 10;
+  let step = nice * mag;
+  if (step < 0.01) step = 0.01;
+  let max = Math.max(step, Math.ceil(m / step) * step);
+  let ticks = Math.round(max / step);
+  if (ticks > 8) {
+    step = (Math.ceil(max / 6 / step) || 1) * step;
+    max = Math.max(step, Math.ceil(m / step) * step);
+  }
+  return { min: 0, max, step };
+}
+
+export function buildSessionRatePoints(rounds, grain) {
+  const pts = [];
+  (rounds || []).forEach((r) => {
+    const ri = r.index ?? "?";
+    if (grain === "round") {
+      if (r.gen_tokens_per_sec == null) return;
+      pts.push({
+        label: `R${ri}`,
+        v: Number(r.gen_tokens_per_sec),
+        kind: "round",
+        round: ri,
+        gen_ms: r.gen_ms,
+        tokens_out: r.gen_out_tokens,
+        n: r.gen_rate_n,
+      });
+      return;
+    }
+    (r.model_steps || []).forEach((s, i) => {
+      if (s.gen_tokens_per_sec == null) return;
+      const li = s.index ?? (i + 1);
+      pts.push({
+        label: `R${ri}·${li}`,
+        v: Number(s.gen_tokens_per_sec),
+        kind: "call",
+        round: ri,
+        call: li,
+        gen_ms: s.gen_ms,
+        tokens_out: s.gen_out_tokens,
+      });
+    });
+  });
+  return pts;
+}
+
+function layoutRateCanvas(canvas, barCount, ids) {
+  const yAxis = $(ids.yAxis);
+  if (yAxis && barCount > 0) yAxis.hidden = false;
+  const scroller = $(ids.scroll);
+  let viewW = (scroller && scroller.clientWidth) || 0;
+  if (!viewW) viewW = (canvas.parentElement && canvas.parentElement.clientWidth) || 600;
+  const store = ids.store;
+  let h = ids.host === "ctx"
+    ? storedCtxChartH()
+    : ensureCostChartH(store);
+  canvas.style.height = h + "px";
+  if (yAxis) yAxis.style.height = h + "px";
+  if (ids.host === "cost") bindChartResize();
+  const vk = (ids.host === "ctx" ? "ctx:" : "") + (store._rateKey || chartViewKey());
+  if (store._rateZoomKey !== vk) {
+    store._costUserZoom = false;
+    store.slotPx = 0;
+    store._scrollLeft = 0;
+    store._rateYZoom = 1;
+    store._rateZoomKey = vk;
+  }
+  const keepScroll = store._costUserZoom || store._costStickEnd === false;
+  const prevScroll = scroller
+    ? (store._scrollLeft != null ? store._scrollLeft : scroller.scrollLeft)
+    : 0;
+  const { nSlots, minSlot, maxSlot: slotCap } = slotRange(viewW, barCount, COST_MAX_SLOT);
+  let slot = store.slotPx;
+  if (store._costUserZoom && slot > 0) {
+    slot = Math.min(slotCap, Math.max(minSlot, slot));
+  } else {
+    slot = minSlot;
+  }
+  store.slotPx = slot;
+  const w = PLOT_PAD_L + 12 + nSlots * slot;
+  const overflow = w > viewW + 1;
+  canvas.style.width = w + "px";
+  if (scroller) scroller.classList.toggle("is-overflow", overflow);
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.max(1, Math.floor(w * dpr));
+  canvas.height = Math.max(1, Math.floor(h * dpr));
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  if (scroller) {
+    const max = Math.max(0, scroller.scrollWidth - scroller.clientWidth);
+    if (overflow && !keepScroll && store._costStickEnd !== false) {
+      scroller.scrollLeft = max;
+      store._scrollLeft = scroller.scrollLeft;
+    } else if (keepScroll) {
+      scroller.scrollLeft = Math.min(max, Math.max(0, prevScroll));
+      store._scrollLeft = scroller.scrollLeft;
+    }
+  }
+  if (scroller && !scroller._rateStickBound) {
+    scroller._rateStickBound = true;
+    scroller.addEventListener("scroll", () => {
+      const st = ids.store;
+      st._scrollLeft = scroller.scrollLeft;
+      const max = scroller.scrollWidth - scroller.clientWidth;
+      st._costStickEnd = max > 0 && scroller.scrollLeft >= max - 12;
+    });
+  }
+  canvas._zoomBars = barCount;
+  canvas._zoomMaxSlot = COST_MAX_SLOT;
+  return { w, h, ctx, overflow, slot, nSlots, minSlot, viewW };
+}
+
+function drawRateYOverlay(ids, { min, max, step, top, h, padB, format }) {
+  const yAxis = $(ids.yAxis);
+  if (!yAxis) return;
+  yAxis.hidden = false;
+  const dpr = window.devicePixelRatio || 1;
+  const w = COST_Y_LEFT;
+  yAxis.width = Math.max(1, Math.floor(w * dpr));
+  yAxis.height = Math.max(1, Math.floor(h * dpr));
+  yAxis.style.width = w + "px";
+  yAxis.style.height = h + "px";
+  const ctx = yAxis.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = CHART_AXIS.label;
+  ctx.font = "10px system-ui, Segoe UI, sans-serif";
+  ctx.textAlign = "right";
+  const span = (max - min) || 1;
+  const plotH = Math.max(10, h - top - (padB || 28));
+  const fmt = typeof format === "function" ? format : fmtToksPerSec;
+  for (let v = min; v <= max + step / 2; v += step) {
+    const y = top + ((max - v) / span) * plotH;
+    ctx.fillText(fmt(v), w - 8, y + 3);
+  }
+}
+
+/** Square step path: horizontal then vertical jump (no linear interpolation). */
+function strokeStepLine(ctx, xs, ys) {
+  if (!xs.length) return;
+  ctx.beginPath();
+  ctx.moveTo(xs[0], ys[0]);
+  for (let i = 1; i < xs.length; i++) {
+    ctx.lineTo(xs[i], ys[i - 1]);
+    ctx.lineTo(xs[i], ys[i]);
+  }
+  ctx.stroke();
+}
+
+/**
+ * Period D/W/M: estimated In / Cached / Out $ per session as step lines.
+ * Reuses cost zoom / resize / X-label collision / Y overlay from rate charts.
+ */
+export function drawIoStepChart(canvas, pts, opts) {
+  const ids = rateHostIds("cost");
+  ids.host = "cost";
+  ids.store._rateKey = "p-io-step";
+  const wrap = $(ids.wrap);
+  if (wrap) {
+    wrap.classList.toggle("is-rate", true);
+    wrap.classList.remove("is-gantt");
+  }
+  if (!window.__aggChart) window.__aggChart = {};
+  window.__aggChart.ioStep = true;
+  window.__aggChart.rate = false;
+  window.__aggChart.timeline = false;
+  window.__aggChart.ioStepPts = pts;
+  window.__aggChart.ioStepOpts = { ...(opts || {}) };
+  canvas._rateRedraw = () => drawIoStepChart(canvas, pts, opts);
+  bindRatePan(ids);
+  bindCostZoom();
+  bindYStretch();
+  setCostTipOwner(canvas, "rate");
+
+  const list = (pts || []).filter((p) => p && p.session_id);
+  const yAxis = $(ids.yAxis);
+  const hidden = (window.__aggChart.hiddenLegend instanceof Set)
+    ? window.__aggChart.hiddenLegend
+    : new Set();
+  const series = [
+    { key: "in", label: "In $/M", color: COST_COLORS.in, pick: (p) => Number(p.in) || 0 },
+    { key: "cached", label: "Cached $/M", color: COST_COLORS.cached, pick: (p) => Number(p.cached) || 0 },
+    { key: "out", label: "Out $/M", color: COST_COLORS.out, pick: (p) => Number(p.out) || 0 },
+  ];
+  const vis = series.filter((s) => !hidden.has(s.key));
+
+  if (!list.length) {
+    if (yAxis) yAxis.hidden = true;
+    const scroller = $(ids.scroll);
+    if (scroller) {
+      canvas.style.width = "100%";
+      canvas.style.height = ensureCostChartH(ids.store) + "px";
+    }
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth || 600;
+    const h = canvas.clientHeight || 240;
+    canvas.width = Math.floor(w * dpr);
+    canvas.height = Math.floor(h * dpr);
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    drawChartEmpty(ctx, w, h, "No sessions");
+    canvas._ratePts = null;
+    hideChartTip($(ids.tip));
+    const legend = $("costLegend");
+    if (legend) legend.innerHTML = "";
+    return;
+  }
+
+  const labels = list.map((p) => p.label || "");
+  const padGuess = guessXPlan(labels, list.length, false);
+  applyXPadHeight(canvas, padGuess.padB);
+  const laid = layoutRateCanvas(canvas, list.length, ids);
+  const { w, h, ctx, slot } = laid;
+  const xPlan = planXLabels(ctx, labels, slot, { temporal: false });
+  const padL = PLOT_PAD_L;
+  const padT = 18;
+  const padB = Math.max(padGuess.padB || 28, xPlan.padB || 28);
+  const plotH = Math.max(10, h - padT - padB);
+  let rawMax = 0;
+  for (const p of list) {
+    for (const s of vis) rawMax = Math.max(rawMax, s.pick(p));
+  }
+  const yz = clampYViewZoom(ids.store._rateYZoom || 1);
+  const { min, max, step } = niceCostYMax(Math.max(rawMax, 0.01) / yz);
+  const yOf = (v) => padT + plotH - ((v - min) / ((max - min) || 1)) * plotH;
+  const xOf = (i) => padL + slot / 2 + i * slot;
+  const baseR = 3.2;
+  const dotR = Math.max(1.15, Math.min(baseR, slot * 0.28));
+  const lineW = Math.max(1.2, Math.min(2.2, slot * 0.12));
+
+  ctx.strokeStyle = CHART_AXIS.grid;
+  ctx.lineWidth = 1;
+  for (let v = min; v <= max + step / 2; v += step) {
+    const y = yOf(v);
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(w - 8, y);
+    ctx.stroke();
+  }
+  drawRateYOverlay(ids, { min, max, step, top: padT, h, padB, format: fmtUsdPerM });
+
+  const xs = list.map((_, i) => xOf(i));
+  for (const s of vis) {
+    const ys = list.map((p) => yOf(s.pick(p)));
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = lineW;
+    strokeStepLine(ctx, xs, ys);
+    list.forEach((p, i) => {
+      ctx.fillStyle = s.color;
+      ctx.beginPath();
+      ctx.arc(xs[i], ys[i], dotR, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+
+  list.forEach((p, i) => {
+    p._x = xs[i];
+    // Hit mid of visible series Y (or plot mid if all hidden).
+    let yHit = padT + plotH / 2;
+    if (vis.length) {
+      let sum = 0;
+      for (const s of vis) sum += yOf(s.pick(p));
+      yHit = sum / vis.length;
+    }
+    p._y = yHit;
+    if (p.label && (xPlan.every <= 1 || i % xPlan.every === 0 || i === list.length - 1)) {
+      drawXLabel(ctx, p.label, xs[i], h - padB + 6, xPlan.rotate);
+    }
+  });
+
+  canvas._ratePts = list;
+  canvas._rateGeom = { padL, padT, padB, plotH, slot, min, max };
+  canvas._ioStepTip = true;
+
+  renderCostLegend(
+    series.map((s) => [s.key, { label: s.label, color: s.color, k: s.key }]),
+    hidden
+  );
+
+  if (!canvas._ioStepTipBound) {
+    canvas._ioStepTipBound = true;
+    canvas.addEventListener("mousemove", (ev) => {
+      if (!canvas._ioStepTip || !canvas._ratePts) return;
+      if (canvas._costTipOwner && canvas._costTipOwner !== "rate") return;
+      const pack = canvas._ratePts;
+      const tip = $(ids.tip);
+      const rect = canvas.getBoundingClientRect();
+      const mx = ev.clientX - rect.left;
+      let best = null;
+      let bestD = Math.max(18, (canvas._rateGeom && canvas._rateGeom.slot) ? canvas._rateGeom.slot / 2 : 18);
+      for (const p of pack) {
+        if (p._x == null) continue;
+        const d = Math.abs(mx - p._x);
+        if (d < bestD) { bestD = d; best = p; }
+      }
+      if (!best) return hideChartTip(tip);
+      const lines = [
+        `<b>${esc(best.title || best.label || "Session")}</b>`,
+        `<span class="tok-in">In ${fmtUsdPerM(best.in)}</span> · `
+          + `<span class="tok-cached">Cached ${fmtUsdPerM(best.cached)}</span> · `
+          + `<span class="tok-out">Out ${fmtUsdPerM(best.out)}</span> <span class="muted">/M</span>`,
+        joinParts([
+          partIn(best.tokens_in, best.cost_in_usd),
+          partCached(best.tokens_cached, best.cost_cached_usd),
+          partOut(best.tokens_out, best.cost_out_usd),
+        ].filter(Boolean)) || "",
+        best.snapped ? `<span class="muted">snapped to published rates</span>` : "",
+      ];
+      placeRateTip(ev, tip, lines.filter(Boolean).join("<br>"), ids.wrap);
+    });
+    canvas.addEventListener("mouseleave", () => {
+      if (!canvas._ioStepTip) return;
+      hideChartTip($(ids.tip));
+    });
+    canvas.addEventListener("click", (ev) => {
+      if (!canvas._ioStepTip || !canvas._ratePts) return;
+      const pack = canvas._ratePts;
+      const rect = canvas.getBoundingClientRect();
+      const mx = ev.clientX - rect.left;
+      let best = null;
+      let bestD = Math.max(16, (canvas._rateGeom && canvas._rateGeom.slot) ? canvas._rateGeom.slot / 2 : 16);
+      for (const p of pack) {
+        if (p._x == null) continue;
+        const d = Math.abs(mx - p._x);
+        if (d < bestD) { bestD = d; best = p; }
+      }
+      const fn = canvas._rateOnClick;
+      if (best && fn) fn(best);
+    });
+  }
+  canvas._rateTipId = ids.tip;
+  canvas._rateWrapId = ids.wrap;
+  canvas._rateOnClick = opts && opts.onClick;
+}
+
+function bindRatePan(ids) {
+  const scroller = $(ids.scroll);
+  const wrap = $(ids.wrap);
+  if (!scroller || scroller._ratePanBound) return;
+  scroller._ratePanBound = true;
+  scroller.addEventListener("pointerdown", (ev) => {
+    if (ev.button !== 0) return;
+    if (ev.target && ev.target.closest && ev.target.closest(".chart-resize")) return;
+    scroller._rpan = { x0: ev.clientX, sl: scroller.scrollLeft, moved: false };
+    try { scroller.setPointerCapture(ev.pointerId); } catch { /* ignore */ }
+  });
+  scroller.addEventListener("pointermove", (ev) => {
+    const d = scroller._rpan;
+    if (!d) return;
+    const dx = ev.clientX - d.x0;
+    if (Math.abs(dx) > 3) d.moved = true;
+    if (!d.moved) return;
+    ev.preventDefault();
+    if (wrap) wrap.classList.add("is-panning");
+    scroller.scrollLeft = d.sl - dx;
+    ids.store._scrollLeft = scroller.scrollLeft;
+  });
+  const end = () => {
+    scroller._rpan = null;
+    if (wrap) wrap.classList.remove("is-panning");
+  };
+  scroller.addEventListener("pointerup", end);
+  scroller.addEventListener("pointercancel", end);
+}
+
+function bindRateZoom(ids) {
+  const wrap = $(ids.wrap);
+  if (!wrap || wrap._rateZoomBound) return;
+  wrap._rateZoomBound = true;
+  wrap.addEventListener("wheel", (ev) => {
+    if (ev.shiftKey) return;
+    if (Math.abs(ev.deltaX) > Math.abs(ev.deltaY)) return;
+    if (ev.target && (ev.target.id === ids.yAxis || (ev.target.classList && ev.target.classList.contains("cost-yaxis"))))
+      return;
+    if (ids.host === "cost" && wrap._zoomBound && pointerInXAxis(ev, wrap)) return;
+    const canvas = ids.host === "ctx" ? $("ctxChart") : $("costChart");
+    const scroller = $(ids.scroll);
+    if (!canvas || !canvas._ratePts) return;
+    const store = ids.store;
+    const barCount = canvas._zoomBars || 1;
+    const viewW = (scroller && scroller.clientWidth) || wrap.clientWidth || 600;
+    const { nSlots, minSlot, maxSlot } = slotRange(viewW, barCount, canvas._zoomMaxSlot);
+    const slot0 = store.slotPx > 0 ? store.slotPx : minSlot;
+    const notches = ev.deltaY / (ev.deltaMode === 1 ? 3 : 80);
+    let next = slot0 * Math.pow(1.16, -notches);
+    next = Math.min(maxSlot, Math.max(minSlot, next));
+    if (next <= minSlot * 1.03) next = minSlot;
+    if (Math.abs(next - slot0) < 0.05) return;
+    ev.preventDefault();
+    const sl = scroller ? scroller.scrollLeft : 0;
+    const rect = (scroller || wrap).getBoundingClientRect();
+    const mx = ev.clientX - rect.left;
+    const oldW = PLOT_PAD_L + 12 + nSlots * slot0;
+    const newW = PLOT_PAD_L + 12 + nSlots * next;
+    const t = oldW > 0 ? (sl + mx) / oldW : 0;
+    store.slotPx = next;
+    store._costUserZoom = true;
+    store._costStickEnd = false;
+    if (canvas._rateRedraw) canvas._rateRedraw();
+    if (scroller) {
+      const max = Math.max(0, scroller.scrollWidth - scroller.clientWidth);
+      scroller.scrollLeft = Math.min(max, Math.max(0, t * newW - mx));
+      store._scrollLeft = scroller.scrollLeft;
+    }
+  }, { passive: false });
+}
+
+function placeRateTip(ev, tipEl, html, _wrapId) {
+  // Same fixed viewport placement as cost tips (wrap-relative + fixed was too high).
+  placeCostTip(ev, tipEl, html);
+}
+
+export function drawRateChart(canvas, pts, opts) {
+  const host = (opts && opts.host) || "cost";
+  const ids = rateHostIds(host);
+  ids.host = host;
+  if (host === "ctx") ids.store._rateKey = "ctx:" + ((opts && opts.grain) || "call");
+  else ids.store._rateKey = "p-rate:" + ((opts && opts.grain) || "session");
+  const color = (opts && opts.color) || "#7ec8ff";
+  const wrap = $(ids.wrap);
+  if (wrap) wrap.classList.toggle("is-rate", true);
+  canvas._ioStepTip = false;
+  if (host === "cost") {
+    if (wrap) wrap.classList.remove("is-gantt");
+    if (window.__aggChart) {
+      window.__aggChart.ratePts = pts;
+      window.__aggChart.rateOpts = { ...(opts || {}), host: "cost" };
+      window.__aggChart.rate = true;
+      window.__aggChart.ioStep = false;
+      window.__aggChart.ioStepPts = null;
+    }
+  }
+  canvas._rateRedraw = () => drawRateChart(canvas, pts, opts);
+  bindRatePan(ids);
+  if (host === "ctx") {
+    bindRateZoom(ids);
+    bindRateYStretch(ids);
+  }
+  if (host === "cost") {
+    bindCostZoom();
+    setCostTipOwner(canvas, "rate");
+  }
+  if (host === "ctx") canvas._ctxPts = null;
+
+  const list = (pts || []).filter((p) => p && p.v != null && !Number.isNaN(p.v));
+  const yAxis = $(ids.yAxis);
+  if (!list.length) {
+    if (yAxis) yAxis.hidden = true;
+    const scroller = $(ids.scroll);
+    if (scroller) {
+      canvas.style.width = "100%";
+      const h = host === "ctx" ? storedCtxChartH() : ensureCostChartH(ids.store);
+      canvas.style.height = h + "px";
+    }
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth || 600;
+    const h = canvas.clientHeight || 240;
+    canvas.width = Math.floor(w * dpr);
+    canvas.height = Math.floor(h * dpr);
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    drawChartEmpty(ctx, w, h, "No tok/s samples");
+    canvas._ratePts = null;
+    hideChartTip($(ids.tip));
+    if (host === "cost") {
+      const legend = $("costLegend");
+      if (legend) legend.innerHTML = "";
+    }
+    return;
+  }
+
+  const labels = list.map((p) => p.label || "");
+  // Pad from fit-view first; final X plan uses real slot after zoom (same as Session bars).
+  const padGuess = guessXPlan(labels, list.length, false);
+  if (host === "cost") applyXPadHeight(canvas, padGuess.padB);
+  else {
+    const base = storedCtxChartH();
+    canvas.style.height = (base + Math.max(0, (padGuess.padB || 28) - 28)) + "px";
+  }
+  const laid = layoutRateCanvas(canvas, list.length, ids);
+  const { w, h, ctx, slot } = laid;
+  const xPlan = planXLabels(ctx, labels, slot, { temporal: false });
+  const padL = PLOT_PAD_L;
+  const padT = 18;
+  const padB = Math.max(padGuess.padB || 28, xPlan.padB || 28);
+  const plotH = Math.max(10, h - padT - padB);
+  const vals = list.map((p) => p.v);
+  const yz = clampYViewZoom(ids.store._rateYZoom || 1);
+  const { min, max, step } = niceRateYMax(Math.max(...vals, 0) / yz);
+  const yOf = (v) => padT + plotH - ((v - min) / ((max - min) || 1)) * plotH;
+  const xOf = (i) => padL + slot / 2 + i * slot;
+  // Shrink dots when zoomed out so dense Session/Round grains stay readable.
+  const baseR = 3.2;
+  const dotR = Math.max(1.15, Math.min(baseR, slot * 0.28));
+  const lineW = Math.max(1, Math.min(2, slot * 0.12));
+
+  ctx.strokeStyle = CHART_AXIS.grid;
+  ctx.lineWidth = 1;
+  for (let v = min; v <= max + step / 2; v += step) {
+    const y = yOf(v);
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(w - 8, y);
+    ctx.stroke();
+  }
+  drawRateYOverlay(ids, { min, max, step, top: padT, h, padB });
+
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lineW;
+  ctx.beginPath();
+  list.forEach((p, i) => {
+    const x = xOf(i);
+    const y = yOf(p.v);
+    p._x = x;
+    p._y = y;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+  ctx.lineTo(xOf(list.length - 1), padT + plotH);
+  ctx.lineTo(xOf(0), padT + plotH);
+  ctx.closePath();
+  ctx.fillStyle = color + "22";
+  ctx.fill();
+
+  list.forEach((p, i) => {
+    const x = xOf(i);
+    const y = yOf(p.v);
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(x, y, dotR, 0, Math.PI * 2);
+    ctx.fill();
+    if (p.label && (xPlan.every <= 1 || i % xPlan.every === 0 || i === list.length - 1)) {
+      drawXLabel(ctx, p.label, x, h - padB + 6, xPlan.rotate);
+    }
+  });
+
+  canvas._ratePts = list;
+  canvas._rateGeom = { padL, padT, padB, plotH, slot, min, max };
+  if (host === "cost") {
+    const legend = $("costLegend");
+    if (legend) legend.innerHTML = "";
+  }
+
+  if (!canvas._rateTipBound) {
+    canvas._rateTipBound = true;
+    canvas.addEventListener("mousemove", (ev) => {
+      if (canvas._ioStepTip) return;
+      const pack = canvas._ratePts;
+      const tip = $(canvas._rateTipId || ids.tip);
+      if (!pack || !pack.length) return;
+      if (canvas._costTipOwner && canvas._costTipOwner !== "rate" && canvas._rateWrapId === "costChartWrap")
+        return;
+      const rect = canvas.getBoundingClientRect();
+      const mx = ev.clientX - rect.left;
+      const my = ev.clientY - rect.top;
+      let best = null;
+      let bestD = Math.max(18, (canvas._rateGeom && canvas._rateGeom.slot) ? canvas._rateGeom.slot / 2 : 18);
+      for (const p of pack) {
+        if (p._x == null) continue;
+        const d = Math.hypot(mx - p._x, my - p._y);
+        if (d < bestD) {
+          bestD = d;
+          best = p;
+        }
+      }
+      if (!best) return hideChartTip(tip);
+      // Period Session/Round: numeric labels (29 / 29.1 / 29 R2). Call grain keeps R·c.
+      const title = (best.kind === "session" || best.kind === "round")
+        ? `<b>${esc(best.label || (best.round != null ? ("R" + best.round) : ""))}</b>`
+        : `<b>R${esc(best.round)}·${esc(best.call != null ? best.call : best.label)}</b>`;
+      // Call-count avg only for session-local Round/Call points (not period session index).
+      const showCallAvg = best.n != null && (
+        best.kind === "call"
+        || (best.kind === "round" && !best.session_id)
+      );
+      const lines = [
+        title,
+        `<span class="muted">Y tok/s</span> <b>${fmtToksPerSec(best.v)}</b>`,
+        best.tokens_out != null ? `<span class="muted">TokF</span> ${fmtTokens(best.tokens_out)}` : "",
+        best.gen_ms != null ? `<span class="muted">window</span> ${fmtMs(best.gen_ms)}` : "",
+        showCallAvg
+          ? `<span class="muted">${best.n} call${best.n === 1 ? "" : "s"} avg</span>`
+          : "",
+      ];
+      placeRateTip(ev, tip, lines.filter(Boolean).join("<br>"), canvas._rateWrapId || ids.wrap);
+    });
+    canvas.addEventListener("mouseleave", () => {
+      if (canvas._ioStepTip) return;
+      if (!canvas._ratePts) return;
+      hideChartTip($(canvas._rateTipId || ids.tip));
+    });
+    canvas.addEventListener("click", (ev) => {
+      if (canvas._ioStepTip) return;
+      const pack = canvas._ratePts;
+      if (!pack || !pack.length) return;
+      const rect = canvas.getBoundingClientRect();
+      const mx = ev.clientX - rect.left;
+      const my = ev.clientY - rect.top;
+      let best = null;
+      let bestD = 16;
+      for (const p of pack) {
+        if (p._x == null) continue;
+        const d = Math.hypot(mx - p._x, my - p._y);
+        if (d < bestD) {
+          bestD = d;
+          best = p;
+        }
+      }
+      const fn = canvas._rateOnClick;
+      if (best && fn) fn(best);
+    });
+  }
+  canvas._rateTipId = ids.tip;
+  canvas._rateWrapId = ids.wrap;
+  canvas._rateOnClick = opts && opts.onClick;
+}
+
+export function clearRateHost(host) {
+  const ids = rateHostIds(host || "cost");
+  const wrap = $(ids.wrap);
+  if (wrap) wrap.classList.remove("is-rate");
+  const y = $(ids.yAxis);
+  if (y && host === "ctx") y.hidden = true;
+  const canvas = host === "ctx" ? $("ctxChart") : $("costChart");
+  if (canvas) {
+    canvas._ratePts = null;
+    canvas._rateGeom = null;
+    canvas._rateRedraw = null;
+    canvas._ioStepTip = false;
+  }
+  if (host === "cost" && window.__aggChart) {
+    window.__aggChart.ioStep = false;
+    window.__aggChart.ioStepPts = null;
+  }
+  hideChartTip($(ids.tip));
+}
+
+function bindRateYStretch(ids) {
+  const y = $(ids.yAxis);
+  if (!y || y._rateYStretch) return;
+  y._rateYStretch = true;
+  y.addEventListener("wheel", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    const store = ids.store;
+    if (!store) return;
+    applyCtxRateYZoom(store, (store._rateYZoom || 1) * Math.pow(1.12, -ev.deltaY / 80), ids);
+  }, { passive: false });
+  y.addEventListener("pointerdown", (ev) => {
+    if (ev.button !== 0) return;
+    ev.preventDefault();
+    const store = ids.store;
+    if (!store) return;
+    try { y.setPointerCapture(ev.pointerId); } catch { /* ignore */ }
+    y._rateYDrag = { y0: ev.clientY, z0: store._rateYZoom || 1 };
+  });
+  y.addEventListener("pointermove", (ev) => {
+    const drag = y._rateYDrag;
+    if (!drag) return;
+    if (Math.abs(ev.clientY - drag.y0) < 3) return;
+    const store = ids.store;
+    if (!store) return;
+    applyCtxRateYZoom(store, drag.z0 * Math.pow(1.02, (drag.y0 - ev.clientY) / 4), ids);
+  });
+  const end = () => { y._rateYDrag = null; };
+  y.addEventListener("pointerup", end);
+  y.addEventListener("pointercancel", end);
+}
+
+function applyCtxRateYZoom(store, next, ids) {
+  const z1 = clampYViewZoom(next);
+  if (Math.abs(z1 - (store._rateYZoom || 1)) < 0.001) return;
+  store._rateYZoom = z1;
+  const canvas = ids && ids.host === "cost" ? $("costChart") : $("ctxChart");
+  if (canvas && canvas._rateRedraw) canvas._rateRedraw();
+}
+
 export {
   buildCtxPoints,
   drawLineChart,
@@ -3306,4 +5022,6 @@ export {
   findRound,
   hideAllChartTips,
   hideChartTip,
+  storedCtxChartH,
+  bindCtxChartResize,
 };

@@ -11,7 +11,52 @@ from typing import Any, Optional
 from token_telemetry.tokenizer import (
     count_chars_as_tokens,
     count_tokens,
+    count_user_prompt_tokens,
 )
+
+
+def _between_rounds_compact(r: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Compact card between prev round and this one (not mid-round on a step)."""
+    cb = r.get("compact_before")
+    if not isinstance(cb, dict) or cb.get("kind") != "compaction":
+        return None
+    if cb.get("placement") == "mid_round":
+        return None
+    return cb
+
+
+def _attach_user_compact_out(up: dict[str, Any], compact: dict[str, Any]) -> None:
+    """Stamp Compact Out on User[N] (between-rounds re-entry — not Call-1 harness)."""
+    try:
+        out_tok = int(compact.get("out_tokens") or compact.get("tokens_after") or 0)
+    except (TypeError, ValueError):
+        out_tok = 0
+    if out_tok <= 0:
+        up.pop("compact_out", None)
+        return
+    try:
+        out_usd = float(compact.get("out_usd") or 0)
+    except (TypeError, ValueError):
+        out_usd = 0.0
+    if out_usd <= 0:
+        try:
+            from token_telemetry.pricing import _price_in
+
+            out_usd = float(_price_in(out_tok, max(out_tok, 1)))
+        except Exception:
+            out_usd = 0.0
+    n = compact.get("n") or compact.get("index") or compact.get("compact_index")
+    up["compact_out"] = {
+        "kind": "compact_out",
+        "compact_index": int(n) if isinstance(n, (int, float)) and int(n) > 0 else None,
+        "tokens_in": int(out_tok),
+        "tokenizer_tokens": int(out_tok),
+        "cost_in_usd": float(out_usd),
+        "note": (
+            "Compacted history re-enters as User In "
+            "(already includes prior LLM answer — not listed again)."
+        ),
+    }
 
 
 def _attach_prev_llm_answer(hb: Any, r: dict[str, Any]) -> None:
@@ -21,6 +66,9 @@ def _attach_prev_llm_answer(hb: Any, r: dict[str, Any]) -> None:
       prompt                  = user_uncached − that In mass
     so prompt never double-counts the previous answer mass.
 
+    Between-rounds compact: skip LLM answer (already inside Compact Out) and
+    attach Compact Out under User[N] instead of Call-1 harness.
+
     TokZ = tokenizer stamp (summary / message). TokF for reasoning =
     billed encrypted residual (off_reason − Thought − ToolReq), not
     thought_encrypted_tokens (raw encrypt size — often much larger).
@@ -28,6 +76,70 @@ def _attach_prev_llm_answer(hb: Any, r: dict[str, Any]) -> None:
     up = r.get("user_prompt")
     if not isinstance(up, dict) or up.get("kind") != "user_prompt":
         return
+
+    # Between-rounds compact: User = prompt + Compact Out (no LLM answer R[n-1]).
+    between = _between_rounds_compact(r)
+    if between is not None:
+        up.pop("prev_llm_answer", None)
+        _attach_user_compact_out(up, between)
+        try:
+            raw_user = int(up.get("tokens_in") or up.get("uncached_est") or 0)
+        except (TypeError, ValueError):
+            raw_user = 0
+        ud = up.get("user_detail") if isinstance(up.get("user_detail"), dict) else {}
+        prompt_tz = int(ud.get("user_query_tokens") or 0) + int(
+            ud.get("skill_information_tokens") or 0
+        )
+        if prompt_tz <= 0:
+            full = str(r.get("user_text") or up.get("user_text") or "")
+            if full:
+                try:
+                    prompt_tz = int(count_user_prompt_tokens(full))
+                except Exception:
+                    prompt_tz = max(1, count_chars_as_tokens(len(full)) or 1)
+            else:
+                preview = str(up.get("preview") or r.get("user_preview") or "")
+                if preview:
+                    try:
+                        prompt_tz = int(count_user_prompt_tokens(preview))
+                    except Exception:
+                        prompt_tz = max(1, count_chars_as_tokens(len(preview)) or 1)
+        prompt_in = int(raw_user)
+        prompt_disp = int(prompt_tz) if prompt_tz > 0 else int(prompt_in)
+        tier = max(
+            int(r.get("context_start") or 0),
+            int((up.get("compact_out") or {}).get("tokens_in") or 0),
+            prompt_in,
+            1,
+        )
+        try:
+            from token_telemetry.pricing import _price_in
+
+            prompt_usd = float(_price_in(prompt_in, tier)) if prompt_in else 0.0
+            user_usd = float(_price_in(raw_user, tier)) if raw_user else 0.0
+        except Exception:
+            prompt_usd = float(up.get("cost_in_usd") or 0)
+            user_usd = float(up.get("cost_in_usd") or 0)
+        if prompt_tz > 0:
+            up["tokenizer_tokens"] = int(prompt_tz)
+            up["prompt_tokenizer_tokens"] = int(prompt_tz)
+        up["prompt_tokens_in"] = int(prompt_disp)
+        up["prompt_cost_in_usd"] = float(prompt_usd)
+        up["uncached_est_raw"] = int(raw_user)
+        up["tokens_in"] = int(raw_user)
+        up["uncached_est"] = int(raw_user)
+        up["cost_in_usd"] = float(user_usd)
+        co = up.get("compact_out") if isinstance(up.get("compact_out"), dict) else {}
+        co_tok = int(co.get("tokens_in") or 0)
+        co_usd = float(co.get("cost_in_usd") or 0)
+        up["display_in_tokens"] = int(prompt_disp) + int(co_tok)
+        up["display_in_usd"] = float(prompt_usd) + float(co_usd)
+        cache_usd = float(up.get("cost_cached_usd") or 0)
+        up["estimate_usd"] = float(user_usd + cache_usd)
+        r["user_prompt"] = up
+        return
+
+    up.pop("compact_out", None)
     prev: Optional[dict[str, Any]] = None
     if r in hb.rounds:
         idx = hb.rounds.index(r)
@@ -128,32 +240,69 @@ def _attach_prev_llm_answer(hb: Any, r: dict[str, Any]) -> None:
         raw_user = int(up.get("tokens_in") or up.get("uncached_est") or 0)
     except (TypeError, ValueError):
         raw_user = 0
-    # Stamp pure-prompt tokZ (query+skill / preview) before peel
+    raw_reserved = int(raw_user)
+    absorbed = False
+    bd_miss = r.get("breakdown") if isinstance(r.get("breakdown"), dict) else {}
+    try:
+        miss_tok = int(bd_miss.get("cache_miss_in_tokens") or 0)
+    except (TypeError, ValueError):
+        miss_tok = 0
+    try:
+        paid_unc = int(
+            bd_miss.get("paid_uncached_tokens")
+            or bd_miss.get("uncached_in_tokens")
+            or 0
+        )
+    except (TypeError, ValueError):
+        paid_unc = 0
+    # context_delta reservation can exceed API uncached (R3: 3686 vs paid 2051).
+    # Continuity / User In must use paid mass only or tree overshoots the card.
+    if paid_unc > 0 and raw_user > paid_unc:
+        raw_user = int(paid_unc)
+
+    # Stamp pure-prompt tokZ from full user text (never the 160-char preview)
     ud = up.get("user_detail") if isinstance(up.get("user_detail"), dict) else {}
     prompt_tz = int(ud.get("user_query_tokens") or 0) + int(
         ud.get("skill_information_tokens") or 0
     )
     if prompt_tz <= 0:
-        preview = str(up.get("preview") or r.get("user_preview") or "")
-        if preview:
+        full = str(r.get("user_text") or up.get("user_text") or "")
+        if full:
             try:
-                prompt_tz = int(count_tokens(preview))
+                prompt_tz = int(count_user_prompt_tokens(full))
             except Exception:
-                prompt_tz = max(1, count_chars_as_tokens(len(preview)) or 1)
+                prompt_tz = max(1, count_chars_as_tokens(len(full)) or 1)
+        else:
+            preview = str(up.get("preview") or r.get("user_preview") or "")
+            if preview:
+                try:
+                    prompt_tz = int(count_user_prompt_tokens(preview))
+                except Exception:
+                    prompt_tz = max(1, count_chars_as_tokens(len(preview)) or 1)
     if prompt_tz > 0:
         up["tokenizer_tokens"] = int(prompt_tz)
         up["prompt_tokenizer_tokens"] = int(prompt_tz)
 
-    # Partition User uncached: answer In + residual prompt (no double-count)
-    # When raw_user >= answer_in → raw includes answer mass → peel
-    # When raw_user < answer_in → pure small prompt; answer is continuity only
+    # Partition User uncached vs prev LLM answer (conserve API off_unc / tree_in).
+    # from_user_pool: paid raw already includes answer → display peel only; miss untouched.
+    # else: only move mass that actually sits in cache_miss (warm miss≈0 → no inflate).
     from_user_pool = bool(raw_user > 0 and raw_user >= answer_in)
+
     if from_user_pool:
         prompt_in = max(0, int(raw_user) - int(answer_in))
         user_tree = int(raw_user)
+        answer_billed = int(answer_in)
+        peel = 0
     else:
         prompt_in = int(raw_user)
-        user_tree = int(raw_user)  # answer not added on top
+        peel = min(int(answer_in), max(0, int(miss_tok)))
+        user_tree = int(raw_user) + int(peel)
+        answer_billed = int(peel)
+        if peel > 0:
+            miss_tok = max(0, int(miss_tok) - int(peel))
+            bd_miss["cache_miss_in_tokens"] = int(miss_tok)
+            if miss_tok <= 0:
+                r["cache_miss"] = False
 
     tier = int(
         last.get("context_end")
@@ -164,25 +313,39 @@ def _attach_prev_llm_answer(hb: Any, r: dict[str, Any]) -> None:
     try:
         from token_telemetry.pricing import _price_in
 
-        answer_usd = float(_price_in(answer_in, tier)) if answer_in else 0.0
+        answer_usd = float(_price_in(answer_billed, tier)) if answer_billed else 0.0
         prompt_usd = float(_price_in(prompt_in, tier)) if prompt_in else 0.0
         user_usd = float(_price_in(user_tree, tier)) if user_tree else 0.0
+        if (not from_user_pool) and peel > 0:
+            bd_miss["cache_miss_in_usd"] = (
+                float(_price_in(miss_tok, tier)) if miss_tok else 0.0
+            )
     except Exception:
         answer_usd = 0.0
         prompt_usd = 0.0
         user_usd = float(up.get("cost_in_usd") or 0)
 
+    if (not from_user_pool) and peel > 0:
+        r["breakdown"] = bd_miss
+
     out_usd = float(last.get("cost_out_usd") or se.get("cost_out_usd") or 0)
-    # Cache miss re-bills prior context (includes last LLM answer) as In —
-    # never list/count that answer again under User.
-    absorbed = bool(
-        r.get("cache_miss")
-        or up.get("cache_miss")
-        or r.get("session_restart")
-        or up.get("session_restart")
-        or up.get("context_reread")
-        or r.get("context_reread")
-    )
+    if from_user_pool:
+        note = (
+            "Last LLM In = Thought TokZ + Reasoning TokF + Message TokZ "
+            "(hooks excluded). "
+            "Peeled from User uncached so prompt In has no double-count."
+        )
+    elif peel > 0:
+        note = (
+            "Last LLM In = Thought TokZ + Reasoning TokF + Message TokZ "
+            "(hooks excluded) — billed User In = mass moved out of KV miss "
+            f"({peel}/{answer_in})."
+        )
+    else:
+        note = (
+            "Last LLM In meta only — prior answer not in this round's uncached "
+            "bill (warm cache); not added to User In / tree_in."
+        )
     up["prev_llm_answer"] = {
         "kind": "prev_llm_answer",
         "round_index": int(prev.get("index") or 0),
@@ -196,37 +359,37 @@ def _attach_prev_llm_answer(hb: Any, r: dict[str, Any]) -> None:
         "tokens_message": int(msg_z),
         "tokens_tool_req": int(em_z),
         "tokenizer_tokens": int(tokz_meta),
-        "tokens_in": int(answer_in),
+        # Billed continuity In (tree); full hybrid stamp kept as tokens_in_full.
+        "tokens_in": int(answer_billed),
+        "tokens_in_full": int(answer_in),
         "cost_out_usd": float(out_usd),
         "cost_in_usd": float(answer_usd),
         "from_user_pool": bool(from_user_pool) and not absorbed,
         "absorbed_in_reread": bool(absorbed),
         "preview": (last.get("message_preview") or "")[:120],
-        "note": (
-            "Absorbed into cache-miss / context re-read In — not listed under User."
-            if absorbed
-            else (
-                "Last LLM In = Thought TokZ + Reasoning TokF + Message TokZ "
-                "(hooks excluded). "
-                "Peeled from User uncached so prompt In has no double-count."
-                if from_user_pool
-                else (
-                    "Last LLM In = Thought TokZ + Reasoning TokF + Message TokZ "
-                    "(hooks excluded) — continuity display; "
-                    "User uncached is pure prompt only."
-                )
-            )
-        ),
+        "note": note,
     }
-    up["prompt_tokens_in"] = int(prompt_in)
+    prompt_disp = int(prompt_tz) if prompt_tz > 0 else int(prompt_in)
+    up["prompt_tokens_in"] = int(prompt_disp)
     up["prompt_cost_in_usd"] = float(prompt_usd)
-    up["uncached_est_raw"] = int(raw_user)
-    # Tree User In = partitioned total when answer taken from pool
+    # Preserve pre-clamp reservation for debugging (context_delta may exceed paid).
+    up["uncached_est_raw"] = int(raw_reserved)
+    # User In = prompt + billed continuity only (peel-capped; never invent warm In).
     up["tokens_in"] = int(user_tree)
     up["uncached_est"] = int(user_tree)
     up["cost_in_usd"] = float(user_usd)
+    display_answer = int(answer_billed)
+    display_in = int(prompt_disp) + int(display_answer)
+    display_usd = float(prompt_usd) + float(answer_usd)
+    up["display_in_tokens"] = int(display_in)
+    up["display_in_usd"] = float(display_usd)
     cache_usd = float(up.get("cost_cached_usd") or 0)
     up["estimate_usd"] = float(user_usd + cache_usd)
+    # Keep breakdown.user_* in sync before finalize re-runs (live open rounds).
+    if isinstance(bd_miss, dict):
+        bd_miss["user_in_tokens"] = int(user_tree)
+        bd_miss["user_in_usd"] = float(user_usd)
+        r["breakdown"] = bd_miss
     r["user_prompt"] = up
 
 
@@ -303,6 +466,23 @@ def _detect_context_reread(hb: Any, r: dict[str, Any]) -> Optional[dict[str, Any
             c0_start = raw_start
     # Compact / new window: start0 << prior is not a cache miss.
     if isinstance(c0_start, int) and c0_start < int(prior * 0.5):
+        return None
+    # Compact on this round (between-rounds or mid-round): extra is compact
+    # Out + rehydrate, not a KV miss / idle reread.
+    if isinstance(r.get("compact_before"), dict) and r["compact_before"].get(
+        "kind"
+    ) == "compaction":
+        return None
+    if r.get("mid_round_compacts"):
+        return None
+    if any(
+        isinstance(s, dict)
+        and any(
+            isinstance(c, dict) and c.get("kind") == "compaction"
+            for c in (s.get("compacts_after") or [])
+        )
+        for s in steps
+    ):
         return None
 
     # Optional first-call cache stamp (metadata only; not a signal)
@@ -390,86 +570,34 @@ def _compute_idle_gap_ms(hb: Any, r: dict[str, Any]) -> Optional[int]:
 
 
 def _apply_session_restart_cache_miss(hb: Any, r: dict[str, Any]) -> None:
-    """
-    Warm rounds assume prior context is Cached. After idle / KV drop the
-    API re-bills prior as Input. Attribution:
+    """Chip on round KV miss. Keep User Cached; do not plant miss under User.
 
-      • warning line → re-read In (≈ prior / context_start of the round)
-      • user prompt  → only the new user message (small)
-      • harness      → residual tools (off_unc − reread − user_new)
-      • user Cached  → 0 (prior was not served as cache)
+    Miss tokens come from reconstruct (§0.5): off_unc − user − Σ harness
+    (R1 also subtracts System). Detector stays a hint (idle gap, compact≠miss).
+
+    We cannot know which prefix missed, so User Cached stays visible even when
+    Σ(User Cached + call Cached) may exceed the round Cached total.
+    R1 User Cached stays 0 via finalize — this path does not invent it.
     """
     up = r.get("user_prompt")
     if not isinstance(up, dict) or up.get("kind") != "user_prompt":
         return
+    bd = dict(r.get("breakdown") or {})
+    try:
+        miss = int(bd.get("cache_miss_in_tokens") or 0)
+    except (TypeError, ValueError):
+        miss = 0
     hit = r.get("context_reread")
     if not isinstance(hit, dict):
         hit = _detect_context_reread(hb, r)
-    if not hit:
+        if hit:
+            r["context_reread"] = hit
+    if miss <= 0:
         return
 
-    prior = int(hit["prior"])
-    off_in = int(hit["off_in"])
-    off_cache = int(hit["off_cache"])
-    off_unc = int(hit["off_unc"])
-    growth = int(hit["growth"])
-    reread = int(hit["reread_tokens"])
-    kind = str(hit.get("kind") or "context_reread")
-
-    steps = [s for s in (r.get("model_steps") or []) if isinstance(s, dict)]
-    # New user text only (never the re-read mass)
-    new_tok = 0
-    raw_new = up.get("uncached_est")
-    try:
-        if raw_new is not None and not up.get("session_restart"):
-            new_tok = max(0, int(raw_new))
-    except (TypeError, ValueError):
-        new_tok = 0
-    if steps:
-        cs0 = steps[0].get("context_start")
-        if isinstance(cs0, int) and cs0 > prior:
-            new_tok = max(new_tok, int(cs0) - prior)
-    if new_tok <= 0:
-        user_chars = int(up.get("chars") or r.get("user_chars") or 0)
-        if user_chars > 0:
-            new_tok = max(1, count_chars_as_tokens(user_chars) or 1)
-
-    # Clamp partition: reread + user_new + harness ≤ off_unc
-    reread = min(int(reread), int(off_unc))
-    new_tok = min(int(new_tok), max(0, int(off_unc) - reread))
-    allow_h = max(0, int(off_unc) - reread - new_tok)
-
-    # User row: new prompt only; no prior-as-Cached on a miss
-    up_in = int(new_tok)
-    up_cache = 0
-
-    tier_ctx = int(
-        (steps[0].get("context_start") if steps else 0)
-        or up.get("context_at_first_call")
-        or (prior + new_tok)
-        or off_in
-        or 1
-    )
-    try:
-        from token_telemetry.pricing import _price_in, _price_cache
-    except ImportError:
-        try:
-            from token_telemetry.pricing import _price_in
-
-            _price_cache = None  # type: ignore
-        except ImportError:
-            _price_in = None  # type: ignore
-            _price_cache = None  # type: ignore
-
-    reread_usd = 0.0
-    if _price_in is not None:
-        user_usd = float(_price_in(up_in, tier_ctx)) if up_in else 0.0
-        reread_usd = float(_price_in(reread, tier_ctx)) if reread else 0.0
-        cache_usd = 0.0
-    else:
-        user_usd = float(up.get("cost_in_usd") or 0)
-        cache_usd = 0.0
-
+    kind = ""
+    if isinstance(hit, dict):
+        kind = str(hit.get("kind") or "")
     if kind == "classic_cache_miss":
         warn = "Session Restart, no cache hit"
     elif kind == "first_call_reread":
@@ -478,105 +606,34 @@ def _apply_session_restart_cache_miss(hb: Any, r: dict[str, Any]) -> None:
         warn = "Context re-read (partial cache miss)"
     else:
         warn = "Context re-read (idle / KV miss)"
-    up["session_restart"] = True
-    up["cache_miss"] = True
-    up["context_reread"] = True
-    up["context_reread_kind"] = kind
+
+    # Keep User Cached as attributed (do not zero on miss).
+    try:
+        user_usd = float(up.get("cost_in_usd") or 0)
+    except (TypeError, ValueError):
+        user_usd = 0.0
+    try:
+        cache_usd = float(up.get("cost_cached_usd") or 0)
+    except (TypeError, ValueError):
+        cache_usd = 0.0
+    up["estimate_usd"] = float(user_usd + cache_usd)
+    up.pop("reread_in_tokens", None)
+    up.pop("reread_in_usd", None)
     up["warning"] = warn
-    # User prompt = new message only
-    up["tokens_in"] = int(up_in)
-    up["uncached_est"] = int(up_in)
-    up["tokens_cached"] = 0
-    up["cached_est"] = 0
-    up["cost_in_usd"] = float(user_usd)
-    up["cost_cached_usd"] = 0.0
-    up["estimate_usd"] = float(user_usd)
-    # Re-read lives on the warning / round, not the user prompt In
-    up["reread_tokens"] = int(reread)
-    up["reread_in_tokens"] = int(reread)
-    up["reread_in_usd"] = float(reread_usd)
-    gap = hit.get("idle_gap_ms")
-    gap_note = ""
-    if isinstance(gap, int) and gap > 0:
-        gap_note = f" idle_gap={gap / 1000:.0f}s."
+    if kind:
+        up["context_reread_kind"] = kind
     up["note"] = (
-        f"{warn}: ~{reread} tok prior re-billed as Input "
-        f"(window growth {growth}; official uncached={off_unc}, "
-        f"cachedRead={off_cache}).{gap_note} "
-        f"Shown on warning; user prompt keeps only new message In."
+        f"{warn}: round KV miss {miss} tok "
+        "(off_unc − user − harness). Not under User; User Cached kept."
     )
-    up["expected_prior_cached"] = int(prior)
-    up["official_cached_read"] = int(off_cache)
-    up["official_uncached_input"] = int(off_unc)
-    up["window_growth_tokens"] = int(growth)
     r["user_prompt"] = up
     r["session_restart"] = True
-    r["context_reread"] = hit
     r["cache_miss"] = True
-    r["reread_in_tokens"] = int(reread)
-    r["reread_in_usd"] = float(reread_usd)
-
-    bd = dict(r.get("breakdown") or {})
-    bd["warm_in_scaled_to_official"] = False
-    bd["context_reread"] = True
-    bd["reread_tokens"] = int(reread)
-    bd["reread_in_tokens"] = int(reread)
-    bd["reread_in_usd"] = float(reread_usd)
-    bd["user_in_tokens"] = int(up_in)
-    bd["user_in_usd"] = float(user_usd)
-    bd["user_cached_tokens"] = 0
-    bd["user_cached_usd"] = 0.0
-
-    harness_tok = int(bd.get("harness_in_tokens") or 0)
-    if allow_h != harness_tok:
-        bd["harness_in_tokens"] = int(allow_h)
-        try:
-            bd["harness_in_usd"] = (
-                float(_price_in(allow_h, tier_ctx)) if allow_h and _price_in else 0.0
-            )
-        except Exception:
-            bd["harness_in_usd"] = 0.0
-        steps_h = [
-            s
-            for s in steps
-            if int(s.get("harness_in_tokens") or s.get("tokens_in") or 0) > 0
-        ]
-        old_sum = (
-            sum(
-                int(s.get("harness_in_tokens") or s.get("tokens_in") or 0)
-                for s in steps_h
-            )
-            or 1
-        )
-        allocated = 0
-        for i, s in enumerate(steps_h):
-            old = int(s.get("harness_in_tokens") or s.get("tokens_in") or 0)
-            if i == len(steps_h) - 1:
-                new_h = max(0, allow_h - allocated)
-            else:
-                new_h = int(round(allow_h * old / old_sum))
-                allocated += new_h
-            s["tokens_in"] = new_h
-            s["harness_in_tokens"] = new_h
-            try:
-                s["cost_in_usd"] = (
-                    float(_price_in(new_h, tier_ctx)) if new_h and _price_in else 0.0
-                )
-                s["harness_in_usd"] = s["cost_in_usd"]
-            except Exception:
-                pass
-        harness_tok = int(allow_h)
-
-    # Tree In = reread + user new + harness residual (= official uncached)
-    tree = int(reread) + int(up_in) + int(harness_tok)
-    bd["tree_in_tokens"] = tree
     try:
-        bd["tree_in_usd"] = float(
-            (reread_usd or 0)
-            + (user_usd or 0)
-            + float(bd.get("harness_in_usd") or 0)
+        bd["user_cached_tokens"] = int(
+            up.get("tokens_cached") or up.get("cached_est") or 0
         )
-    except Exception:
-        pass
+    except (TypeError, ValueError):
+        bd["user_cached_tokens"] = 0
+    bd["user_cached_usd"] = float(up.get("cost_cached_usd") or 0)
     r["breakdown"] = bd
-    r["tree_in_tokens"] = tree

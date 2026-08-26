@@ -11,8 +11,64 @@ from typing import Any, Optional
 SESSIONS_ROOT = Path.home() / ".grok" / "sessions"
 ACTIVE_SESSIONS = Path.home() / ".grok" / "active_sessions.json"
 
+# path -> (mtime, size, has_usage)
+_usage_cache: dict[str, tuple[float, int, bool]] = {}
 
-def list_session_dirs(root: Path = SESSIONS_ROOT) -> list[Path]:
+
+def session_has_usage(session_dir: Path) -> bool:
+    """True if updates.jsonl has any turn_completed with In/Cached/Out > 0.
+
+    Title-only folders (Grok created the dir, nothing billed) return False.
+    Cached by updates mtime/size for the session picker poll.
+    """
+    path = session_dir / "updates.jsonl"
+    key = str(path)
+    try:
+        st = path.stat()
+    except OSError:
+        _usage_cache.pop(key, None)
+        return False
+    prev = _usage_cache.get(key)
+    if prev and prev[0] == st.st_mtime and prev[1] == st.st_size:
+        return prev[2]
+    ok = _scan_updates_has_usage(path)
+    _usage_cache[key] = (st.st_mtime, st.st_size, ok)
+    return ok
+
+
+def _scan_updates_has_usage(path: Path) -> bool:
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    if "turn_completed" not in raw:
+        return False
+    for line in raw.splitlines():
+        if not line or line[0] not in "{[" or "turn_completed" not in line:
+            continue
+        try:
+            o = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(o, dict):
+            continue
+        params = o.get("params") if isinstance(o.get("params"), dict) else {}
+        upd = params.get("update") if isinstance(params.get("update"), dict) else {}
+        if upd.get("sessionUpdate") != "turn_completed":
+            continue
+        usage = upd.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        inn = int(usage.get("inputTokens") or 0)
+        cache = int(usage.get("cachedReadTokens") or 0)
+        out = int(usage.get("outputTokens") or 0)
+        if inn or cache or out:
+            return True
+    return False
+
+
+def list_session_dirs(root: Optional[Path] = None) -> list[Path]:
+    root = SESSIONS_ROOT if root is None else root
     if not root.is_dir():
         return []
     out: list[Path] = []
@@ -157,6 +213,8 @@ def list_sessions_for_ui() -> list[dict[str, Any]]:
         d = by_id.get(sid)
         if d is None:
             return None
+        if not session_has_usage(d):
+            return None
         updates = d / "updates.jsonl"
         try:
             mtime = updates.stat().st_mtime
@@ -191,16 +249,14 @@ def list_sessions_for_ui() -> list[dict[str, Any]]:
             kind = kind.strip().lower() or None
         else:
             kind = None
+        # Dedicated sub-agent / resume dirs are never listed — open via parent Sub N tab.
+        if kind in ("subagent", "subagent_resume"):
+            return None
         agent_name = summary.get("agent_name")
         if not isinstance(agent_name, str) or not agent_name.strip():
             agent_name = None
         else:
             agent_name = agent_name.strip()
-        if kind == "subagent":
-            role = (agent_name or "").strip()
-            if role.lower() in ("general-purpose", "general purpose"):
-                role = ""
-            label = f"↳ {role + ' · ' if role else ''}{label}"
 
         return {
             "session_id": sid,
@@ -247,7 +303,9 @@ def resolve_session_dir(session_id: Optional[str] = None) -> Optional[Path]:
     def _is_sub(d: Path) -> bool:
         summary = _read_session_summary(d)
         kind = summary.get("session_kind")
-        return isinstance(kind, str) and kind.strip().lower() == "subagent"
+        if not isinstance(kind, str):
+            return False
+        return kind.strip().lower() in ("subagent", "subagent_resume")
 
     def _recency(d: Path) -> float:
         summary = _read_session_summary(d)
@@ -261,18 +319,19 @@ def resolve_session_dir(session_id: Optional[str] = None) -> Optional[Path]:
         return max(float(ep or 0), float(mt or 0))
 
     # Follow the most recently active main session (never a sub-agent).
+    # Skip title-only folders with no billed tokens.
     active = read_active_session_ids()
     active_mains = []
     for sid in active:
         d = by_id.get(sid)
-        if d is not None and not _is_sub(d):
+        if d is not None and not _is_sub(d) and session_has_usage(d):
             active_mains.append(d)
     if active_mains:
         active_mains.sort(key=_recency, reverse=True)
         return active_mains[0]
 
-    mains = [d for d in dirs if not _is_sub(d)]
-    pool = mains or dirs
+    mains = [d for d in dirs if not _is_sub(d) and session_has_usage(d)]
+    pool = mains or [d for d in dirs if session_has_usage(d)]
     if not pool:
         return None
     pool.sort(key=_recency, reverse=True)

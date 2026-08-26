@@ -88,3 +88,64 @@ def test_reset_forces_recompute(tmp_path, monkeypatch):
     pa.cached_attr_events(d)
     assert calls["n"] == 2
     assert agg_mod._file_cache == {}
+
+
+def test_code_sig_change_misses_disk(tmp_path, monkeypatch):
+    monkeypatch.setattr(cc, "CACHE_DIR", tmp_path / "cache")
+    d = _sid_dir(tmp_path / "sess")
+    monkeypatch.setattr(cc, "code_sig", lambda: "before")
+    cc.save_calc(d, events=[{"epoch": 1}])
+    assert cc.load_calc(d) is not None
+    monkeypatch.setattr(cc, "code_sig", lambda: "after")
+    assert cc.load_calc(d) is None
+
+
+def test_cache_ver_rejects_previous_blob(tmp_path, monkeypatch):
+    monkeypatch.setattr(cc, "CACHE_DIR", tmp_path / "cache")
+    d = _sid_dir(tmp_path / "sess")
+    assert cc.CACHE_VER >= 1
+    cc.save_calc(d, events=[{"epoch": 1}])
+    assert cc.load_calc(d) is not None
+    path = cc._path_for(d)
+    blob = json.loads(path.read_text(encoding="utf-8"))
+    assert blob.get("v") == cc.CACHE_VER
+    blob["v"] = int(cc.CACHE_VER) - 1
+    path.write_text(json.dumps(blob), encoding="utf-8")
+    assert cc.load_calc(d) is None
+
+
+def test_rebuild_current_replays_stale_tree(tmp_path):
+    from token_telemetry.session.monitor import SessionMonitor
+
+    d = _sid_dir(tmp_path / "sess")
+    extra = json.dumps(
+        {
+            "params": {
+                "_meta": {"agentTimestampMs": 1_700_000_001_000, "promptId": "p2"},
+                "update": {
+                    "sessionUpdate": "turn_completed",
+                    "usage": {
+                        "inputTokens": 20,
+                        "cachedReadTokens": 0,
+                        "outputTokens": 2,
+                        "modelCalls": 1,
+                    },
+                },
+            }
+        }
+    )
+    (d / "updates.jsonl").write_text(
+        (d / "updates.jsonl").read_text(encoding="utf-8") + extra + "\n",
+        encoding="utf-8",
+    )
+    mon = SessionMonitor()
+    mon.attach(d, pin=True)
+    out = mon.rebuild_current()
+    assert out["rebuilt"] is True
+    assert out["session_id"] == d.name
+    n = len(mon.hierarchy.rounds)
+    assert n >= 1
+    mon.hierarchy.rounds.clear()
+    assert mon.hierarchy.rounds == []
+    mon.rebuild_current()
+    assert len(mon.hierarchy.rounds) == n

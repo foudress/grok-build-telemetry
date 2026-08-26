@@ -38,22 +38,35 @@ def _is_compact_continuation(text: str) -> bool:
 
 
 def _session_is_subagent(session_dir: Optional[Path]) -> bool:
+    """True for spawn *and* resume — both show Super Agent [1], not System Other."""
     if session_dir is None:
         return False
     sm = Path(session_dir) / "summary.json"
-    if not sm.is_file():
-        return False
-    try:
-        data = json.loads(sm.read_text(encoding="utf-8", errors="replace"))
-    except (OSError, json.JSONDecodeError, UnicodeError):
-        return False
-    if not isinstance(data, dict):
-        return False
-    kind = data.get("session_kind") or (data.get("info") or {}).get("session_kind")
-    return str(kind or "").lower() == "subagent"
+    if sm.is_file():
+        try:
+            data = json.loads(sm.read_text(encoding="utf-8-sig", errors="replace"))
+        except (OSError, json.JSONDecodeError, UnicodeError):
+            data = None
+        if isinstance(data, dict):
+            kind = data.get("session_kind") or (data.get("info") or {}).get(
+                "session_kind"
+            )
+            if str(kind or "").strip().lower() in ("subagent", "subagent_resume"):
+                return True
+    sp = Path(session_dir) / "system_prompt.txt"
+    if sp.is_file():
+        try:
+            blob = sp.read_text(encoding="utf-8-sig", errors="replace")[:400].lower()
+        except OSError:
+            blob = ""
+        if "subagent" in blob:
+            return True
+    return False
 
 
-def _classify_bootstrap_message(role: str, text: str, syn: Any) -> Optional[str]:
+def _classify_bootstrap_message(
+    role: str, text: str, syn: Any, *, subagent: bool = False
+) -> Optional[str]:
     """Map a chat_history message to system-card / user buckets."""
     if role in ("system",):
         return "system"
@@ -72,62 +85,223 @@ def _classify_bootstrap_message(role: str, text: str, syn: Any) -> Optional[str]
         return None
     if "<user_query>" in text or "<skill_information>" in text:
         return "user_prompt"
+    # Parent task on a sub-agent is Super Agent [1], even without <user_query>
+    # (most spawns/resumes; Wave B happened to wrap tags — that is not required).
+    if subagent:
+        return "user_prompt"
     return "other"
+
+def _tool_result_record(tid: str, content: Any) -> dict[str, Any]:
+    """Tokenize tool_result.content (inner body) plus the JSON envelope."""
+    if isinstance(content, str):
+        inner = content
+    elif content is None:
+        inner = ""
+    else:
+        try:
+            inner = json.dumps(content, ensure_ascii=False)
+        except (TypeError, ValueError):
+            inner = str(content)
+    try:
+        envelope = json.dumps(
+            {
+                "type": "tool_result",
+                "tool_call_id": str(tid),
+                "content": content if content is not None else inner,
+            },
+            ensure_ascii=False,
+        )
+    except (TypeError, ValueError):
+        envelope = inner
+    body_tok = count_tokens(inner) if inner else 0
+    env_tok = count_tokens(envelope) if envelope else 0
+    preview_src = inner or envelope
+    rec: dict[str, Any] = {
+        "tool_call_id": str(tid),
+        "content_chars": len(envelope),
+        "content_tokens": int(env_tok),
+        "body_chars": len(inner),
+        "body_tokens": int(body_tok),
+        "preview": _preview(preview_src, 80) if preview_src else "",
+    }
+    # Preview is 80 chars — spawn UUID is truncated there. Keep ids from the
+    # full inner body so Sub Agent N Sys can key the original session.
+    if inner:
+        from token_telemetry.session.subagents import (
+            extract_ids_from_text,
+            parse_subagent_meta,
+        )
+
+        meta_s = parse_subagent_meta(inner)
+        ids = extract_ids_from_text(inner)
+        if meta_s.get("subagent_id") and meta_s["subagent_id"] not in ids:
+            ids = [meta_s["subagent_id"]] + ids
+        if ids:
+            rec["subagent_id"] = ids[0]
+            rec["subagent_ids"] = ids
+    return rec
+
+
+def _put_tool_result(
+    out: dict[str, dict[str, Any]], tid: Any, content: Any
+) -> None:
+    if not tid:
+        return
+    key = str(tid)
+    rec = _tool_result_record(key, content)
+    prev = out.get(key)
+    # Prefer the larger inner body (wait results often only live in sidecars).
+    prev_body = int((prev or {}).get("body_tokens") or (prev or {}).get("content_tokens") or 0)
+    new_body = int(rec.get("body_tokens") or rec.get("content_tokens") or 0)
+    if prev and prev_body >= new_body:
+        return
+    out[key] = rec
+
+
+def _ingest_tool_result_obj(out: dict[str, dict[str, Any]], o: Any) -> None:
+    if not isinstance(o, dict):
+        return
+    role = str(o.get("type") or o.get("role") or "")
+    if role != "tool_result":
+        return
+    _put_tool_result(out, o.get("tool_call_id") or o.get("toolCallId"), o.get("content"))
+
+
+def _iter_chat_history_objs(session_dir: Path):
+    """Yield conversation dicts from chat_history.jsonl + compact/recap sidecars."""
+    ch_path = session_dir / "chat_history.jsonl"
+    try:
+        if ch_path.is_file():
+            with ch_path.open(encoding="utf-8-sig") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        yield json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+        for sub in ("compaction_requests", "recap_requests"):
+            folder = session_dir / sub
+            if not folder.is_dir():
+                continue
+            for fp in folder.glob("*.json"):
+                try:
+                    data = json.loads(fp.read_text(encoding="utf-8-sig"))
+                except (OSError, json.JSONDecodeError, UnicodeError):
+                    continue
+                hist = data.get("chat_history") if isinstance(data, dict) else None
+                if not isinstance(hist, list):
+                    continue
+                for item in hist:
+                    if isinstance(item, dict):
+                        yield item
+    except OSError:
+        return
+
 
 def load_chat_history_tool_results(
     session_dir: Optional[Path],
 ) -> dict[str, dict[str, Any]]:
     """
-    Map tool_call_id → tokenized tool_result.content from chat_history.jsonl.
+    Map tool_call_id → tokenized tool_result.content.
 
-    This is the assistant-facing result body (closer to model In than rawOutput dump).
+    Inner ``content`` is the parent-facing wait/get_command body (and grep/read
+    payload). Compact / recap sidecars keep wait results that jsonl dropped.
     """
     out: dict[str, dict[str, Any]] = {}
     if session_dir is None:
         return out
-    ch_path = Path(session_dir) / "chat_history.jsonl"
-    if not ch_path.is_file():
+    for o in _iter_chat_history_objs(Path(session_dir)):
+        _ingest_tool_result_obj(out, o)
+    return out
+
+
+def _tool_request_record(tid: str, arguments: Any, name: Any = None) -> dict[str, Any]:
+    """Tokenize assistant tool_calls[].arguments (exact model emit string)."""
+    if isinstance(arguments, str):
+        args_s = arguments
+    elif arguments is None:
+        args_s = ""
+    else:
+        try:
+            args_s = json.dumps(arguments, ensure_ascii=False)
+        except (TypeError, ValueError):
+            args_s = str(arguments)
+    rec: dict[str, Any] = {
+        "tool_call_id": str(tid),
+        "arguments": args_s,
+        "arg_chars": len(args_s),
+        "arg_tokens": int(count_tokens(args_s) if args_s else 0),
+    }
+    if name:
+        rec["name"] = str(name)
+    return rec
+
+
+def _put_tool_request(
+    out: dict[str, dict[str, Any]], tid: Any, arguments: Any, name: Any = None
+) -> None:
+    if not tid:
+        return
+    key = str(tid)
+    rec = _tool_request_record(key, arguments, name)
+    prev = out.get(key)
+    prev_n = int((prev or {}).get("arg_chars") or 0)
+    new_n = int(rec.get("arg_chars") or 0)
+    # Prefer the longer arguments string (sidecars may be truncated).
+    if prev and prev_n >= new_n and new_n > 0:
+        return
+    if prev and new_n <= 0:
+        return
+    out[key] = rec
+
+
+def _ingest_tool_request_obj(out: dict[str, dict[str, Any]], o: Any) -> None:
+    if not isinstance(o, dict):
+        return
+    role = str(o.get("type") or o.get("role") or "")
+    if role == "assistant":
+        for tc in o.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            tid = tc.get("id") or tc.get("tool_call_id") or tc.get("toolCallId")
+            _put_tool_request(
+                out,
+                tid,
+                tc.get("arguments") if "arguments" in tc else tc.get("args"),
+                tc.get("name"),
+            )
+        return
+    if role == "function_call":
+        tid = (
+            o.get("call_id")
+            or o.get("id")
+            or o.get("tool_call_id")
+            or o.get("toolCallId")
+        )
+        _put_tool_request(
+            out,
+            tid,
+            o.get("arguments") if "arguments" in o else o.get("args"),
+            o.get("name"),
+        )
+
+
+def load_chat_history_tool_requests(
+    session_dir: Optional[Path],
+) -> dict[str, dict[str, Any]]:
+    """
+    Map tool_call_id → tokenized assistant tool_calls[].arguments.
+
+    Matches grok-build ``estimate_item_tokens`` (arguments string only — not
+    ACP ``tool_call_update.rawInput`` extras like ``variant``).
+    """
+    out: dict[str, dict[str, Any]] = {}
+    if session_dir is None:
         return out
-    try:
-        with ch_path.open(encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    o = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                role = str(o.get("type") or o.get("role") or "")
-                if role != "tool_result":
-                    continue
-                tid = o.get("tool_call_id") or o.get("toolCallId")
-                if not tid:
-                    continue
-                content = o.get("content")
-                if isinstance(content, str):
-                    text = content
-                elif content is None:
-                    text = ""
-                else:
-                    try:
-                        text = json.dumps(content, ensure_ascii=False)
-                    except (TypeError, ValueError):
-                        text = str(content)
-                chars = len(text)
-                tok = count_tokens(text) if text else 0
-                # Keep max if duplicate ids (shouldn't happen)
-                prev = out.get(str(tid))
-                if prev and int(prev.get("content_tokens") or 0) >= tok:
-                    continue
-                out[str(tid)] = {
-                    "tool_call_id": str(tid),
-                    "content_chars": chars,
-                    "content_tokens": int(tok),
-                    "preview": _preview(text, 80) if text else "",
-                }
-    except OSError:
-        return out
+    for o in _iter_chat_history_objs(Path(session_dir)):
+        _ingest_tool_request_obj(out, o)
     return out
 
 
@@ -258,6 +432,7 @@ def parse_session_bootstrap(
     user_preview = ""
     user_query_chars = 0
     skill_chars = 0
+    is_sub = _session_is_subagent(session_dir)
 
     try:
         with ch_path.open(encoding="utf-8") as f:
@@ -274,7 +449,11 @@ def parse_session_bootstrap(
                     break
                 text = _msg_text(o.get("content"))
                 syn = o.get("synthetic_reason")
-                kind = _classify_bootstrap_message(role, text, syn)
+                if role in ("system",) and "subagent" in (text or "").lower():
+                    is_sub = True
+                kind = _classify_bootstrap_message(
+                    role, text, syn, subagent=is_sub
+                )
                 if not kind:
                     continue
                 full_json = json.dumps(o, ensure_ascii=False)
@@ -309,6 +488,8 @@ def parse_session_bootstrap(
                         user_query_chars += full_chars
                     if uq and not user_preview:
                         user_preview = _preview(uq.group(1).strip(), 80)
+                    elif not user_preview:
+                        user_preview = prev
                     add(
                         "user_prompt",
                         full_chars,
@@ -324,13 +505,16 @@ def parse_session_bootstrap(
     _ = hooks  # call-site may still pass bootstrap hooks; ignore
 
     # Sub-agent parent task is Super Agent [1], not System Other.
-    if _session_is_subagent(session_dir) and "other" in buckets:
+    # Tabs show the *resume* dir (`subagent_resume`) — must move Other there too.
+    if is_sub and "other" in buckets:
         oth = buckets.pop("other")
         if "user_prompt" in buckets:
             upb = buckets["user_prompt"]
             upb["chars"] = int(upb.get("chars") or 0) + int(oth.get("chars") or 0)
             upb["tok_w"] = int(upb.get("tok_w") or 0) + int(oth.get("tok_w") or 0)
             upb["messages"] = int(upb.get("messages") or 0) + int(oth.get("messages") or 0)
+            if not user_preview:
+                user_preview = str(oth.get("preview") or "")
         else:
             buckets["user_prompt"] = oth
             if not user_preview:

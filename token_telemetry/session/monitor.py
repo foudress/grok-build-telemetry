@@ -17,7 +17,7 @@ from token_telemetry.pricing import (
     pricing_payload,
     ticks_to_usd,
 )
-from token_telemetry.hierarchy import HierarchyBuilder
+from token_telemetry.hierarchy import HierarchyBuilder, MAX_ROUNDS_RETAINED
 from token_telemetry.session.discover import (
     SESSIONS_ROOT,
     list_sessions_for_ui,
@@ -25,11 +25,20 @@ from token_telemetry.session.discover import (
     resolve_session_dir,
 )
 from token_telemetry.session.subagents import (
+    capture_child_sys,
     collect_child_ids_from_round,
+    collect_resume_alias_from_round,
     is_subagent_session,
+    latest_in_resume_chain,
     read_session_summary,
+    root_subagent_id,
     sibling_session_dir,
 )
+from token_telemetry.hierarchy.gen_rate import mean_gen_rate
+
+
+def _mean_round_tps(rounds: list) -> Optional[float]:
+    return mean_gen_rate(rounds)
 
 
 def _enrich_user_prompt(up: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -145,11 +154,25 @@ def _sum_rounds_estimate(rounds: list) -> float:
     return est
 
 
+def _sum_child_tab_estimates(sub_sessions: list) -> float:
+    """One child session $ per sub-agent tab (the number shown on that tab)."""
+    tot = 0.0
+    for ss in sub_sessions or []:
+        if not isinstance(ss, dict):
+            continue
+        try:
+            tot += float(ss.get("estimate_usd") or 0)
+        except (TypeError, ValueError):
+            pass
+    return tot
+
+
 # RAM guards
 MAX_TURNS = 40
 MAX_CONTEXT_POINTS = 200
 MAX_READ_CHUNK = 1_500_000  # bytes per tick when catching up
-API_ROUNDS = 20  # rounds sent to browser
+# Wire window = builder retention so Compact · auto on last rounds is visible.
+API_ROUNDS = MAX_ROUNDS_RETAINED
 
 
 class _ChildWatch:
@@ -158,11 +181,13 @@ class _ChildWatch:
     def __init__(self, session_dir: Path) -> None:
         self.session_dir = session_dir
         self.session_id = session_dir.name
+        self.root_id = session_dir.name
         self.hierarchy = HierarchyBuilder()
         self.hierarchy.set_session_dir(session_dir)
         self._updates_path = session_dir / "updates.jsonl"
         self._updates_offset = 0
         self.turns: list[dict[str, Any]] = []
+        self._turn_seq: int = 0
         self.live: dict[str, Any] = {"context_tokens": None}
         self.error: Optional[str] = None
 
@@ -181,9 +206,10 @@ class _ChildWatch:
                 if upd.get("sessionUpdate") == "turn_completed":
                     usage = upd.get("usage") or {}
                     ticks = usage.get("costUsdTicks")
+                    self._turn_seq += 1
                     self.turns.append(
                         {
-                            "index": len(self.turns) + 1,
+                            "index": self._turn_seq,
                             "input_tokens": int(usage.get("inputTokens") or 0),
                             "output_tokens": int(usage.get("outputTokens") or 0),
                             "cached_read_tokens": int(usage.get("cachedReadTokens") or 0),
@@ -217,6 +243,7 @@ class _ChildWatch:
         )
         return {
             "session_id": self.session_id,
+            "root_session_id": getattr(self, "root_id", None) or self.session_id,
             "session_kind": summary.get("session_kind") or "subagent",
             "agent_name": summary.get("agent_name"),
             "title": title,
@@ -227,6 +254,7 @@ class _ChildWatch:
             "rounds": rounds,
             "live": dict(self.live),
             "error": self.error,
+            "gen_tokens_per_sec": _mean_round_tps(rounds_all),
         }
 
 
@@ -245,6 +273,7 @@ class SessionMonitor:
         self.context_series: deque[dict[str, Any]] = deque(maxlen=MAX_CONTEXT_POINTS)
         self.feed: deque[dict[str, Any]] = deque(maxlen=60)
         self.turns: list[dict[str, Any]] = []
+        self._turn_seq: int = 0
         self.hierarchy = HierarchyBuilder()
         self._turn_peak_ctx: Optional[int] = None
         self.signals: dict[str, Any] = {}
@@ -291,6 +320,7 @@ class SessionMonitor:
         self.context_series.clear()
         self.feed.clear()
         self.turns.clear()
+        self._turn_seq = 0
         self.hierarchy.reset()
         self.hierarchy.set_session_dir(session_dir)
         self._turn_peak_ctx = None
@@ -330,13 +360,71 @@ class SessionMonitor:
                 d = resolve_session_dir()
                 if d:
                     self._attach_unlocked(d, pin=False)
+                    self._catch_up_unlocked()
                     return {"ok": True, "session_id": d.name, "pinned": False}
                 return {"ok": False, "error": "no session available"}
             d = resolve_session_dir(session_id)
             if not d:
                 return {"ok": False, "error": f"unknown session {session_id}"}
             self._attach_unlocked(d, pin=True)
+            # Drain the whole jsonl before the UI paints — otherwise each poll
+            # chunk (+ mid-file compacts) flashes as a new "loading wave".
+            self._catch_up_unlocked()
             return {"ok": True, "session_id": d.name, "pinned": True}
+
+    def rebuild_current(self) -> dict[str, Any]:
+        """Drop RAM hierarchy and replay updates.jsonl (Reset calc).
+
+        Disk calc-cache is wiped separately. Without this, a closed session
+        stays on the tree built at attach even after accounting code changes.
+        """
+        with self.lock:
+            d = self.session_dir
+            if d is None:
+                self._snap_bytes = None
+                self._snap_rev = -1
+                self._snap_sig_key = None
+                return {"rebuilt": False, "session_id": None}
+            pin = self.pinned_session_id is not None
+            self._attach_unlocked(d, pin=pin)
+            self._catch_up_unlocked()
+            self._snap_bytes = None
+            self._snap_rev = -1
+            self._snap_sig_key = None
+            return {"rebuilt": True, "session_id": self.session_id}
+
+    def _catch_up_unlocked(self) -> None:
+        """Drain updates.jsonl past MAX_READ_CHUNK (lock already held)."""
+        for _ in range(256):
+            path = self._updates_path
+            if path is None or not path.is_file():
+                return
+            try:
+                size = path.stat().st_size
+            except OSError:
+                return
+            if int(self._updates_offset) >= int(size):
+                # Parent caught up — finish any still-streaming child watches.
+                self._catch_up_children_unlocked()
+                return
+            before = self._updates_offset
+            self.tick()
+            if self._updates_offset <= before:
+                self._catch_up_children_unlocked()
+                return
+        self._catch_up_children_unlocked()
+
+    def _catch_up_children_unlocked(self) -> None:
+        """Drain each sub-agent watch so Sub tabs are complete on first paint."""
+        for _ in range(128):
+            progressed = False
+            for watch in list(self._children.values()):
+                before = int(getattr(watch, "_updates_offset", 0) or 0)
+                watch.tick(self._read_new_lines)
+                if int(getattr(watch, "_updates_offset", 0) or 0) > before:
+                    progressed = True
+            if not progressed:
+                return
 
     def _read_new_lines(self, path: Optional[Path], offset: int) -> tuple[list[str], int]:
         """Read new complete lines; cap bytes per call to avoid multi-MB spikes."""
@@ -395,22 +483,6 @@ class SessionMonitor:
             prior = round_.get("cache_baseline_at_start")
             if not isinstance(prior, int):
                 prior = (step_usage or {}).get("prior_context_tokens")
-            cr = round_.get("context_reread")
-            reread_flag = bool(
-                round_.get("session_restart")
-                or round_.get("cache_miss")
-                or cr
-                or (round_.get("user_prompt") or {}).get("session_restart")
-            )
-            reread_tok = 0
-            if isinstance(cr, dict):
-                reread_tok = int(cr.get("reread_tokens") or 0)
-            reread_tok = int(
-                round_.get("reread_in_tokens")
-                or (round_.get("user_prompt") or {}).get("reread_tokens")
-                or reread_tok
-                or 0
-            )
             up0 = round_.get("user_prompt") if isinstance(round_.get("user_prompt"), dict) else {}
             user_unc = 0
             try:
@@ -426,8 +498,6 @@ class SessionMonitor:
                     steps,
                     official_usage=usage if usage else None,
                     prior_context_tokens=prior if isinstance(prior, int) else None,
-                    context_reread=reread_flag,
-                    reread_uncached_tokens=reread_tok,
                     user_uncached_tokens=int(user_unc),
                 )
             steps = recon["steps"]
@@ -453,8 +523,10 @@ class SessionMonitor:
             or (step_usage or {}).get("breakdown")
             or {}
         )
-        # Keep hierarchy reread fields even if step_usage breakdown overwrote
+        # Keep hierarchy miss / cache-share fields if step_usage overwrote
         for k in (
+            "cache_miss_in_tokens",
+            "cache_miss_in_usd",
             "reread_in_tokens",
             "reread_in_usd",
             "reread_tokens",
@@ -471,7 +543,7 @@ class SessionMonitor:
             breakdown["user_in_usd"] = float(user_prompt.get("cost_in_usd") or 0)
             breakdown["user_cached_tokens"] = int(user_prompt.get("tokens_cached") or 0)
             breakdown["user_cached_usd"] = float(user_prompt.get("cost_cached_usd") or 0)
-            # Round In = User + Σ call In (+ reread). Prefer step sum over harness bag.
+            # Round In = user + Σ call In + cache_miss. Prefer step sum over harness bag.
             user_tok = int(user_prompt.get("tokens_in") or 0)
             user_usd = float(user_prompt.get("cost_in_usd") or 0)
             sum_call = 0
@@ -495,29 +567,23 @@ class SessionMonitor:
             )
             breakdown["harness_in_tokens"] = harness_tok
             breakdown["harness_in_usd"] = harness_usd
-            reread_tok = int(
-                breakdown.get("reread_in_tokens")
-                or breakdown.get("reread_tokens")
-                or round_.get("reread_in_tokens")
-                or user_prompt.get("reread_tokens")
-                or 0
+            try:
+                miss_tok = int(breakdown.get("cache_miss_in_tokens") or 0)
+            except (TypeError, ValueError):
+                miss_tok = 0
+            try:
+                miss_usd = float(breakdown.get("cache_miss_in_usd") or 0)
+            except (TypeError, ValueError):
+                miss_usd = 0.0
+            breakdown["cache_miss_in_tokens"] = int(miss_tok)
+            breakdown["cache_miss_in_usd"] = float(miss_usd)
+            breakdown["tree_in_tokens"] = int(user_tok) + int(harness_tok) + int(miss_tok)
+            breakdown["tree_in_usd"] = (
+                float(user_usd) + float(harness_usd) + float(miss_usd)
             )
-            reread_usd = float(
-                breakdown.get("reread_in_usd")
-                or round_.get("reread_in_usd")
-                or user_prompt.get("reread_in_usd")
-                or 0
-            )
-            if reread_tok > 0 or breakdown.get("context_reread") or round_.get(
-                "session_restart"
-            ):
-                breakdown["tree_in_tokens"] = reread_tok + user_tok + harness_tok
-                breakdown["tree_in_usd"] = reread_usd + user_usd + harness_usd
-                breakdown["reread_in_tokens"] = reread_tok
-                breakdown["reread_in_usd"] = reread_usd
-            else:
-                breakdown["tree_in_tokens"] = user_tok + harness_tok
-                breakdown["tree_in_usd"] = user_usd + harness_usd
+            # Wave D owns tree.js; alias so the live miss chip is not blank.
+            breakdown["reread_in_tokens"] = int(miss_tok)
+            breakdown["reread_in_usd"] = float(miss_usd)
 
         su_totals = (step_usage or {}).get("totals") or {}
         base = {
@@ -536,6 +602,10 @@ class SessionMonitor:
             "started_ms": round_.get("started_ms"),
             "completed_ms": round_.get("completed_ms"),
             "turn_start_ms": round_.get("turn_start_ms"),
+            "gen_ms": round_.get("gen_ms"),
+            "gen_out_tokens": round_.get("gen_out_tokens"),
+            "gen_tokens_per_sec": round_.get("gen_tokens_per_sec"),
+            "gen_rate_n": round_.get("gen_rate_n"),
             "session_restart": bool(
                 round_.get("session_restart")
                 or (user_prompt or {}).get("session_restart")
@@ -544,14 +614,18 @@ class SessionMonitor:
                 round_.get("cache_miss") or (user_prompt or {}).get("cache_miss")
             ),
             "context_reread": round_.get("context_reread"),
+            "cache_miss_in_tokens": breakdown.get("cache_miss_in_tokens"),
+            "cache_miss_in_usd": breakdown.get("cache_miss_in_usd"),
             "reread_in_tokens": (
-                round_.get("reread_in_tokens")
+                breakdown.get("cache_miss_in_tokens")
                 or breakdown.get("reread_in_tokens")
+                or round_.get("reread_in_tokens")
                 or (user_prompt or {}).get("reread_tokens")
             ),
             "reread_in_usd": (
-                round_.get("reread_in_usd")
+                breakdown.get("cache_miss_in_usd")
                 or breakdown.get("reread_in_usd")
+                or round_.get("reread_in_usd")
                 or (user_prompt or {}).get("reread_in_usd")
             ),
             "completed": round_.get("completed"),
@@ -663,9 +737,14 @@ class SessionMonitor:
             "tier": est["tier"],
             "context_tokens_for_tier": est["context_tokens_for_tier"],
             "tier_method": (est.get("tier_resolution") or {}).get("method"),
-            "output_tokens_per_sec": round(out_t / sec, 3) if sec else None,
+            "output_tokens_per_sec": round_.get("gen_tokens_per_sec")
+            if round_.get("gen_tokens_per_sec") is not None
+            else (round(out_t / sec, 3) if sec else None),
             "reasoning_tokens_per_sec": round(reason_t / sec, 3) if sec else None,
-            "gen_tokens_per_sec": round(out_t / sec, 3) if sec else None,
+            "gen_tokens_per_sec": round_.get("gen_tokens_per_sec")
+            if round_.get("gen_tokens_per_sec") is not None
+            else (round(out_t / sec, 3) if sec else None),
+            "gen_ms": round_.get("gen_ms"),
         }
 
     def _handle_update(self, raw: dict[str, Any]) -> None:
@@ -806,8 +885,9 @@ class SessionMonitor:
                 cost_cached = est["cost_usd"].get("cached_input")
             if cost_out is None:
                 cost_out = est["cost_usd"].get("output")
+            self._turn_seq += 1
             turn = {
-                "index": len(self.turns) + 1,
+                "index": self._turn_seq,
                 "prompt_id": update.get("prompt_id") or pid,
                 "input_tokens": in_t,
                 "output_tokens": out_t,
@@ -829,9 +909,14 @@ class SessionMonitor:
                 "tier_method": est["tier_resolution"]["method"],
                 "peak_context_tokens": peak,
                 "model_step_count": (last_round or {}).get("model_step_count"),
-                "output_tokens_per_sec": round(out_t / sec, 3) if sec else None,
+                "output_tokens_per_sec": (last_round or {}).get("gen_tokens_per_sec")
+                if (last_round or {}).get("gen_tokens_per_sec") is not None
+                else (round(out_t / sec, 3) if sec else None),
                 "reasoning_tokens_per_sec": round(reason_t / sec, 3) if sec else None,
-                "gen_tokens_per_sec": round(out_t / sec, 3) if sec else None,
+                "gen_tokens_per_sec": (last_round or {}).get("gen_tokens_per_sec")
+                if (last_round or {}).get("gen_tokens_per_sec") is not None
+                else (round(out_t / sec, 3) if sec else None),
+                "gen_ms": (last_round or {}).get("gen_ms"),
             }
             self.turns.append(turn)
             if len(self.turns) > MAX_TURNS:
@@ -974,41 +1059,112 @@ class SessionMonitor:
         except Exception as e:  # noqa: BLE001 — surface in UI
             self.error = f"{type(e).__name__}: {e}"
 
-    def _known_child_ids(self) -> list[str]:
+    def _child_lineage(self) -> tuple[list[str], dict[str, str], dict[str, str]]:
+        """root ids (spawn order), alias new→old, root → latest session dir id."""
         ids: list[str] = []
         seen: set[str] = set()
-        for rr in self.hierarchy.rounds:
+        alias: dict[str, str] = {}
+        rounds = list(self.hierarchy.rounds)
+        open_r = getattr(self.hierarchy, "_open", None)
+        if isinstance(open_r, dict):
+            rounds = rounds + [open_r]
+        for rr in rounds:
             if not isinstance(rr, dict):
                 continue
+            alias.update(collect_resume_alias_from_round(rr))
             for uid in collect_child_ids_from_round(rr):
                 if uid not in seen:
                     seen.add(uid)
                     ids.append(uid)
-        open_r = getattr(self.hierarchy, "_open", None)
-        if isinstance(open_r, dict):
-            for uid in collect_child_ids_from_round(open_r):
-                if uid not in seen:
-                    seen.add(uid)
-                    ids.append(uid)
-        return ids
+        parent_dir = self.session_dir
+        roots: list[str] = []
+        root_seen: set[str] = set()
+        latest: dict[str, str] = {}
+        for uid in ids:
+            root = root_subagent_id(uid, parent_dir=parent_dir, alias=alias)
+            if root not in root_seen:
+                root_seen.add(root)
+                roots.append(root)
+        for root in roots:
+            latest[root] = latest_in_resume_chain(
+                root, ids, parent_dir=parent_dir, alias=alias
+            )
+        return roots, alias, latest
 
     def _sync_children(self) -> None:
         if not self.session_dir or is_subagent_session(self.session_dir):
             self._children = {}
             return
-        wanted = self._known_child_ids()
+        roots, alias, latest = self._child_lineage()
+        parent_dir = self.session_dir
+        wanted: dict[str, str] = {}
+        # Watch every child session dir (spawn + resume) so Sys + $ use original
+        # spawn rounds; UI tabs still collapse to `latest` per root.
+        lineage_ids: list[str] = []
+        seen_ids: set[str] = set()
+        rounds_src = list(self.hierarchy.rounds)
+        open_r0 = getattr(self.hierarchy, "_open", None)
+        if isinstance(open_r0, dict):
+            rounds_src = rounds_src + [open_r0]
+        for rr in rounds_src:
+            if not isinstance(rr, dict):
+                continue
+            for uid in collect_child_ids_from_round(rr):
+                if uid not in seen_ids:
+                    seen_ids.add(uid)
+                    lineage_ids.append(uid)
+        for uid in lineage_ids:
+            root = root_subagent_id(uid, parent_dir=parent_dir, alias=alias)
+            wanted[uid] = root
+        for root in roots:
+            wanted.setdefault(root, root)
+            last = latest.get(root)
+            if last:
+                wanted.setdefault(last, root)
         for uid in list(self._children):
             if uid not in wanted:
                 self._children.pop(uid, None)
-        for uid in wanted:
+        ordinal = getattr(self.hierarchy, "_subagent_ordinal", None)
+        if ordinal is None:
+            ordinal = {}
+            self.hierarchy._subagent_ordinal = ordinal
+        snaps = getattr(self.hierarchy, "_child_round_snaps", None)
+        if not isinstance(snaps, dict):
+            snaps = {}
+            self.hierarchy._child_round_snaps = snaps
+        for uid, root in wanted.items():
+            if root not in ordinal:
+                nxt = int(getattr(self.hierarchy, "_subagent_next_n", 0) or 0) + 1
+                self.hierarchy._subagent_next_n = nxt
+                ordinal[root] = nxt
             watch = self._children.get(uid)
-            if watch is None:
+            if watch is None or watch.session_id != uid:
                 d = sibling_session_dir(self.session_dir, uid)
                 if d is None or not (d / "updates.jsonl").is_file():
                     continue
                 watch = _ChildWatch(d)
                 self._children[uid] = watch
+            watch.root_id = root
             watch.tick(self._read_new_lines)
+            child_rounds = watch.hierarchy.snapshot_rounds(include_open=True)
+            snaps[uid] = child_rounds
+            if uid == root:
+                snaps[root] = child_rounds
+                capture_child_sys(self.hierarchy, root, child_rounds)
+        from token_telemetry.session.subagents import attach_subagents_after_steps
+
+        rounds = list(self.hierarchy.rounds)
+        open_r = getattr(self.hierarchy, "_open", None)
+        if isinstance(open_r, dict) and open_r not in rounds:
+            rounds.append(open_r)
+        for rr in rounds:
+            if not isinstance(rr, dict):
+                continue
+            attach_subagents_after_steps(
+                rr,
+                rr.get("subagent_peel") if isinstance(rr.get("subagent_peel"), dict) else {"children": []},
+                hb=self.hierarchy,
+            )
 
     def snapshot_bytes(self) -> bytes:
         """Return JSON bytes for /api/state; rebuild only when data revision changes."""
@@ -1062,14 +1218,38 @@ class SessionMonitor:
             # Session Cost estimate over *all* rounds (not the wire-truncated slice).
             # R1 white UI total is peeled; session sum uses full API bill per turn
             # so we never do peeled_rounds + System (double) or peeled-only (short).
-            est = _sum_rounds_estimate(rounds_all)
+            parent_est = _sum_rounds_estimate(rounds_all)
+            _roots, _alias, latest_map = self._child_lineage()
 
             # Only last N rounds over the wire (browser tree)
             rounds_raw = rounds_all
             if len(rounds_raw) > API_ROUNDS:
                 rounds_raw = rounds_raw[-API_ROUNDS:]
             rounds = [self._enrich_round_usage(r) for r in rounds_raw]
-            sub_sessions = [w.snapshot(self._enrich_round_usage) for w in self._children.values()]
+            ordmap = getattr(self.hierarchy, "_subagent_ordinal", None) or {}
+            sub_sessions = []
+            seen_tab: set[str] = set()
+            for w in self._children.values():
+                sid = str(w.session_id or "").lower()
+                root = str(getattr(w, "root_id", None) or sid).lower()
+                # One tab per agent: latest resume, else the original spawn.
+                pick = str((latest_map or {}).get(root) or root).lower()
+                if sid != pick:
+                    continue
+                if root in seen_tab:
+                    continue
+                seen_tab.add(root)
+                snap = w.snapshot(self._enrich_round_usage)
+                snap["root_session_id"] = root
+                snap["n"] = ordmap.get(root) or ordmap.get(str(root or "").lower())
+                snap["resume_index"] = 0
+                snap["label"] = (
+                    f"Sub Agent {snap['n']}" if snap.get("n") else (snap.get("label") or "Sub Agent")
+                )
+                sub_sessions.append(snap)
+            # Parent session $ + each sub-agent tab $ (the number on that tab).
+            children_est = _sum_child_tab_estimates(sub_sessions)
+            est = parent_est + children_est
             # Drop heavy nested estimate blobs from completed steps already priced
             slim_rounds = list(rounds)
             for ss in sub_sessions:
@@ -1110,8 +1290,11 @@ class SessionMonitor:
                     "turns": len(self.turns),
                     "parent_only_usd": round(parent_only, 6),
                     "children_usd": round(children_official, 6),
+                    "parent_estimate_usd": round(parent_est, 6),
+                    "children_estimate_usd": round(children_est, 6),
                     "combined_usd": round(official, 6),
                     "subagent_count": len(sub_sessions),
+                    "gen_tokens_per_sec": _mean_round_tps(rounds_all),
                 },
                 "pricing": pricing_payload(
                     model=getattr(self.hierarchy, "_pricing_model", None),

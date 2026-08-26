@@ -17,6 +17,12 @@ from token_telemetry.hierarchy.bootstrap import (
     _classify_bootstrap_message,
 )
 from token_telemetry.hierarchy.builder import HierarchyBuilder
+from token_telemetry.hierarchy.gen_rate import (
+    attach_gen_rates,
+    call_out_tokf,
+    mean_gen_rate,
+    stream_out_tokens,
+)
 from token_telemetry.hierarchy.compact_out import (
     _compact_child,
     _shallow_round_copy,
@@ -136,4 +142,8 @@ __all__ = [
     "_merge_bootstrap_into_breakdown",
     "_inject_system_message_residual",
     "_reprice_completed_rounds",
+    "attach_gen_rates",
+    "call_out_tokf",
+    "mean_gen_rate",
+    "stream_out_tokens",
 ]

@@ -1,6 +1,11 @@
 /** Formatting helpers and DOM $ */
 const $ = (id) => document.getElementById(id);
 
+function isSubagentKind(kind) {
+  const k = String(kind || "").toLowerCase();
+  return k === "subagent" || k === "subagent_resume";
+}
+
 function fmtTokens(n) {
   if (n == null || Number.isNaN(n)) return "—";
   if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
@@ -13,10 +18,155 @@ function fmtUsd(n) {
   if (Math.abs(n) < 0.01) return "$" + n.toFixed(4);
   return "$" + n.toFixed(3);
 }
+/** $/M token rate label. */
+function fmtUsdPerM(n) {
+  if (n == null || !Number.isFinite(n)) return "—";
+  const a = Math.abs(n);
+  if (a >= 10) return "$" + n.toFixed(1);
+  return "$" + n.toFixed(2);
+}
+
+/**
+ * Published xAI $/M cards (Official snap check).
+ * Grok 4.5: $2/$0.30/$6 or $2/$0.60/$6 (repricing ambiguous) — not $0.50.
+ * Grok 4.6: $2/$0.50/$6 only. High tier doubles.
+ */
+const RATE_CARD_45 = [
+  { in: 2, cached: 0.3, out: 6 },
+  { in: 2, cached: 0.6, out: 6 },
+  { in: 4, cached: 0.6, out: 12 },
+  { in: 4, cached: 1.2, out: 12 },
+];
+const RATE_CARD_46 = [
+  { in: 2, cached: 0.5, out: 6 },
+  { in: 4, cached: 1.0, out: 12 },
+];
+const RATE_CARD_ALL = [...RATE_CARD_45, ...RATE_CARD_46];
+/** Component $/M and absolute $ session match — do not force-snap beyond this. */
+const RATE_SNAP_EPS = 0.02;
+
+function normalizeModelFamily(raw) {
+  const s = String(raw || "").toLowerCase().replace(/_/g, "-");
+  if (!s) return null;
+  if (s.includes("4.6") || s.includes("4-6")) return "grok-4.6";
+  if (s.includes("4.5") || s.includes("4-5")) return "grok-4.5";
+  return null;
+}
+
+/** Cards to try for a model (4.5 tries $0.30 and $0.60 cache). */
+function rateCardsForModel(model) {
+  const fam = normalizeModelFamily(model);
+  if (fam === "grok-4.6") return RATE_CARD_46;
+  if (fam === "grok-4.5") return RATE_CARD_45;
+  return RATE_CARD_ALL;
+}
+
+function costAtRates(tok, rates) {
+  return (tok.unc * rates.in + tok.cached * rates.cached + tok.out * rates.out) / 1e6;
+}
+
+function ratesNearCard(rates, card, eps = RATE_SNAP_EPS) {
+  return Math.abs(rates.in - card.in) <= eps
+    && Math.abs(rates.out - card.out) <= eps
+    && Math.abs(rates.cached - card.cached) <= eps;
+}
+
+/**
+ * Solve Official $ with a card's own In/Out and Cache/Out ratios.
+ * e.g. 2/0.3/6 → Cache=Out/20; 2/0.6/6 → Cache=Out/10; 2/0.5/6 → Cache=Out/12.
+ */
+function solveRatesForCard(officialUsd, tok, card) {
+  const outP = Number(card.out);
+  if (!(outP > 0)) return null;
+  const inRatio = Number(card.in) / outP;
+  const cacheRatio = Number(card.cached) / outP;
+  const weight = tok.unc * inRatio + tok.cached * cacheRatio + tok.out;
+  if (!(Number(officialUsd) > 0) || !(weight > 0)) return null;
+  const out = (Number(officialUsd) * 1e6) / weight;
+  return { in: out * inRatio, cached: out * cacheRatio, out };
+}
+
+/**
+ * Reverse-engineer In/Cached/Out $/M from Official $ + API tokens.
+ * Picks the best matching published card for the model (4.5: $0.30 or $0.60
+ * cache; 4.6: $0.50). Snap only when within ±$0.02 (cost or rates).
+ */
+function implyOfficialRatesPerM(officialUsd, tok, opts) {
+  const off = Number(officialUsd);
+  const unc = Number(tok && tok.unc) || 0;
+  const cached = Number(tok && tok.cached) || 0;
+  const outTok = Number(tok && tok.out) || 0;
+  if (!(off > 0) || !(unc + cached + outTok > 0)) return null;
+  const t = { unc, cached, out: outTok };
+  const cards = rateCardsForModel(opts && opts.model);
+
+  let bestCard = null;
+  let bestCostD = Infinity;
+  for (const card of cards) {
+    const d = Math.abs(costAtRates(t, card) - off);
+    if (d < bestCostD) { bestCostD = d; bestCard = card; }
+  }
+  if (bestCard && bestCostD <= RATE_SNAP_EPS) {
+    return { ...bestCard, snapped: true, note: "official $ ≈ published card" };
+  }
+
+  let bestSolve = null;
+  let bestSolveD = Infinity;
+  for (const card of cards) {
+    const rates = solveRatesForCard(off, t, card);
+    if (!rates) continue;
+    if (ratesNearCard(rates, card)) {
+      return { ...card, snapped: true, note: "ratio solve ≈ published" };
+    }
+    const d = Math.abs(rates.in - card.in)
+      + Math.abs(rates.cached - card.cached)
+      + Math.abs(rates.out - card.out);
+    if (d < bestSolveD) {
+      bestSolveD = d;
+      bestSolve = { ...rates, snapped: false, note: `ratio ${card.in}/${card.cached}/${card.out}` };
+    }
+  }
+  return bestSolve;
+}
+
+/**
+ * Period I/O $/M point: Official ÷ API tokens from rounds ≤190k ctx
+ * (`rate_*` fields — same pool as Session Official card).
+ */
+function ratesPerMFromIoCosts(row) {
+  const tin = Number(row && (row.rate_tokens_in ?? row.api_tokens_in ?? row.tokens_in)) || 0;
+  const tc = Number(row && (row.rate_tokens_cached ?? row.api_tokens_cached ?? row.tokens_cached)) || 0;
+  const tout = Number(row && (row.rate_tokens_out ?? row.api_tokens_out ?? row.tokens_out)) || 0;
+  const off = Number(row && (row.rate_official_usd ?? row.official_usd)) || 0;
+  const model = (row && (row.model_family || row.model_id || row.model)) || null;
+  const implied = implyOfficialRatesPerM(off, { unc: tin, cached: tc, out: tout }, { model });
+  if (implied) return implied;
+  // No official bill — fall back to estimate cost÷tokens.
+  const cin = Number(row && row.cost_in_usd) || 0;
+  const cc = Number(row && row.cost_cached_usd) || 0;
+  const cout = Number(row && row.cost_out_usd) || 0;
+  const rates = {
+    in: tin > 0 ? (cin * 1e6) / tin : 0,
+    cached: tc > 0 ? (cc * 1e6) / tc : 0,
+    out: tout > 0 ? (cout * 1e6) / tout : 0,
+  };
+  for (const card of rateCardsForModel(model)) {
+    if (ratesNearCard(rates, card)) return { ...card, snapped: true };
+  }
+  return { ...rates, snapped: false };
+}
 function fmtMs(n) {
   if (n == null) return "—";
   if (n < 1000) return Math.round(n) + " ms";
   return (n / 1000).toFixed(1) + " s";
+}
+function fmtToksPerSec(n) {
+  if (n == null || Number.isNaN(n)) return "—";
+  const v = Math.abs(n);
+  if (v >= 1000) return fmtTokens(n) + "/s";
+  if (v >= 100) return n.toFixed(0) + "/s";
+  if (v >= 10) return n.toFixed(1) + "/s";
+  return n.toFixed(2) + "/s";
 }
 /** Idle gap between rounds (ms) — prefer minutes/hours when long. */
 function fmtIdleGap(ms) {
@@ -233,9 +383,12 @@ function eolTokenizerMeta(c, tokF) {
 
 export {
   $,
+  isSubagentKind,
   fmtTokens,
   fmtUsd,
+  fmtUsdPerM,
   fmtMs,
+  fmtToksPerSec,
   fmtIdleGap,
   fmtDelta,
   esc,
@@ -246,6 +399,10 @@ export {
   joinParts,
   totalPrice,
   moneyFromNode,
+  ratesPerMFromIoCosts,
+  implyOfficialRatesPerM,
+  normalizeModelFamily,
+  rateCardsForModel,
   shortPath,
   compressCwdText,
   shellInteresting,

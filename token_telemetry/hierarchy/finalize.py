@@ -17,12 +17,14 @@ from token_telemetry.pricing import pricing_model_scope, reconstruct_model_step_
 from token_telemetry.tokenizer import (
     count_chars_as_tokens,
     count_tokens,
+    count_user_prompt_tokens,
 )
 
 from token_telemetry.hierarchy.bootstrap import (
     _is_compact_continuation,
     inject_tool_definitions_into_bootstrap,
     load_chat_history_reasonings,
+    load_chat_history_tool_requests,
     load_chat_history_tool_results,
     parse_session_bootstrap,
     resolve_tool_definitions,
@@ -56,26 +58,116 @@ def _bootstrap_hist_tokens(boot: dict[str, Any]) -> int:
     )
 
 
+def _is_first_round(hb: Any, r: dict[str, Any]) -> bool:
+    """True for System-card R1 (index 1 or existing card)."""
+    sys_p = r.get("system_prompt")
+    if isinstance(sys_p, dict) and sys_p.get("kind") == "system_prompt":
+        return True
+    try:
+        return int(r.get("index") or 0) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_cold_session_first(r: dict[str, Any]) -> bool:
+    """True when reconstruct prior must stay None (cold R1, not a pruned list head)."""
+    return r.get("cache_baseline_at_start") is None and _is_first_round(None, r)
+
+
+def _official_input_tokens(r: dict[str, Any]) -> Optional[int]:
+    usage = r.get("usage_raw")
+    if not isinstance(usage, dict):
+        return None
+    for key in ("inputTokens", "input_tokens"):
+        if usage.get(key) is not None:
+            try:
+                return max(0, int(usage[key]))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _first_raw_stream_cs(steps: list[dict[str, Any]]) -> Optional[int]:
+    """Un-bumped Call-1 stream start (raw snap before ToolDef remainder)."""
+    for s in steps or []:
+        if not isinstance(s, dict):
+            continue
+        for key in ("stream_context_raw", "stream_context_start", "context_start"):
+            v = s.get(key)
+            if isinstance(v, int) and v > 0:
+                return int(v)
+        return None
+    return None
+
+
+def _independent_tooldef_size(
+    hb: Any, r: dict[str, Any]
+) -> tuple[int, int]:
+    """Measured ToolDef size from env, session file, or schema tokZ."""
+    session_dir = getattr(hb, "_session_dir", None)
+    resolved = resolve_tool_definitions(session_dir)
+    count = int(resolved.get("count") or 0)
+    src = str(resolved.get("source") or "")
+    tok = 0
+    try:
+        tok = int(resolved.get("tokens") or 0)
+    except (TypeError, ValueError):
+        tok = 0
+    if src in ("env", "session_tool_definitions.json") and tok > 0:
+        return tok, count
+    meta = r.get("tool_definitions") if isinstance(r.get("tool_definitions"), dict) else {}
+    try:
+        indep = int(meta.get("independent_tokens") or 0)
+    except (TypeError, ValueError):
+        indep = 0
+    if indep > 0:
+        try:
+            count = int(meta.get("count") or count)
+        except (TypeError, ValueError):
+            pass
+        return indep, count
+    for key in ("schema_tokens", "tokenizer_tokens"):
+        if meta.get(key) is None:
+            continue
+        try:
+            schema = int(meta[key])
+        except (TypeError, ValueError):
+            continue
+        if schema > 0:
+            try:
+                count = int(meta.get("count") or count)
+            except (TypeError, ValueError):
+                pass
+            return schema, count
+    return 0, count
+
+
 def _estimate_tooldef_message_bucket(
     r: dict[str, Any],
     boot: dict[str, Any],
     steps: list[dict[str, Any]],
 ) -> int:
-    """Call-1 reconstruct bump: context_end − user − harness − history."""
+    """Call-1 bump: window remainder, floored with off_in − raw stream start on a 1-call."""
     hist = _bootstrap_hist_tokens(boot)
     try:
         user = int(boot.get("user_tokens") or 0)
     except (TypeError, ValueError):
         user = 0
+    real_steps = [s for s in (steps or []) if isinstance(s, dict)]
     harness_est = sum(
-        int(s.get("harness_pool_tokens") or 0)
-        for s in (steps or [])
-        if isinstance(s, dict)
+        int(s.get("harness_pool_tokens") or 0) for s in real_steps
     )
+    stream_formula = 0
     end = r.get("context_end")
     if isinstance(end, int) and end > 0:
-        return max(0, int(end) - int(user) - int(harness_est) - int(hist))
-    return 0
+        stream_formula = max(0, int(end) - int(user) - int(harness_est) - int(hist))
+    floor_off = 0
+    if len(real_steps) == 1:
+        off_in = _official_input_tokens(r)
+        stream_cs = _first_raw_stream_cs(real_steps)
+        if off_in is not None and stream_cs is not None:
+            floor_off = max(0, int(off_in) - int(stream_cs))
+    return max(stream_formula, floor_off)
 
 
 def _stamp_stream_window(step: dict[str, Any]) -> None:
@@ -154,12 +246,9 @@ def _finalize_round(hb: Any, r: dict[str, Any]) -> None:
     ):
         new_tok = max(1, count_chars_as_tokens(user_chars) or 1)
 
-    # Session bootstrap (first round only): System card + full user prompt
-    # from chat_history (user_query + skill_information), not stream chars.
-    # Silent ToolDef+Message is the window remainder (not a hardcoded 8.2k).
-    # Bump call-1 stream_context_start by that bucket for reconstruct weights;
-    # keep the raw harness snap in stream_context_raw for display.
-    is_first = prior is None and len(hb.rounds) == 0
+    # R1 System card from chat_history. Bump call-1 start by the remainder
+    # for reconstruct weights; keep stream_context_raw as the harness snap.
+    is_first = _is_first_round(hb, r)
     if is_first and isinstance(first_cs, int) and first_cs > 0:
         s0 = kept_steps[0] if kept_steps else None
         stream_cs = int(first_cs)
@@ -191,11 +280,34 @@ def _finalize_round(hb: Any, r: dict[str, Any]) -> None:
 
         hb._session_bootstrap = boot
         r["session_bootstrap"] = boot
+        td_src = str(tool_defs.get("source") or "")
+        try:
+            indep_tok = int(tool_defs.get("tokens") or 0)
+        except (TypeError, ValueError):
+            indep_tok = 0
+        if td_src == "default":
+            indep_tok = 0
         r["tool_definitions"] = {
             "tokens": int(bucket),
+            "independent_tokens": int(indep_tok),
             "count": int(tool_defs.get("count") or 0),
             "source": tool_defs.get("source"),
         }
+        # Stream start can lag official input; bump end so System + R1 In holds.
+        hist_tok = _bootstrap_hist_tokens(boot)
+        try:
+            user_tok = int(boot.get("user_tokens") or 0)
+        except (TypeError, ValueError):
+            user_tok = 0
+        needed_end = int(hist_tok) + int(bucket) + int(user_tok)
+        end_now = r.get("context_end")
+        if bucket > 0 and isinstance(end_now, int) and needed_end > end_now:
+            r["context_end"] = needed_end
+            start_now = r.get("context_start")
+            if isinstance(start_now, int):
+                r["context_delta"] = needed_end - start_now
+            else:
+                r["context_delta"] = needed_end
         # Compact-like system card (before the round in UI)
         r["system_prompt"] = {
             "kind": "system_prompt",
@@ -239,12 +351,13 @@ def _finalize_round(hb: Any, r: dict[str, Any]) -> None:
                 f"({int(bucket)} tok window remainder)."
             ),
         }
-    else:
+    elif not is_first:
         r["system_prompt"] = None
         r["session_bootstrap"] = None
         r["user_prompt"] = {
             "kind": "user_prompt",
             "preview": r.get("user_preview") or "",
+            "user_text": r.get("user_text") or "",
             "chars": user_chars,
             "prior_context": prior,
             "context_at_first_call": first_cs,
@@ -277,42 +390,93 @@ def _finalize_round(hb: Any, r: dict[str, Any]) -> None:
         hb._apply_session_restart_cache_miss(r)
         hb._attach_prev_llm_answer(r)
         hb._merge_bootstrap_into_breakdown(r)
+    from token_telemetry.hierarchy.gen_rate import attach_gen_rates
+
+    attach_gen_rates(r)
 
 
 def _r1_tree_in_tokens(r: dict[str, Any]) -> int:
-    """User uncached + Σ LLM call In. recon.tree_in is harness-only — do not use it."""
+    """User uncached + User Compact Out + Σ LLM call In."""
     up = r.get("user_prompt") if isinstance(r.get("user_prompt"), dict) else {}
     user_in = int(
         (up or {}).get("tokens_in")
         or (up or {}).get("uncached_est")
         or 0
     )
+    co = (up or {}).get("compact_out") if isinstance((up or {}).get("compact_out"), dict) else {}
+    try:
+        co_tok = int(co.get("tokens_in") or 0)
+    except (TypeError, ValueError):
+        co_tok = 0
     steps_m = [s for s in (r.get("model_steps") or []) if isinstance(s, dict)]
     sum_call = sum(
         int(s.get("tokens_in") or s.get("harness_in_tokens") or 0)
         for s in steps_m
     )
-    return int(user_in) + int(sum_call)
+    return int(user_in) + int(co_tok) + int(sum_call)
+
+
+def _remainder_rows(
+    bucket: int, tool_tok: int, msg_tok: int, count: int, split: bool
+) -> list[dict[str, Any]]:
+    """ToolDef + Message rows, or one combined row when the split is unknown."""
+    if bucket <= 0:
+        return []
+    note = "Window remainder after history. System + R1 In = context_end."
+    if split:
+        rows = [
+            {
+                "kind": "tool_definitions",
+                "label": "Tool definitions",
+                "tokens": int(tool_tok),
+                "tokenizer_tokens": int(tool_tok),
+                "chars": 0,
+                "tool_count": count or None,
+                "preview": (
+                    f"{count} tools · silent API channel"
+                    if count
+                    else "silent API channel"
+                ),
+                "messages": 0,
+                "note": note,
+            }
+        ]
+        rows.append(
+            {
+                "kind": "message",
+                "label": "Message",
+                "tokens": int(msg_tok),
+                "tokenizer_tokens": int(msg_tok),
+                "chars": 0,
+                "preview": "window remainder after Tool definitions",
+                "messages": 0,
+                "note": note,
+            }
+        )
+        return rows
+    return [
+        {
+            "kind": "tool_defs_message",
+            "label": "Tool definitions + Message",
+            "tokens": int(bucket),
+            "tokenizer_tokens": int(bucket),
+            "chars": 0,
+            "tool_count": count or None,
+            "preview": (
+                f"{count} tools · context_end − R1 In − history"
+                if count
+                else "context_end − R1 In − history"
+            ),
+            "messages": 0,
+            "note": note,
+        }
+    ]
 
 
 def _inject_system_message_residual(
     hb: Any, r: dict[str, Any], recon: dict[str, Any]
 ) -> None:
-    """
-    Window identity (R1):
-
-        System + R1 In = context_end
-
-    Last LLM Out is next-round In (already folded into later-call In when
-    not last). History parts stay tokenized from chat_history. Remainder
-    is one bucket — silent tool schemas + unexplained glue:
-
-        ToolDef+Message = max(0, context_end − R1_tree − history)
-
-    History = System + User info + Reminders/skills + MCP (+ other).
-    Never use official multi-call Σ off_unc (that inflates Message).
-    Never keep a hardcoded 8.2k tool-def part on the System card.
-    """
+    """Stamp System remainder so System + R1 In = context_end (floored with recon residual)."""
     sys_p = r.get("system_prompt")
     if not isinstance(sys_p, dict) or sys_p.get("kind") != "system_prompt":
         return
@@ -325,36 +489,44 @@ def _inject_system_message_residual(
     known_hist = sum(int(p.get("tokens") or 0) for p in parts)
     r1_tree = _r1_tree_in_tokens(r)
 
+    stream_formula = 0
     end = r.get("context_end")
     if isinstance(end, int) and end > 0:
-        bucket = max(0, int(end) - int(r1_tree) - int(known_hist))
-    else:
-        bucket = 0
+        stream_formula = max(0, int(end) - int(r1_tree) - int(known_hist))
+    recon_residual = 0
+    if isinstance(recon, dict):
+        try:
+            recon_residual = max(0, int(recon.get("bootstrap_residual_tokens") or 0))
+        except (TypeError, ValueError):
+            recon_residual = 0
+    bucket = max(stream_formula, recon_residual)
 
-    tool_meta = r.get("tool_definitions") if isinstance(r.get("tool_definitions"), dict) else {}
     if bucket > 0:
-        count = int(tool_meta.get("count") or 0)
-        parts.append(
-            {
-                "kind": "tool_defs_message",
-                "label": "Tool definitions + Message",
-                "tokens": int(bucket),
-                "tokenizer_tokens": int(bucket),
-                "chars": 0,
-                "tool_count": count or None,
-                "preview": (
-                    f"{count} tools · context_end − R1 In − history"
-                    if count
-                    else "context_end − R1 In − history"
-                ),
-                "messages": 0,
-                "note": (
-                    "ToolDef+Message = max(0, context_end − R1_In − "
-                    "System − User info − Reminders − MCP). "
-                    "System + R1 In = context_end. Last LLM Out is next-round In."
-                ),
-            }
-        )
+        needed = int(known_hist) + int(bucket) + int(r1_tree)
+        if isinstance(end, int) and needed > int(end):
+            r["context_end"] = needed
+            start = r.get("context_start")
+            if isinstance(start, int) and start != 0:
+                r["context_delta"] = needed - int(start)
+            else:
+                r["context_delta"] = needed
+            end = needed
+
+    indep, count = _independent_tooldef_size(hb, r)
+    tool_meta = r.get("tool_definitions") if isinstance(r.get("tool_definitions"), dict) else {}
+    try:
+        count = int(tool_meta.get("count") or count or 0)
+    except (TypeError, ValueError):
+        count = int(count or 0)
+    split = indep > 0
+    if split:
+        tool_tok = min(int(indep), int(bucket))
+        msg_tok = int(bucket) - int(tool_tok)
+    else:
+        tool_tok = int(bucket)
+        msg_tok = 0
+    extra = _remainder_rows(bucket, tool_tok, msg_tok, count, split)
+    parts.extend(extra)
 
     new_tok = int(known_hist) + int(bucket)
     sys_p["parts"] = parts
@@ -362,25 +534,22 @@ def _inject_system_message_residual(
     sys_p["logical_tokens"] = new_tok
     sys_p["uncached_est"] = new_tok
     sys_p["message_residual_tokens"] = int(bucket)
-    sys_p["tool_definitions_tokens"] = int(bucket)
+    sys_p["tool_definitions_tokens"] = int(tool_tok)
     sys_p["note"] = (
-        "System + R1 In = context_end. History parts from chat_history; "
-        "Tool definitions + Message is the window remainder "
-        "(not a hardcoded 8.2k, not official Σ uncached)."
+        "History from chat_history; ToolDef + Message is the window remainder."
     )
 
     boot = r.get("session_bootstrap")
     if isinstance(boot, dict):
         boot["system_tokens"] = int(new_tok)
         boot["message_residual_tokens"] = int(bucket)
-        boot["tool_definitions_tokens"] = int(bucket)
+        boot["tool_definitions_tokens"] = int(tool_tok)
         bparts = [
             p
             for p in (boot.get("parts") or [])
             if isinstance(p, dict) and p.get("kind") not in _DROP_SYS_PARTS
         ]
-        if bucket > 0:
-            bparts.append(parts[-1])
+        bparts.extend(extra)
         boot["parts"] = bparts
     r["bootstrap_residual_tokens"] = int(bucket)
     if isinstance(r.get("step_usage"), dict):
@@ -401,6 +570,11 @@ def _merge_bootstrap_into_breakdown(hb: Any, r: dict[str, Any]) -> None:
             bd["system_message_tokens"] = int(sys_p["message_residual_tokens"])
     user_tok = 0
     user_usd = 0.0
+    # Between-rounds Compact Out lives under User (not Call/Harness In). Miss
+    # math still counted it inside reconstruct Σ harness, so display harness
+    # excludes it — tree In must add it back here or Parts scales User down.
+    co_tok = 0
+    co_usd = 0.0
     if isinstance(up, dict):
         user_tok = int(up.get("tokens_in") or up.get("uncached_est") or 0)
         user_usd = float(up.get("cost_in_usd") or 0)
@@ -410,9 +584,21 @@ def _merge_bootstrap_into_breakdown(hb: Any, r: dict[str, Any]) -> None:
             up.get("tokens_cached") or up.get("cached_est") or 0
         )
         bd["user_cached_usd"] = float(up.get("cost_cached_usd") or 0)
-    # Round In = User (+ reread) + Σ LLM call In.
-    # Prefer sum of model_steps tokens_in (authoritative call tree) over
-    # breakdown harness total so User + Calls always equals Round In.
+        co = up.get("compact_out") if isinstance(up.get("compact_out"), dict) else {}
+        try:
+            co_tok = int(co.get("tokens_in") or 0)
+        except (TypeError, ValueError):
+            co_tok = 0
+        try:
+            co_usd = float(co.get("cost_in_usd") or 0)
+        except (TypeError, ValueError):
+            co_usd = 0.0
+        if co_tok > 0 or co_usd > 0:
+            bd["user_compact_out_tokens"] = int(co_tok)
+            bd["user_compact_out_usd"] = float(co_usd)
+    # Round In = User (prompt + prev LLM answer) + User Compact Out +
+    # Σ LLM call In + cache_miss. Prefer sum of model_steps tokens_in
+    # (authoritative call tree) over breakdown harness so User+Calls = Round In.
     steps_m = [s for s in (r.get("model_steps") or []) if isinstance(s, dict)]
     sum_call = 0
     sum_call_usd = 0.0
@@ -425,24 +611,58 @@ def _merge_bootstrap_into_breakdown(hb: Any, r: dict[str, Any]) -> None:
     )
     bd["harness_in_tokens"] = harness_tok
     bd["harness_in_usd"] = harness_usd
-    reread_tok = int(
-        bd.get("reread_in_tokens")
-        or bd.get("reread_tokens")
-        or r.get("reread_in_tokens")
-        or 0
-    )
-    reread_usd = float(bd.get("reread_in_usd") or r.get("reread_in_usd") or 0)
+    try:
+        miss_tok = int(bd.get("cache_miss_in_tokens") or 0)
+    except (TypeError, ValueError):
+        miss_tok = 0
+    try:
+        miss_usd = float(bd.get("cache_miss_in_usd") or 0)
+    except (TypeError, ValueError):
+        miss_usd = 0.0
     cold = bool(bd.get("cold_round")) or (
         isinstance(sys_p, dict) and sys_p.get("kind") == "system_prompt"
     )
-    if reread_tok > 0 or bd.get("context_reread") or r.get("session_restart"):
-        bd["tree_in_tokens"] = int(reread_tok) + int(user_tok) + harness_tok
-        bd["tree_in_usd"] = float(reread_usd) + float(user_usd) + harness_usd
-        bd["reread_in_tokens"] = int(reread_tok)
-        bd["reread_in_usd"] = float(reread_usd)
-    else:
-        bd["tree_in_tokens"] = int(user_tok) + harness_tok
-        bd["tree_in_usd"] = float(user_usd) + harness_usd
+    # Warm rounds: tree In must not exceed official paid uncached (card In).
+    # Overflow usually = context_delta reservation or tool TokZ > API bill (R3/R13).
+    # Shrink harness → miss → user; never touch R1/System (cold).
+    try:
+        paid_unc = int(bd.get("uncached_in_tokens") or bd.get("paid_uncached_tokens") or 0)
+    except (TypeError, ValueError):
+        paid_unc = 0
+    if (not cold) and paid_unc > 0:
+        tree_now = int(user_tok) + int(co_tok) + int(harness_tok) + int(miss_tok)
+        overflow = tree_now - int(paid_unc)
+        if overflow > 0:
+            take = min(overflow, int(harness_tok))
+            if take:
+                if harness_tok > 0 and harness_usd:
+                    harness_usd *= (harness_tok - take) / harness_tok
+                harness_tok -= take
+                overflow -= take
+            take = min(overflow, int(miss_tok))
+            if take:
+                if miss_tok > 0 and miss_usd:
+                    miss_usd *= (miss_tok - take) / miss_tok
+                miss_tok -= take
+                overflow -= take
+                bd["cache_miss_in_tokens"] = int(miss_tok)
+                bd["cache_miss_in_usd"] = float(miss_usd)
+            take = min(overflow, int(user_tok))
+            if take:
+                if user_tok > 0 and user_usd:
+                    user_usd *= (user_tok - take) / user_tok
+                user_tok -= take
+                if isinstance(up, dict):
+                    up["tokens_in"] = int(user_tok)
+                    up["uncached_est"] = int(user_tok)
+                    up["cost_in_usd"] = float(user_usd)
+                bd["user_in_tokens"] = int(user_tok)
+                bd["user_in_usd"] = float(user_usd)
+            bd["harness_in_tokens"] = int(harness_tok)
+            bd["harness_in_usd"] = float(harness_usd)
+            bd["tree_in_clamped_to_paid"] = True
+    bd["tree_in_tokens"] = int(user_tok) + int(co_tok) + harness_tok + int(miss_tok)
+    bd["tree_in_usd"] = float(user_usd) + float(co_usd) + harness_usd + float(miss_usd)
     if cold:
         # R1 window starts at 0 (no prior call). System lives on its own card.
         # Do not peel context_start to System size — that hid ctx 0→end.
@@ -520,32 +740,66 @@ def _load_reasonings_fresh(hb: Any) -> list[dict[str, Any]]:
         hb._reasonings_mtime = mtime
     return list(hb._reasonings_cache or [])
 
-def _load_tool_results_fresh(hb: Any) -> dict[str, dict[str, Any]]:
-    """Reload chat_history tool_result content tokens when file changes."""
-    if not hb._session_dir:
-        return {}
-    ch_path = Path(hb._session_dir) / "chat_history.jsonl"
-    mtime: Optional[float] = None
+def _tool_results_sig(session_dir: Path) -> tuple:
+    parts: list[tuple] = []
+    ch_path = session_dir / "chat_history.jsonl"
     try:
         if ch_path.is_file():
-            mtime = float(ch_path.stat().st_mtime)
+            st = ch_path.stat()
+            parts.append(("chat_history.jsonl", float(st.st_mtime), int(st.st_size)))
     except OSError:
-        mtime = None
-    if (
-        hb._tool_results_cache is None
-        or mtime is None
-        or mtime != hb._tool_results_mtime
-    ):
+        pass
+    for sub in ("compaction_requests", "recap_requests"):
+        folder = session_dir / sub
+        if not folder.is_dir():
+            continue
+        try:
+            files = sorted(folder.glob("*.json"))
+        except OSError:
+            continue
+        for fp in files:
+            try:
+                st = fp.stat()
+            except OSError:
+                continue
+            parts.append((fp.name, float(st.st_mtime), int(st.st_size)))
+    return tuple(parts)
+
+
+def _load_tool_results_fresh(hb: Any) -> dict[str, dict[str, Any]]:
+    """Reload chat_history tool_result content tokens when files change."""
+    if not hb._session_dir:
+        return {}
+    sig = _tool_results_sig(Path(hb._session_dir))
+    if hb._tool_results_cache is None or sig != getattr(hb, "_tool_results_mtime", None):
         hb._tool_results_cache = load_chat_history_tool_results(hb._session_dir)
-        hb._tool_results_mtime = mtime
+        hb._tool_results_mtime = sig
     return dict(hb._tool_results_cache or {})
+
+
+def _load_tool_requests_fresh(hb: Any) -> dict[str, dict[str, Any]]:
+    """Reload chat_history tool_calls[].arguments tokens when files change."""
+    if not hb._session_dir:
+        return {}
+    sig = _tool_results_sig(Path(hb._session_dir))
+    if hb._tool_requests_cache is None or sig != getattr(
+        hb, "_tool_requests_mtime", None
+    ):
+        hb._tool_requests_cache = load_chat_history_tool_requests(hb._session_dir)
+        hb._tool_requests_mtime = sig
+    return dict(hb._tool_requests_cache or {})
+
 
 def _stamp_tool_chat_results(hb: Any, tools: list[dict[str, Any]]) -> None:
     """Attach chat_history tool_result.content tokenizer size onto harness tools.
 
     chat_history is authoritative for result **chars** and tokenizer **weights**
     (stream tool_call_update bodies under-count / truncate tools like grep).
+    Weights = inner ``content`` only (grok-build ToolResult) — never the ACP
+    ``{type,tool_call_id,content}`` envelope.
     """
+    from token_telemetry.session.subagents import apply_history_subagent_ids
+
     by_id = hb._load_tool_results_fresh()
     if not by_id:
         return
@@ -558,8 +812,13 @@ def _stamp_tool_chat_results(hb: Any, tools: list[dict[str, Any]]) -> None:
         hit = by_id.get(str(tid))
         if not hit:
             continue
-        ch_chars = int(hit.get("content_chars") or 0)
-        ch_tok = int(hit.get("content_tokens") or 0)
+        name = str(t.get("name") or "").lower()
+        waitish = (
+            "get_command" in name
+            or name in ("spawn_subagent", "kill_command_or_subagent")
+        )
+        ch_chars = int(hit.get("body_chars") or 0)
+        ch_tok = int(hit.get("body_tokens") or 0)
         t["ch_result_chars"] = ch_chars
         t["ch_result_tokens"] = ch_tok
         # Prefer history body for UI chars + harness pro-rata weights.
@@ -570,6 +829,41 @@ def _stamp_tool_chat_results(hb: Any, tools: list[dict[str, Any]]) -> None:
             t["weight_source"] = "chat_history_tokenizer"
         if hit.get("preview") and not t.get("result_preview"):
             t["result_preview"] = hit["preview"]
+        if waitish:
+            apply_history_subagent_ids(t, hit)
+
+
+def _stamp_tool_chat_args(hb: Any, tools: list[dict[str, Any]]) -> None:
+    """Attach chat_history tool_calls[].arguments as ToolRequest Out weights.
+
+    Authoritative over stream ``rawInput`` (updates often add harness-only
+    fields like ``variant`` / ``is_background``).
+    """
+    by_id = hb._load_tool_requests_fresh()
+    if not by_id:
+        return
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        tid = t.get("tool_call_id")
+        if not tid:
+            continue
+        hit = by_id.get(str(tid))
+        if not hit:
+            continue
+        ch_chars = int(hit.get("arg_chars") or 0)
+        ch_tok = int(hit.get("arg_tokens") or 0)
+        if ch_chars <= 0 and ch_tok <= 0:
+            continue
+        t["ch_arg_chars"] = ch_chars
+        t["ch_arg_tokens"] = ch_tok
+        t["arg_chars"] = ch_chars
+        t["arg_tokens_est"] = ch_tok
+        t["arg_weight_source"] = "chat_history_arguments"
+        if hit.get("name") and (
+            not t.get("name") or str(t.get("name") or "") in ("tool", "")
+        ):
+            t["name"] = hit["name"]
 
 def _stamp_step_reasoning(step: dict[str, Any], rs: dict[str, Any]) -> None:
     """Apply one chat_history reasoning item onto a model step."""
@@ -605,6 +899,8 @@ def _stamp_step_reasoning(step: dict[str, Any], rs: dict[str, Any]) -> None:
     # Absolute assign (session remap clears first)
     step["thought_encrypted_chars"] = int(enc_c)
     step["thought_encrypted_tokens"] = int(enc_tok)
+    # 1:1 stamp only — extra reasonings merged onto last must not inflate tok/s
+    step["thought_encrypted_tokens_own"] = int(enc_tok)
     step["thought_full_json_chars"] = int(full_c)
     if rs.get("preview") and not step.get("thought_preview"):
         step["thought_preview"] = rs["preview"]
@@ -642,6 +938,7 @@ def _enrich_session_thoughts(hb: Any) -> None:
     for s in steps_flat:
         s["thought_encrypted_chars"] = 0
         s["thought_encrypted_tokens"] = 0
+        s["thought_encrypted_tokens_own"] = 0
         s["thought_full_json_chars"] = 0
 
     r_n, s_n = len(reasonings), len(steps_flat)
@@ -840,12 +1137,13 @@ def _price_bootstrap_prompts(hb: Any, r: dict[str, Any]) -> None:
             ud.get("skill_information_tokens") or 0
         )
         if tz <= 0:
-            prevw = str(up.get("preview") or r.get("user_preview") or "")
-            if prevw:
+            full = str(r.get("user_text") or up.get("user_text") or "")
+            src = full or str(up.get("preview") or r.get("user_preview") or "")
+            if src:
                 try:
-                    tz = int(count_tokens(prevw))
+                    tz = int(count_user_prompt_tokens(src))
                 except Exception:
-                    tz = max(1, count_chars_as_tokens(len(prevw)) or 1)
+                    tz = max(1, count_chars_as_tokens(len(src)) or 1)
         if tz > 0:
             up["tokenizer_tokens"] = int(tz)
             up["prompt_tokenizer_tokens"] = int(tz)
@@ -889,6 +1187,8 @@ def _finalize_step(hb: Any, step: dict[str, Any]) -> None:
                 "ch_result_tokens": int(t.get("ch_result_tokens") or 0),
                 "arg_chars": int(t.get("arg_chars") or 0),
                 "arg_tokens_est": int(t.get("arg_tokens_est") or 0),
+                "ch_arg_chars": int(t.get("ch_arg_chars") or 0),
+                "ch_arg_tokens": int(t.get("ch_arg_tokens") or 0),
                 "tt_delta_observed": max(0, tt_obs),
                 "context_delta": max(0, tt_obs),  # may be redistributed below
                 "context_before": t.get("context_before"),
@@ -900,10 +1200,12 @@ def _finalize_step(hb: Any, step: dict[str, Any]) -> None:
                 "subagent_ids": list(t.get("subagent_ids") or []) or None,
                 "subagent_type": t.get("subagent_type"),
                 "subagent_description": t.get("subagent_description"),
+                "resume_from": t.get("resume_from"),
             }
         )
-    # Stamp chat_history tool_result (chars + tokenizer weights; authoritative)
+    # Stamp chat_history tool_result + tool_calls[].arguments (authoritative)
     hb._stamp_tool_chat_results(cleaned)
+    hb._stamp_tool_chat_args(cleaned)
     for t in cleaned:
         # also keep on step.tools for later reprice
         tid = t.get("tool_call_id")
@@ -915,8 +1217,20 @@ def _finalize_step(hb: Any, step: dict[str, Any]) -> None:
                 raw_t["ch_result_tokens"] = t.get("ch_result_tokens")
                 raw_t["result_chars"] = t.get("result_chars")
                 raw_t["result_tokens_est"] = t.get("result_tokens_est")
+                raw_t["arg_chars"] = t.get("arg_chars")
+                raw_t["arg_tokens_est"] = t.get("arg_tokens_est")
+                raw_t["ch_arg_chars"] = t.get("ch_arg_chars")
+                raw_t["ch_arg_tokens"] = t.get("ch_arg_tokens")
                 if t.get("weight_source"):
                     raw_t["weight_source"] = t.get("weight_source")
+                if t.get("arg_weight_source"):
+                    raw_t["arg_weight_source"] = t.get("arg_weight_source")
+                if t.get("subagent_id"):
+                    raw_t["subagent_id"] = t.get("subagent_id")
+                if t.get("subagent_ids"):
+                    raw_t["subagent_ids"] = list(t.get("subagent_ids") or [])
+                if t.get("resume_from") and not raw_t.get("resume_from"):
+                    raw_t["resume_from"] = t.get("resume_from")
                 break
 
     emit_d = int(step.get("model_emit_delta") or 0)
@@ -1264,7 +1578,7 @@ def _finalize_step(hb: Any, step: dict[str, Any]) -> None:
     harness_delta = sum(
         int(c.get("context_delta") or 0)
         for c in harness_children
-        if c.get("kind") != "llm_to_in"
+        if c.get("kind") not in ("llm_to_in", "compact_out_in")
     )
     harness_in_with_out = harness_delta + int(llm_to_ctx)
     children: list[dict[str, Any]] = []
@@ -1326,19 +1640,9 @@ def _attach_step_estimates(hb: Any, r: dict[str, Any]) -> None:
         elif isinstance(hb._cache_baseline, int):
             prior = hb._cache_baseline
 
-    # Cold R1: never treat session-level _cache_baseline as a warm prior when
-    # this is the first round (System card / no completed predecessor).
-    is_session_first = (
-        r.get("cache_baseline_at_start") is None
-        and (
-            (r in hb.rounds and hb.rounds.index(r) == 0)
-            or (r not in hb.rounds and len(hb.rounds) == 0)
-        )
-    )
-    if is_session_first or r.get("system_prompt") is not None:
-        # system_prompt is only built for the first cold prompt
-        if is_session_first:
-            prior = None
+    # Zero prior only for a true cold R1 (not a pruned list head).
+    if _is_cold_session_first(r):
+        prior = None
 
     # Warm R2+: mild stream under-count only (start still ≥ half of prior).
     # Never rewrite stream_context_start / raw — reconstruct + miss detect
@@ -1389,46 +1693,47 @@ def _attach_step_estimates(hb: Any, r: dict[str, Any]) -> None:
     from token_telemetry.session.subagents import (
         attach_subagents_after_steps,
         child_ids_to_peel,
+        collect_child_ids_from_round,
         peel_round_usage,
     )
 
-    if usage:
-        child_ids = child_ids_to_peel(r)
-        if child_ids:
-            cache = getattr(hb, "_child_usage_cache", None)
-            if cache is None:
-                cache = {}
-                hb._child_usage_cache = cache
-            already: dict[str, Any] = {}
-            if r in hb.rounds:
-                prevs = hb.rounds[: hb.rounds.index(r)]
-            else:
-                prevs = list(hb.rounds)
-            for prev in prevs:
-                snap = prev.get("child_usage_at_peel")
-                if isinstance(snap, dict):
-                    already.update(snap)
-            src = r.get("usage_raw_unpeeled")
-            if not isinstance(src, dict) or not src:
-                src = dict(usage)
-            peeled, peel_meta = peel_round_usage(
-                src,
-                parent_dir=getattr(hb, "_session_dir", None),
-                child_ids=child_ids,
-                cache=cache,
-                already_peeled=dict(already),
-            )
-            r["usage_raw_unpeeled"] = dict(src)
-            r["subagent_peel"] = peel_meta
-            r["child_usage_at_peel"] = {
-                c["session_id"]: c.get("usage")
-                for c in (peel_meta.get("children") or [])
-                if isinstance(c, dict) and c.get("session_id") and c.get("usage")
-            }
-            if peel_meta.get("peeled"):
-                usage = peeled
-                r["usage_raw"] = peeled
-            attach_subagents_after_steps(r, peel_meta)
+    peel_meta: dict[str, Any] = {"children": [], "peeled": False}
+    child_ids = child_ids_to_peel(r)
+    if usage and child_ids:
+        cache = getattr(hb, "_child_usage_cache", None)
+        if cache is None:
+            cache = {}
+            hb._child_usage_cache = cache
+        already: dict[str, Any] = {}
+        if r in hb.rounds:
+            prevs = hb.rounds[: hb.rounds.index(r)]
+        else:
+            prevs = list(hb.rounds)
+        for prev in prevs:
+            snap = prev.get("child_usage_at_peel")
+            if isinstance(snap, dict):
+                already.update(snap)
+        src = r.get("usage_raw_unpeeled")
+        if not isinstance(src, dict) or not src:
+            src = dict(usage)
+        peeled, peel_meta = peel_round_usage(
+            src,
+            parent_dir=getattr(hb, "_session_dir", None),
+            child_ids=child_ids,
+            cache=cache,
+            already_peeled=dict(already),
+        )
+        r["usage_raw_unpeeled"] = dict(src)
+        r["subagent_peel"] = peel_meta
+        r["child_usage_at_peel"] = {
+            c["session_id"]: c.get("usage")
+            for c in (peel_meta.get("children") or [])
+            if isinstance(c, dict) and c.get("session_id") and c.get("usage")
+        }
+        if peel_meta.get("peeled"):
+            usage = peeled
+            r["usage_raw"] = peeled
+    attach_subagents_after_steps(r, peel_meta, hb=hb)
 
     fam = r.get("model_family") or getattr(hb, "_pricing_model", None)
     with pricing_model_scope(fam):
@@ -1445,15 +1750,48 @@ def _attach_step_estimates(hb: Any, r: dict[str, Any]) -> None:
             end_tok_i = int(end_tok) if end_tok is not None else None
         except (TypeError, ValueError):
             end_tok_i = None
+        compact_reentry = None
+        cb = r.get("compact_before")
+        if isinstance(cb, dict) and cb.get("kind") == "compaction":
+            compact_reentry = dict(cb)
+            # Between-rounds → User[N] owns Compact Out in UI (reconstruct keeps node).
+            if compact_reentry.get("placement") != "mid_round":
+                compact_reentry["_attribution"] = "user"
+                if not compact_reentry.get("placement"):
+                    compact_reentry["placement"] = "between_rounds"
+        elif not r.get("mid_round_compacts"):
+            prev = None
+            if r in hb.rounds:
+                idx = hb.rounds.index(r)
+                prev = hb.rounds[idx - 1] if idx > 0 else None
+            elif hb.rounds:
+                prev = hb.rounds[-1]
+            if isinstance(prev, dict):
+                pst = [
+                    s
+                    for s in (prev.get("model_steps") or [])
+                    if isinstance(s, dict)
+                ]
+                if pst:
+                    cas = [
+                        c
+                        for c in (pst[-1].get("compacts_after") or [])
+                        if isinstance(c, dict) and c.get("kind") == "compaction"
+                    ]
+                    if cas:
+                        compact_reentry = dict(cas[-1])
+                        if compact_reentry.get("placement") == "mid_round":
+                            compact_reentry["_attribution"] = "harness"
+                        else:
+                            compact_reentry["_attribution"] = "user"
         recon = reconstruct_model_step_usage(
             steps,
             official_usage=usage,
             prior_context_tokens=prior if isinstance(prior, int) else None,
-            context_reread=bool(reread),
-            reread_uncached_tokens=int(reread["reread_tokens"]) if reread else 0,
             user_uncached_tokens=int(user_unc),
             system_uncached_tokens=int(sys_unc),
             context_end_tokens=end_tok_i,
+            compact_reentry=compact_reentry,
         )
         r["model_steps"] = recon["steps"]
         r["step_usage"] = {
@@ -1611,6 +1949,9 @@ def _reprice_completed_rounds(hb: Any) -> None:
             if isinstance(step, dict):
                 hb._finalize_step(step)
         hb._attach_step_estimates(rr)
+        from token_telemetry.hierarchy.gen_rate import attach_gen_rates
+
+        attach_gen_rates(rr)
         try:
             hb._price_bootstrap_prompts(rr)
         except Exception:

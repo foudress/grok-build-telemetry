@@ -22,6 +22,22 @@ def _rec(typ, content, **kw):
     return o
 
 
+def _billable_updates() -> str:
+    """Minimal turn_completed so session_has_usage keeps the fixture."""
+    return json.dumps({
+        "params": {
+            "update": {
+                "sessionUpdate": "turn_completed",
+                "usage": {
+                    "inputTokens": 10,
+                    "cachedReadTokens": 0,
+                    "outputTokens": 1,
+                },
+            }
+        }
+    }) + "\n"
+
+
 def _snaps(recs):
     return [fingerprint(r, i) for i, r in enumerate(recs)]
 
@@ -166,8 +182,8 @@ def test_watcher_baseline_then_mutate(tmp_path: Path):
     d = cwd / sid
     d.mkdir(parents=True)
     hist = d / "chat_history.jsonl"
-    # discover requires updates.jsonl
-    (d / "updates.jsonl").write_text("{}\n", encoding="utf-8")
+    # discover requires updates.jsonl with billable usage
+    (d / "updates.jsonl").write_text(_billable_updates(), encoding="utf-8")
     recs = [_rec("system", "S"), _rec("user", "hello", prompt_index=0)]
     hist.write_text("\n".join(json.dumps(r) for r in recs) + "\n", encoding="utf-8")
 
@@ -198,7 +214,7 @@ def test_watcher_new_session_after_start(tmp_path: Path):
 
     d = tmp_path / "proj" / "sess-new"
     d.mkdir(parents=True)
-    (d / "updates.jsonl").write_text("{}\n", encoding="utf-8")
+    (d / "updates.jsonl").write_text(_billable_updates(), encoding="utf-8")
     recs = [_rec("system", "S")]
     (d / "chat_history.jsonl").write_text(json.dumps(recs[0]) + "\n", encoding="utf-8")
     w.tick()
@@ -220,7 +236,7 @@ def test_watcher_evicts_stale_for_new_session(tmp_path: Path, monkeypatch):
     for i in range(2):
         d = tmp_path / "p" / f"old-{i}"
         d.mkdir(parents=True)
-        (d / "updates.jsonl").write_text("{}\n", encoding="utf-8")
+        (d / "updates.jsonl").write_text(_billable_updates(), encoding="utf-8")
         (d / "chat_history.jsonl").write_text(
             json.dumps(_rec("system", f"S{i}")) + "\n", encoding="utf-8"
         )
@@ -229,7 +245,7 @@ def test_watcher_evicts_stale_for_new_session(tmp_path: Path, monkeypatch):
     assert {s["session_id"] for s in w.snapshot()["sessions"]} == {"old-0", "old-1"}
     d = tmp_path / "p" / "new-hot"
     d.mkdir(parents=True)
-    (d / "updates.jsonl").write_text("{}\n", encoding="utf-8")
+    (d / "updates.jsonl").write_text(_billable_updates(), encoding="utf-8")
     time.sleep(0.02)
     (d / "chat_history.jsonl").write_text(
         json.dumps(_rec("system", "NEW")) + "\n", encoding="utf-8"
@@ -243,7 +259,7 @@ def test_watcher_evicts_stale_for_new_session(tmp_path: Path, monkeypatch):
 def test_incomplete_last_line_skipped(tmp_path: Path):
     d = tmp_path / "proj" / "sess-partial"
     d.mkdir(parents=True)
-    (d / "updates.jsonl").write_text("{}\n", encoding="utf-8")
+    (d / "updates.jsonl").write_text(_billable_updates(), encoding="utf-8")
     hist = d / "chat_history.jsonl"
     hist.write_text(json.dumps(_rec("system", "S")) + "\n", encoding="utf-8")
     w = HistoryWatcher(root=tmp_path)
@@ -256,3 +272,15 @@ def test_incomplete_last_line_skipped(tmp_path: Path):
     )
     w.tick()
     assert w.snapshot()["sessions"][0]["records"] == n0
+
+
+def test_watcher_skips_title_only_no_usage(tmp_path: Path):
+    d = tmp_path / "proj" / "ghost"
+    d.mkdir(parents=True)
+    (d / "updates.jsonl").write_text("{}\n", encoding="utf-8")
+    (d / "chat_history.jsonl").write_text(
+        json.dumps(_rec("system", "S")) + "\n", encoding="utf-8"
+    )
+    w = HistoryWatcher(root=tmp_path)
+    w.tick()
+    assert w.snapshot()["sessions"] == []

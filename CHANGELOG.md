@@ -5,6 +5,60 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+-
+
+### Changed
+
+-
+
+### Fixed
+
+-
+
+## [1.0.0] — 2026-08-26
+
+Post-0.5.2 hierarchy, period, compact, chart, install, and rates UX as one release.
+**Mutation History, hourglass Gantt, tok/s, Agent Animation Graph, and Period I/O $/M
+stay in the tree but are gated off** for the v1.0.0 UI (polish/debug). Flip
+`token_telemetry.features` + `dashboard/js/features.js` to re-enable.
+`CACHE_VER = 26`. Package **1.0.0**.
+
+### Added
+
+- TokZ prefix on tree In/Out; round KV miss under Attribution (not User).
+- User [N] In = prompt tokZ (full `<user_query>` / quoted payload) + prior LLM answer as **new** In (warm continuity; peel-capped + paid-unc / tree_in clamp).
+- Cost Per Round **I/O · Parts · Tools**; **Sub Agent N Sys** after spawn LLM.
+- Auto-compact / recap ownership (Compact Out → User; no double-peel; no cross-mode chart scale).
+- Period **Normalized** + grain **Session**; Sub Agent parent nesting; estimate `$` on period list.
+- Period calc cache skip for out-of-window sessions; `cats_ready` / `rate_full`.
+- Chart shell: resize Cost+Context, collapse title strip, D/W/M toolbar chrome.
+- UI shell: **Grok Build Telemetry** header, **Reset calc** right, single-viewport layout; Official cost card flip (tokens ↔ implied In/Cache/Out `$/M`).
+- Context chart: **`R{n}`** under User points; Round End unlabeled.
+- Official `$/M` imply from Official bill ÷ API tokens (turns with ctx ≤190k); model cards 4.5 `2/0.3|0.6/6` · 4.6 `2/0.5/6`; period aggregate `rate_*` + `model_family`.
+- OS-independent install: `docs/install.md`, `bootstrap_install.py`, `install_skills.py`, slash **`/telemetry`** + `launch_dashboard.py` (kill `:8765`, prefer `.venv`).
+- Feature gates + WIP pages/APIs for History / Gantt / tok/s / Graph / Period I/O `$/M` (`features.py` / `features.js`).
+- In-tree (gated): Mutation History, hourglass Gantt, tok/s charts, Agent Animation Graph, Period I/O `$/M` step chart.
+
+### Changed
+
+- Last LLM call of a round: Cached = 0.
+- Sub-agent resume = same agent (one Daily child, one tab). Session estimate = parent + each tab `$`.
+- Tool request/result weights align with harness (`tool_calls[].arguments` / `tool_result.content` body).
+- Context chart: User → calls → `R{n}` end; hide zero Call/User points.
+- Removed duplicate PowerShell launch wrapper (`launch_dashboard.ps1`); use `launch_dashboard.py` / `/telemetry`.
+- Package version **0.5.2 → 1.0.0**.
+
+### Fixed
+
+- Spawn UUID truncation, resume Sys double, wait-tool peel, Sub Agent Sys In copy, Reasoning = Thought+Enc.
+- Period resume latest-only; Tools cache-miss via `snapshot_rounds`; empty 0/0/0 sessions hidden.
+- Cost tip placement / legend order / Y-zoom retention; period → session header pick.
+- Warm Σ(Round In + Sys) vs API uncached overshoot (continuity peel + paid/tree clamp); hierarchy `prevTokZ` render.
+
 ## [0.5.2] — 2026-08-19
 
 Session titles, persisted period calcs, header cleanup, and tool-result
