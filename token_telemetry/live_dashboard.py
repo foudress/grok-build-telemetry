@@ -19,7 +19,7 @@ import argparse
 import sys
 import threading
 import webbrowser
-from http.server import HTTPServer
+from http.server import ThreadingHTTPServer
 from typing import Optional
 
 from token_telemetry.tokenizer import preload as _preload_tokenizer, tokenizer_info
@@ -77,20 +77,30 @@ def main(argv: Optional[list[str]] = None) -> int:
     except Exception as e:
         print(f"tokenizer preload skipped: {e}", file=sys.stderr)
 
-    d = resolve_session_dir(args.session_id)
+    # Explicit --session-id (from /telemetry + GROK_SESSION_ID) must pin;
+    # otherwise follow-active can jump to another concurrent Grok window.
+    sid = (args.session_id or "").strip() or None
+    d = resolve_session_dir(sid)
     if d:
-        MONITOR.attach(d)
-        print(f"tracking session {d.name}")
+        pin = sid is not None
+        MONITOR.attach(d, pin=pin)
+        print(f"{'pinned' if pin else 'tracking'} session {d.name}")
         print(f"  updates: {d / 'updates.jsonl'}")
     else:
-        print("no session yet — will attach when one appears", file=sys.stderr)
+        if sid:
+            print(f"session not found: {sid} — will follow active", file=sys.stderr)
+        else:
+            print("no session yet — will attach when one appears", file=sys.stderr)
 
     stop = threading.Event()
     th = threading.Thread(target=background_poller, args=(stop,), daemon=True)
     th.start()
 
-    # Single-threaded: concurrent snapshot rebuilds were a major RAM amplifier
-    httpd = HTTPServer((args.host, args.port), Handler)
+    # Threaded accept loop: browsers (esp. Opera) open many parallel connections;
+    # a single-threaded HTTPServer stalls entirely on one slow /api/state.
+    # Heavy snapshot work stays serialized via MONITOR.lock.
+    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    httpd.daemon_threads = True
     url = f"http://{args.host}:{args.port}/"
     print(f"dashboard: {url}")
     print(f"history:   {url}history")

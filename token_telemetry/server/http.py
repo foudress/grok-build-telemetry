@@ -135,9 +135,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, body, "application/json; charset=utf-8")
             return
         if path == "/api/sessions":
+            # Full picker (recent tail) — used when the user opens the dropdown.
+            # Live /api/state stays slim while pinned so startup stays fast.
             body = json.dumps(
                 {
-                    "sessions": list_sessions_for_ui(),
+                    "sessions": list_sessions_for_ui(
+                        focus_session_id=MONITOR.pinned_session_id,
+                        recent_limit=30,
+                    ),
                     "current": MONITOR.session_id,
                     "pinned": MONITOR.pinned_session_id,
                     "follow_active": MONITOR.pinned_session_id is None,
@@ -291,9 +296,12 @@ def background_poller(stop: threading.Event, interval: float = 0.5) -> None:
                 MONITOR.tick()
         except Exception:
             pass
-        try:
-            WATCHER.tick()
-        except Exception:
-            pass
+        # Mutation History is gated off for v1 — skip baselining every
+        # chat_history.jsonl (can be multi-second across hundreds of sessions).
+        if feat.MUTATION_HISTORY:
+            try:
+                WATCHER.tick()
+            except Exception:
+                pass
         stop.wait(interval)
 

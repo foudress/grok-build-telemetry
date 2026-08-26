@@ -3,8 +3,11 @@ import { $ } from './fmt.js';
 
 let _sessionSwitching = false;
 let _lastSessionOptsKey = "";
+let _fullPickerLoaded = false;
 /** @type {null | (() => Promise<void>)} */
 let _pollRef = null;
+/** @type {null | Record<string, any>} */
+let _lastStateRef = null;
 
 export function bindPoll(fn) {
   _pollRef = fn;
@@ -46,6 +49,21 @@ function ensureSessionDd(sel) {
         menu.style.left = "auto";
         menu.style.right = "0";
       }
+      // Pinned /telemetry startup keeps /api/state slim; load the full
+      // recent list only when the user opens the picker.
+      if (!_fullPickerLoaded && _lastStateRef && _lastStateRef.pinned_session_id) {
+        _fullPickerLoaded = true;
+        fetch("/api/sessions?_=" + Date.now())
+          .then((r) => (r.ok ? r.json() : null))
+          .then((data) => {
+            if (!data || !Array.isArray(data.sessions) || !_lastStateRef) return;
+            _lastSessionOptsKey = "";
+            fillSessionSelect({ ..._lastStateRef, sessions: data.sessions });
+            const m = $("sessionDdMenu");
+            if (m) m.hidden = false;
+          })
+          .catch(() => { _fullPickerLoaded = false; });
+      }
     }
   });
   document.addEventListener("click", (ev) => {
@@ -57,6 +75,8 @@ function ensureSessionDd(sel) {
 function fillSessionSelect(state) {
   const sel = $("sessionSelect");
   if (!sel) return;
+  _lastStateRef = state;
+  if (!state.pinned_session_id) _fullPickerLoaded = false;
   const sessions = state.sessions || [];
   const current = state.session_id || "";
   const pinned = state.pinned_session_id || null;

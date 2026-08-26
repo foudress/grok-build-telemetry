@@ -2,7 +2,7 @@
 
 Live companion dashboard for **[Grok Build](https://x.ai)** sessions: exact token fields Grok already writes, cache vs uncached split, official `$` ticks, and list-price estimates — outside the TUI.
 
-> Package: `token-telemetry` **v1.0.0** (`pip install -e .` / `token-telemetry` CLI).
+> Package: `token-telemetry` **v1.0.1** (`pip install -e .` / `token-telemetry` CLI).
 
 ```
 ~/.grok/sessions/.../updates.jsonl  ──tail──►  live dashboard  ──►  http://127.0.0.1:8765/
@@ -65,7 +65,9 @@ python3 bootstrap_install.py   # or: python bootstrap_install.py
 
 ## Run
 
-**From Grok Build:** end your first prompt with **`/telemetry`**, or run `/telemetry` alone. The agent kills anything on port **8765**, starts a clean dashboard, opens the browser, then continues your prompt.
+**From Grok Build:** end your first prompt with **`/telemetry`**, or run `/telemetry` alone. The agent kills anything on port **8765**, starts a clean detached dashboard (Windows-safe under Grok’s Job Object), **pins the current `GROK_SESSION_ID`**, opens the browser to `http://127.0.0.1:8765/?session=<id>`, then continues your prompt.
+
+First paint only recalculates the **pinned session** (not every session on disk). The full recent picker loads when you open the session dropdown.
 
 ```bash
 token-telemetry
@@ -77,8 +79,9 @@ Launcher (used by `/telemetry`):
 
 ```bash
 python3 launch_dashboard.py              # foreground (Ctrl+C)
-python3 launch_dashboard.py --detached   # background
+python3 launch_dashboard.py --detached   # background (survives agent shell exit)
 # optional: --port 8765 --session-id <uuid> --no-open
+# If --session-id is omitted, GROK_SESSION_ID is used when set.
 ```
 
 Legacy (no install):
@@ -88,7 +91,7 @@ python scripts/live_dashboard.py
 python scripts/live_dashboard.py --port 8765 --session-id <uuid> --no-open
 ```
 
-Opens **http://127.0.0.1:8765/** — leave it beside Grok Build.
+Opens **http://127.0.0.1:8765/** (with `?session=` when pinned) — leave it beside Grok Build.
 
 ## Pricing estimates
 

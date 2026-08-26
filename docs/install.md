@@ -111,5 +111,7 @@ Do **not** chain a long tour of the dashboard UI.
 
 ## Related
 
-- Daily: **`/telemetry`** → kill port **8765** → clean relaunch → `http://127.0.0.1:8765/`
-- Manual: `python launch_dashboard.py` (foreground) or `--detached`
+- Daily: **`/telemetry`** → kill port **8765** → clean detached relaunch → pin `GROK_SESSION_ID` → `http://127.0.0.1:8765/?session=<id>`
+- On Windows, detached mode escapes the Grok Build Job Object so the dashboard stays up after the skill command returns.
+- First paint recalculates only the pinned session; other sessions load when picked in the UI.
+- Manual: `python launch_dashboard.py` (foreground) or `--detached` (`--session-id` optional; falls back to `GROK_SESSION_ID`)

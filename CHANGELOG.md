@@ -19,6 +19,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 -
 
+## [1.0.1] — 2026-08-26
+
+`/telemetry` reliability on Windows + pin the calling Grok session + faster first paint.
+Package **1.0.1**.
+
+### Fixed
+
+- **Windows detached launch**: Grok Build shells run inside a Job Object
+  (`KILL_ON_JOB_CLOSE`). `start /B` / direct `CreateProcess` children died when
+  `/telemetry` returned, so the browser opened on a dead `:8765`. Detached spawn
+  now launches a hidden VBS via `explorer.exe` (outside the job); PID is taken
+  from the listener on the port.
+- **Browser stall**: switched the dashboard to `ThreadingHTTPServer` so Opera/Chrome
+  parallel connections cannot block `/` or `/api/health` behind one slow `/api/state`.
+- **Wrong session**: `--session-id` / `GROK_SESSION_ID` now **pins** the session
+  (no follow-active jump to another open Grok window). Launcher opens
+  `http://127.0.0.1:8765/?session=<id>`; the UI pins on boot from that query.
+- **Slow first paint**: skipped `HistoryWatcher` baselining while Mutation History
+  is gated off (was scanning hundreds of `chat_history.jsonl`). Pinned `/api/state`
+  only lists active + focused session; full recent picker loads on dropdown open.
+  Re-`select_session` of an already-pinned id is a no-op (no double jsonl replay).
+
+### Changed
+
+- `launch_dashboard.py` waits on `/api/health`, falls back to `GROK_SESSION_ID`,
+  and prints the pinned session id.
+- `list_sessions_for_ui(focus_session_id=…, recent_limit=…)` supports slim startup
+  payloads vs full picker.
+
 ## [1.0.0] — 2026-08-26
 
 Post-0.5.2 hierarchy, period, compact, chart, install, and rates UX as one release.

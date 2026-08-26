@@ -1154,7 +1154,16 @@ $("ctxRateRound")?.addEventListener("click", () => {
 });
 bindCtxGraphResize();
 
-poll();
+// /telemetry opens ?session=<GROK_SESSION_ID> so this tab pins that session
+// even if another Grok window is also "active".
+const bootSid = new URLSearchParams(location.search).get("session")
+  || new URLSearchParams(location.search).get("session_id");
+if (bootSid) {
+  beginViewLoad();
+  switchSession(bootSid);
+} else {
+  poll();
+}
 setInterval(poll, 1000);
 window.addEventListener("resize", () => {
   if (isPeriodScope()) {

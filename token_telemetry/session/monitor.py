@@ -363,6 +363,21 @@ class SessionMonitor:
                     self._catch_up_unlocked()
                     return {"ok": True, "session_id": d.name, "pinned": False}
                 return {"ok": False, "error": "no session available"}
+            # /telemetry opens ?session= after the server already pinned that id.
+            # Re-attach + full catch-up would replay the same jsonl twice.
+            if (
+                self.pinned_session_id == session_id
+                and self.session_id == session_id
+                and self.session_dir is not None
+                and (self.session_dir / "updates.jsonl").is_file()
+                and self.bootstrapped
+            ):
+                return {
+                    "ok": True,
+                    "session_id": session_id,
+                    "pinned": True,
+                    "already": True,
+                }
             d = resolve_session_dir(session_id)
             if not d:
                 return {"ok": False, "error": f"unknown session {session_id}"}
@@ -1172,7 +1187,9 @@ class SessionMonitor:
             # Ingest new lines first (background poller also ticks; both under lock)
             self.tick()
             rev = self.hierarchy.revision
-            sessions = list_sessions_for_ui()
+            # Pinned (/telemetry): only active + focused session in the picker
+            # payload — avoid usage-scanning dozens of unrelated jsonl files.
+            sessions = list_sessions_for_ui(focus_session_id=self.pinned_session_id)
             sig_key = (
                 self.live.get("context_tokens"),
                 self.live.get("context_tokens_ui"),

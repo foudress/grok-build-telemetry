@@ -320,6 +320,64 @@ def port_free_check(port: int) -> None:
         s.close()
 
 
+def _write_windows_launch_vbs(
+    cmd: list[str], root: Path, out_log: Path, err_log: Path, vbs_path: Path
+) -> None:
+    """Hidden WScript launcher; opened via explorer.exe to escape Job Objects."""
+    # cmd /c cd /d ROOT && <cmd> >> out 2>> err
+    inner = " ".join(
+        [
+            "cd /d",
+            subprocess.list2cmdline([str(root)]),
+            "&&",
+            subprocess.list2cmdline(cmd),
+            ">>",
+            subprocess.list2cmdline([str(out_log)]),
+            "2>>",
+            subprocess.list2cmdline([str(err_log)]),
+        ]
+    )
+    run = "cmd /c " + inner.replace('"', '""')
+    vbs_path.write_text(
+        'Set sh = CreateObject("WScript.Shell")\r\n'
+        f'sh.Run "{run}", 0, False\r\n',
+        encoding="ascii",
+        errors="replace",
+    )
+
+
+def _spawn_detached(cmd: list[str], root: Path, out_log: Path, err_log: Path) -> int:
+    """Start dashboard so it survives after this launcher exits.
+
+    Returns a best-effort PID (0 if not yet known). On Windows, Grok Build runs
+    the skill shell inside a Job Object with KILL_ON_JOB_CLOSE. Direct CreateProcess
+    / ``start /B`` / Start-Process stay in that job and die when ``/telemetry``
+    returns — even with CREATE_BREAKAWAY_FROM_JOB on some hosts. Launching a
+    tiny VBS through ``explorer.exe`` creates the process outside the job.
+    """
+    if sys.platform == "win32":
+        vbs = out_log.parent / "_dashboard_launch.vbs"
+        _write_windows_launch_vbs(cmd, root, out_log, err_log, vbs)
+        # explorer.exe is outside the agent job; its child inherits that.
+        subprocess.Popen(
+            ["explorer.exe", str(vbs)],
+            close_fds=True,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW (explorer itself)
+        )
+        return 0
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(root),
+        stdin=subprocess.DEVNULL,
+        stdout=open(out_log, "a", encoding="utf-8"),  # noqa: SIM115 — kept for child life
+        stderr=open(err_log, "a", encoding="utf-8"),  # noqa: SIM115
+        start_new_session=True,
+        close_fds=True,
+    )
+    return int(proc.pid)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Launch Grok Token Telemetry dashboard")
     ap.add_argument("--port", type=int, default=8765)
@@ -331,15 +389,22 @@ def main(argv: list[str] | None = None) -> int:
 
     root = resolve_root()
     py = venv_python(root)
+    # Prefer CLI flag; fall back to the Grok Build session that ran /telemetry.
+    session_id = (args.session_id or "").strip() or (
+        os.environ.get("GROK_SESSION_ID") or ""
+    ).strip()
     url = f"http://127.0.0.1:{args.port}/"
+    if session_id:
+        url = f"{url}?session={session_id}"
+    health_url = f"http://127.0.0.1:{args.port}/api/health"
 
     if not args.no_kill:
         kill_port(args.port)
         port_free_check(args.port)
 
-    cmd = [str(py), "-m", "token_telemetry", "--port", str(args.port)]
-    if args.session_id:
-        cmd += ["--session-id", args.session_id]
+    cmd = [str(py), "-u", "-m", "token_telemetry", "--port", str(args.port)]
+    if session_id:
+        cmd += ["--session-id", session_id]
     # Always let this launcher own browser open when detached; avoid double-open
     if args.detached or args.no_open:
         cmd.append("--no-open")
@@ -347,6 +412,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Starting Grok Token Telemetry on {url}")
     print(f"  root:   {root}")
     print(f"  python: {py}")
+    if session_id:
+        print(f"  session: {session_id} (pinned)")
 
     # Preflight: Grok-2 weights need transformers (else bytes4 fallback)
     try:
@@ -371,42 +438,24 @@ def main(argv: list[str] | None = None) -> int:
     out_log = log_dir / "dashboard.out.log"
     err_log = log_dir / "dashboard.err.log"
 
-    # Detached spawn must not own the child's stdio handles in this process:
-    # when the launcher exits, closing those handles kills the dashboard on Windows.
-    if sys.platform == "win32":
-        # `start /B` returns immediately; redirection is owned by the new process tree.
-        line = subprocess.list2cmdline(cmd)
-        shell_cmd = f'start /B "" {line} >> "{out_log}" 2>> "{err_log}"'
-        proc = subprocess.Popen(
-            shell_cmd,
-            cwd=str(root),
-            shell=True,
-            creationflags=0x08000000,  # CREATE_NO_WINDOW
-        )
-    else:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(root),
-            stdout=open(out_log, "a", encoding="utf-8"),  # noqa: SIM115 — kept for child life
-            stderr=open(err_log, "a", encoding="utf-8"),  # noqa: SIM115
-            start_new_session=True,
-            close_fds=True,
-        )
+    spawned_pid = _spawn_detached(cmd, root, out_log, err_log)
 
-    # First transformers import can be slow
-    ok = wait_url(url, seconds=45.0)
+    # Prefer /api/health (cheap). First transformers import / bind can be slow.
+    ok = wait_url(health_url, seconds=45.0) or wait_url(url, seconds=10.0)
     if not ok:
         print(
             f"warning: dashboard did not respond on {url} — see {err_log}",
             file=sys.stderr,
         )
         return 1
+    listen_pids = pids_on_port(args.port)
+    pid = listen_pids[0] if listen_pids else spawned_pid
     if not args.no_open:
         try:
             webbrowser.open(url)
         except Exception:
             pass
-    print(f"dashboard up  pid={proc.pid}  {url}")
+    print(f"dashboard up  pid={pid}  {url}")
     return 0
 
 

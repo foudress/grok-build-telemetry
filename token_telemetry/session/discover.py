@@ -194,26 +194,37 @@ def format_age(seconds: float) -> str:
     return f"{d}d"
 
 
-def list_sessions_for_ui() -> list[dict[str, Any]]:
+def list_sessions_for_ui(
+    focus_session_id: Optional[str] = None,
+    *,
+    recent_limit: Optional[int] = None,
+) -> list[dict[str, Any]]:
     """
     Sessions for the dashboard dropdown.
     Active sessions first (from active_sessions.json), then other recent dirs.
     Prefer session_summary (then generated_title) over session id hash.
+
+    When ``focus_session_id`` is set (pinned /telemetry session), skip scanning
+    the long recent tail so first paint only touches active + focused sessions.
+    Pass ``recent_limit`` explicitly (e.g. 30) to populate the full picker later.
     """
     dirs = list_session_dirs()
     by_id = {d.name: d for d in dirs}
     active_meta = {m["session_id"]: m for m in read_active_sessions_meta()}
     active_ids = read_active_session_ids()
     now = time.time()
+    focus = (focus_session_id or "").strip() or None
+    if recent_limit is None:
+        recent_limit = 0 if focus else 30
 
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
 
-    def _row(sid: str, *, active: bool) -> Optional[dict[str, Any]]:
+    def _row(sid: str, *, active: bool, require_usage: bool = True) -> Optional[dict[str, Any]]:
         d = by_id.get(sid)
         if d is None:
             return None
-        if not session_has_usage(d):
+        if require_usage and not session_has_usage(d):
             return None
         updates = d / "updates.jsonl"
         try:
@@ -282,13 +293,21 @@ def list_sessions_for_ui() -> list[dict[str, Any]]:
             out.append(row)
             seen.add(sid)
 
-    # Other sessions with updates, newest first (cap for UI)
-    rest = [d for d in dirs if d.name not in seen]
-    rest.sort(key=lambda d: (d / "updates.jsonl").stat().st_mtime, reverse=True)
-    for d in rest[:30]:
-        row = _row(d.name, active=False)
+    # Always surface the pinned /telemetry session even if not in active list yet.
+    if focus and focus not in seen:
+        row = _row(focus, active=focus in set(active_ids), require_usage=False)
         if row:
-            out.append(row)
+            out.insert(0, row)
+            seen.add(focus)
+
+    # Other sessions with updates, newest first (cap for UI)
+    if recent_limit > 0:
+        rest = [d for d in dirs if d.name not in seen]
+        rest.sort(key=lambda d: (d / "updates.jsonl").stat().st_mtime, reverse=True)
+        for d in rest[:recent_limit]:
+            row = _row(d.name, active=False)
+            if row:
+                out.append(row)
 
     return out
 

@@ -75,7 +75,7 @@ if ($env:GROK_SESSION_ID) { $argList += @("--session-id", $env:GROK_SESSION_ID) 
 & $py @argList
 ```
 
-The launcher **always kills** whatever is listening on port **8765**, then starts a clean detached instance and opens the browser.
+The launcher **always kills** whatever is listening on port **8765**, then starts a clean detached instance (Windows: survives the agent Job Object), **pins `GROK_SESSION_ID` when set**, opens `http://127.0.0.1:8765/?session=<id>`, and does **not** rebuild every session on disk at startup.
 
 ## Reply
 
