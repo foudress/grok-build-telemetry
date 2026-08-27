@@ -19,6 +19,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 -
 
+## [1.0.2] — 2026-08-27
+
+Period (D/W/M) correctness, session-open reliability, and calc progress UX.
+Package **1.0.2**.
+
+### Added
+
+- **SSE aggregate progress**: `GET /api/aggregate?stream=1` emits `progress`
+  `{done,total,cold}` then a final `result` event (connection closes after).
+- **Period loaders**: full-page spinner with `X/N` on first D/W/M paint; chart-local
+  overlay when a grain/rate change must **rebuild** attr calc-cache (`cold > 0`).
+  Warm cache switches skip the graph spinner.
+- `is_attr_warm()` preflight so the client knows whether a refetch will write cache.
+
+### Fixed
+
+- **Total All $** on D/W/M used `official_usd` instead of the sum of the three I/O
+  cards (`cost_in + cost_cached + cost_out`).
+- **Cumulative → By label** re-summed cumulative prefixes and massively overestimated
+  every label; by-label now always uses observation-window buckets.
+- **Open session from D/W/M** could leave the UI stuck on the loader: parallel
+  `/api/state` vs `POST /api/session`, case-sensitive `__pendingSid`, and no
+  guaranteed `endViewLoad`. Catch-up now yields the monitor lock between jsonl
+  chunks so HTTP is not wedged for the whole replay.
+- **Chart loader loop**: 1s period poll re-streamed the same aggregate and flashed
+  `0→N` forever; quiet polls skip when params are unchanged.
+- **Total Cached** accent bar missing in D/W/M (collision with the session Official
+  flip card). Period flattens kpi2 to a normal amber KPI; session flip restored on
+  leave.
+
+### Changed
+
+- Period refetch is dirty-keyed (`scope|offset|grain|stack|rate`); interval ticks
+  no longer invalidate an in-flight monthly aggregate.
+- `__version__` / package metadata aligned at **1.0.2**.
+
 ## [1.0.1] — 2026-08-26
 
 `/telemetry` reliability on Windows + pin the calling Grok session + faster first paint.

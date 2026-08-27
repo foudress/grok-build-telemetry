@@ -69,6 +69,64 @@ class Handler(BaseHTTPRequestHandler):
         ).encode("utf-8")
         self._send(503, body, "application/json; charset=utf-8")
 
+    def _sse_write(self, event: str, data: dict[str, Any]) -> bool:
+        """Write one SSE event. Returns False if the client went away."""
+        try:
+            payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+            self.wfile.write(f"event: {event}\ndata: {payload}\n\n".encode("utf-8"))
+            self.wfile.flush()
+            return True
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError):
+            return False
+
+    def _stream_aggregate(
+        self,
+        period: str,
+        offset: int,
+        grain: str,
+        *,
+        stack: str,
+        rate: bool,
+    ) -> None:
+        """SSE: progress events ({done,total}) then a final result event."""
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            # Close after the final event so fetch() streams end (no hang on keep-alive).
+            self.send_header("Connection", "close")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError):
+            return
+        self.close_connection = True
+
+        alive = True
+
+        def on_progress(done: int, total: int, cold: int = 0) -> None:
+            nonlocal alive
+            if not alive:
+                return
+            alive = self._sse_write(
+                "progress",
+                {"done": int(done), "total": int(total), "cold": int(cold)},
+            )
+
+        try:
+            payload = build_aggregate(
+                period, offset, grain, stack=stack, rate=rate, on_progress=on_progress
+            )
+        except Exception as exc:  # noqa: BLE001
+            if alive:
+                self._sse_write("error", {"error": f"{type(exc).__name__}: {exc}"})
+            return
+        if alive:
+            try:
+                self._sse_write("result", payload)
+            except Exception as exc:  # noqa: BLE001
+                self._sse_write("error", {"error": f"{type(exc).__name__}: {exc}"})
+
     def do_OPTIONS(self) -> None:  # noqa: N802
         self._send(204, b"", "text/plain")
 
@@ -172,10 +230,15 @@ class Handler(BaseHTTPRequestHandler):
             stack = (qs.get("stack") or ["io"])[0]
             rate_raw = (qs.get("rate") or ["0"])[0]
             rate = str(rate_raw).strip().lower() in ("1", "true", "yes", "on")
+            stream_raw = (qs.get("stream") or ["0"])[0]
+            stream = str(stream_raw).strip().lower() in ("1", "true", "yes", "on")
             try:
                 offset = int((qs.get("offset") or ["0"])[0])
             except ValueError:
                 offset = 0
+            if stream:
+                self._stream_aggregate(period, offset, grain, stack=stack, rate=rate)
+                return
             try:
                 payload = build_aggregate(period, offset, grain, stack=stack, rate=rate)
             except Exception as exc:  # noqa: BLE001

@@ -358,14 +358,13 @@ class SessionMonitor:
             if not session_id:
                 self.pinned_session_id = None
                 d = resolve_session_dir()
-                if d:
-                    self._attach_unlocked(d, pin=False)
-                    self._catch_up_unlocked()
-                    return {"ok": True, "session_id": d.name, "pinned": False}
-                return {"ok": False, "error": "no session available"}
+                if not d:
+                    return {"ok": False, "error": "no session available"}
+                self._attach_unlocked(d, pin=False)
+                out = {"ok": True, "session_id": d.name, "pinned": False}
             # /telemetry opens ?session= after the server already pinned that id.
             # Re-attach + full catch-up would replay the same jsonl twice.
-            if (
+            elif (
                 self.pinned_session_id == session_id
                 and self.session_id == session_id
                 and self.session_dir is not None
@@ -378,14 +377,16 @@ class SessionMonitor:
                     "pinned": True,
                     "already": True,
                 }
-            d = resolve_session_dir(session_id)
-            if not d:
-                return {"ok": False, "error": f"unknown session {session_id}"}
-            self._attach_unlocked(d, pin=True)
-            # Drain the whole jsonl before the UI paints — otherwise each poll
-            # chunk (+ mid-file compacts) flashes as a new "loading wave".
-            self._catch_up_unlocked()
-            return {"ok": True, "session_id": d.name, "pinned": True}
+            else:
+                d = resolve_session_dir(session_id)
+                if not d:
+                    return {"ok": False, "error": f"unknown session {session_id}"}
+                self._attach_unlocked(d, pin=True)
+                out = {"ok": True, "session_id": d.name, "pinned": True}
+        # Drain outside the attach critical section: release between chunks so
+        # concurrent /api/state is not wedged for the whole replay (D/W/M open).
+        self._catch_up_yielding()
+        return out
 
     def rebuild_current(self) -> dict[str, Any]:
         """Drop RAM hierarchy and replay updates.jsonl (Reset calc).
@@ -402,11 +403,36 @@ class SessionMonitor:
                 return {"rebuilt": False, "session_id": None}
             pin = self.pinned_session_id is not None
             self._attach_unlocked(d, pin=pin)
-            self._catch_up_unlocked()
+            sid = self.session_id
+        self._catch_up_yielding()
+        with self.lock:
             self._snap_bytes = None
             self._snap_rev = -1
             self._snap_sig_key = None
-            return {"rebuilt": True, "session_id": self.session_id}
+            return {"rebuilt": True, "session_id": sid}
+
+    def _catch_up_yielding(self) -> None:
+        """Drain updates.jsonl; release the monitor lock between chunks."""
+        for _ in range(256):
+            with self.lock:
+                path = self._updates_path
+                if path is None or not path.is_file():
+                    return
+                try:
+                    size = path.stat().st_size
+                except OSError:
+                    return
+                if int(self._updates_offset) >= int(size):
+                    self._catch_up_children_unlocked()
+                    return
+                before = self._updates_offset
+                self.tick()
+                if self._updates_offset <= before:
+                    self._catch_up_children_unlocked()
+                    return
+            # Lock released — other HTTP handlers can snapshot mid-catch-up.
+        with self.lock:
+            self._catch_up_children_unlocked()
 
     def _catch_up_unlocked(self) -> None:
         """Drain updates.jsonl past MAX_READ_CHUNK (lock already held)."""

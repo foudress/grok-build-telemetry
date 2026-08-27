@@ -602,3 +602,44 @@ def test_rate_full_includes_flag(tmp_path, monkeypatch):
     hot = build_aggregate("daily", 0, rate=True, now=now)
     assert hot.get("rate_full") is True
     assert hot["tps_sessions"][0]["v"] == 12.5
+
+
+def test_build_aggregate_progress_callback(tmp_path, monkeypatch):
+    now = _aware(2026, 8, 14, 18, 0)
+    day0 = datetime(2026, 8, 14, tzinfo=timezone.utc)
+    t10 = (day0 + timedelta(hours=10, minutes=5)).timestamp()
+    _write_session(
+        tmp_path,
+        "prog1111-0000-0000-0000-000000000001",
+        [(t10, 1000, 200, 50)],
+        title="Prog A",
+    )
+    _write_session(
+        tmp_path,
+        "prog2222-0000-0000-0000-000000000002",
+        [(t10, 2000, 100, 20)],
+        title="Prog B",
+    )
+    monkeypatch.setattr(agg_mod, "list_session_dirs", lambda: list(tmp_path.iterdir()))
+    _file_cache.clear()
+    ticks = []
+    cold_ticks = []
+
+    def on_prog(d, t, cold=None):
+        ticks.append((d, t))
+        if cold is not None:
+            cold_ticks.append(cold)
+
+    out = build_aggregate("daily", 0, now=now, on_progress=on_prog)
+    assert ticks[0] == (0, 2)
+    assert ticks[-1] == (2, 2)
+    assert [t[0] for t in ticks] == [0, 1, 2]
+    assert out["session_count"] == 2
+    # First ping reports how many attr rebuilds are needed.
+    assert cold_ticks and cold_ticks[0] >= 0
+
+    # Second pass should be warm (disk/mem calc-cache) → cold=0.
+    ticks.clear()
+    cold_ticks.clear()
+    build_aggregate("daily", 0, now=now, on_progress=on_prog)
+    assert cold_ticks and cold_ticks[0] == 0

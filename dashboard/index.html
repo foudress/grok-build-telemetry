@@ -40,7 +40,7 @@
   </header>
   <div id="viewLoader" class="view-loader" hidden>
     <span class="spinner" aria-hidden="true"></span>
-    <span class="view-loader-lab">Loading…</span>
+    <span class="view-loader-lab" id="viewLoaderLab">Loading…</span>
   </div>
   <div id="statusBanner" class="status-banner" hidden></div>
 
@@ -176,6 +176,10 @@
         <canvas id="costYAxis" class="cost-yaxis" hidden></canvas>
         <div class="chart-scroll" id="costChartScroll">
           <canvas id="costChart" class="bars" height="320"></canvas>
+        </div>
+        <div id="costChartLoader" class="chart-loader" hidden>
+          <span class="spinner spinner-sm" aria-hidden="true"></span>
+          <span class="chart-loader-lab">Calculating… <span id="costChartProg" class="chart-loader-prog">0/0</span></span>
         </div>
         <div id="costTip" class="chart-tip" role="tooltip"></div>
         <button type="button" id="chartResize" class="chart-resize" title="Drag to resize" aria-label="Resize chart">

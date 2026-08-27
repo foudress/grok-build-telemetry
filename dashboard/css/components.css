@@ -263,8 +263,57 @@
 
 body.scope-period #kpi1.card::before { background: var(--green); }
 body.scope-period #kpi1 .value { color: var(--green); }
-body.scope-period #kpi2.card::before { background: var(--amber); }
-body.scope-period #kpi2 .value { color: var(--amber); }
+/*
+ * kpi2 is a session flip-card (transparent shell, accent on .card-face).
+ * In D/W/M it becomes Total Cached — flatten to a normal KPI so the amber
+ * left bar matches In / Out / All (flip chrome otherwise hides shell ::before).
+ */
+body.scope-period #kpi2.card.card-flip {
+  cursor: default;
+  perspective: none;
+  padding: var(--space-3) var(--space-3) var(--space-3) var(--space-4);
+  min-height: 0;
+  overflow: hidden;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-xs);
+}
+body.scope-period #kpi2.card.card-flip::before {
+  display: block;
+  background: var(--amber);
+}
+body.scope-period #kpi2.card.card-flip:hover {
+  background: var(--panel-hover);
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-sm);
+}
+body.scope-period #kpi2 .card-flip-inner {
+  transform: none !important;
+  min-height: 0;
+  height: auto;
+}
+body.scope-period #kpi2 .card-face {
+  position: static;
+  inset: auto;
+  transform: none !important;
+  backface-visibility: visible;
+  -webkit-backface-visibility: visible;
+  border: none;
+  box-shadow: none;
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+  overflow: visible;
+}
+body.scope-period #kpi2 .card-face::before {
+  display: none;
+}
+body.scope-period #kpi2 .card-face-back {
+  display: none !important;
+}
+body.scope-period #kpi2 .value {
+  color: var(--amber);
+}
 body.scope-period #kpi3.card::before { background: var(--rose); }
 body.scope-period #kpi3 .value { color: var(--rose); }
 body.scope-period #kpi4.card::before { background: var(--accent); }

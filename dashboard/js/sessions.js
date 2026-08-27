@@ -9,6 +9,18 @@ let _pollRef = null;
 /** @type {null | Record<string, any>} */
 let _lastStateRef = null;
 
+function beginViewLoad() {
+  document.body.classList.add("is-loading");
+  const el = document.getElementById("viewLoader");
+  if (el) el.hidden = false;
+}
+
+function endViewLoad() {
+  document.body.classList.remove("is-loading");
+  const el = document.getElementById("viewLoader");
+  if (el) el.hidden = true;
+}
+
 export function bindPoll(fn) {
   _pollRef = fn;
 }
@@ -165,10 +177,9 @@ function fillSessionSelect(state) {
 
 async function switchSession(sessionId) {
   _sessionSwitching = true;
-  window.__pendingSid = sessionId || null;
-  document.body.classList.add("is-loading");
-  const loader = document.getElementById("viewLoader");
-  if (loader) loader.hidden = false;
+  window.__sessionSwitching = true;
+  window.__pendingSid = sessionId ? String(sessionId) : null;
+  beginViewLoad();
   try {
     const r = await fetch("/api/session", {
       method: "POST",
@@ -180,13 +191,30 @@ async function switchSession(sessionId) {
       console.warn("session switch failed", res);
       $("liveBadge").textContent = "switch err";
       $("liveBadge").className = "badge warn";
+      window.__pendingSid = null;
+      endViewLoad();
+      return;
     }
+    // Prefer server-resolved id so pending checks match /api/state.
+    if (res.session_id) window.__pendingSid = String(res.session_id);
     _lastSessionOptsKey = "";
-    if (_pollRef) await _pollRef();
+    if (_pollRef) {
+      await _pollRef();
+      // If a parallel poll was in flight, the await can return without paint.
+      for (let i = 0; i < 40 && window.__pendingSid; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        await _pollRef();
+      }
+    }
   } catch (e) {
     console.warn(e);
+    window.__pendingSid = null;
   } finally {
     _sessionSwitching = false;
+    window.__sessionSwitching = false;
+    // Never leave the period→session spinner up if paint was skipped.
+    if (window.__pendingSid) window.__pendingSid = null;
+    endViewLoad();
   }
 }
 

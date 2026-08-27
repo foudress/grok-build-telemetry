@@ -39,6 +39,23 @@ let _pollRef = null;
 let _lastAgg = null;
 let _ganttSel = new Set();
 let _periodReturn = null;
+/** @type {AbortController | null} */
+let _aggAbort = null;
+/** @type {"full" | "chart" | null} */
+let _aggLoadMode = null;
+/** Last successfully painted aggregate key (scope|offset|grain|stack|rate). */
+let _aggKey = "";
+/** True when scope/grain/offset/rate changed and needs a fresh fetch + loader. */
+let _aggDirty = true;
+/**
+ * Chart refetch waiting on first SSE progress: show loader only if cold>0
+ * (attr cache miss / rebuild). Warm cache → no spinner.
+ */
+let _chartLoaderAwaitCold = false;
+
+function aggRequestKey() {
+  return [_scope, _offset, _grain, _stack, _rate ? 1 : 0].join("|");
+}
 
 export function bindPeriodPoll(fn) {
   _pollRef = fn;
@@ -237,7 +254,33 @@ function applyScopeChrome() {
   }
 }
 
+function setAggProgress(done, total, meta) {
+  const n = Math.max(0, Number(done) || 0);
+  const t = Math.max(0, Number(total) || 0);
+  const text = t > 0 ? `${n}/${t}` : "";
+  // Chart-option refetch: spinner only when at least one session rebuilds cache.
+  if (_chartLoaderAwaitCold) {
+    _chartLoaderAwaitCold = false;
+    const cold = meta && meta.cold != null ? Number(meta.cold) : 0;
+    if (cold > 0) beginChartLoad();
+  }
+  const lab = $("viewLoaderLab");
+  // Only rewrite the full-page label once aggregate progress starts (keep
+  // "Loading…" for session switches / cache reset).
+  if (lab && _aggLoadMode === "full" && t > 0) {
+    lab.innerHTML = `Calculating sessions… <span class="view-loader-prog">${text}</span>`;
+  }
+  const cp = $("costChartProg");
+  if (cp) cp.textContent = text || "…";
+}
+
 export function beginViewLoad() {
+  endChartLoad();
+  _aggLoadMode = "full";
+  const lab = $("viewLoaderLab");
+  if (lab) lab.textContent = "Loading…";
+  const cp = $("costChartProg");
+  if (cp) cp.textContent = "…";
   document.body.classList.add("is-loading");
   const el = $("viewLoader");
   if (el) el.hidden = false;
@@ -247,6 +290,33 @@ export function endViewLoad() {
   document.body.classList.remove("is-loading");
   const el = $("viewLoader");
   if (el) el.hidden = true;
+  if (_aggLoadMode === "full") _aggLoadMode = null;
+}
+
+export function beginChartLoad() {
+  // Prefer chart-local spinner when period data is already on screen.
+  endViewLoad();
+  _aggLoadMode = "chart";
+  const cp = $("costChartProg");
+  if (cp) cp.textContent = "…";
+  const el = $("costChartLoader");
+  if (el) el.hidden = false;
+  const wrap = $("costChartWrap");
+  if (wrap) wrap.classList.add("is-chart-loading");
+}
+
+export function endChartLoad() {
+  const el = $("costChartLoader");
+  if (el) el.hidden = true;
+  const wrap = $("costChartWrap");
+  if (wrap) wrap.classList.remove("is-chart-loading");
+  if (_aggLoadMode === "chart") _aggLoadMode = null;
+}
+
+function endAggLoaders() {
+  endChartLoad();
+  endViewLoad();
+  _aggLoadMode = null;
 }
 
 function syncPeriodBack() {
@@ -273,7 +343,9 @@ export function openSessionFromPeriod(sid) {
     };
   }
   beginViewLoad();
-  setScope("session");
+  // Do not kick a parallel /api/state poll before POST /api/session finishes —
+  // that race left is-loading stuck when __pendingSid never matched.
+  setScope("session", { poll: false });
   const want = String(sid || "").toLowerCase();
   const row = (_lastAgg && _lastAgg.sessions || []).find(
     (s) => String(s.session_id || "").toLowerCase() === want
@@ -308,16 +380,22 @@ export function restorePeriodReturn() {
   _mode = AGG_MODES.has(snap.mode) ? snap.mode : "timeframe";
   _stack = snap.stack || "io";
   _byLabel = !!snap.byLabel;
+  _aggDirty = true;
+  _aggKey = "";
   persist();
   applyScopeChrome();
   if (_pollRef) _pollRef();
 }
 
-export function setScope(scope) {
+export function setScope(scope, opts = {}) {
   const next = PERIODS.has(scope) || scope === "session" ? scope : "session";
   if (next !== _scope) {
     beginViewLoad();
-    if (PERIODS.has(next)) _periodReturn = null;
+    if (PERIODS.has(next)) {
+      _periodReturn = null;
+      _aggDirty = true;
+      _aggKey = "";
+    }
     _scope = next;
     _offset = 0;
     _grain = normalizeGrain(_scope, _grain);
@@ -327,13 +405,27 @@ export function setScope(scope) {
   }
   persist();
   applyScopeChrome();
+  if (opts.poll === false) return;
   if (_pollRef) _pollRef();
 }
 
-function requestAggFetch({ showLoader = true } = {}) {
-  // Grain / date tweaks with an existing period payload are warm calc-cache —
-  // keep the chart up and skip the full-page spinner flash.
-  if (showLoader) beginViewLoad();
+function requestAggFetch({ mode } = {}) {
+  // Full-page on first period paint; chart overlay only if SSE reports cold cache work.
+  _aggDirty = true;
+  // Abort any quiet/in-flight stream so a grain switch does not paint stale data.
+  if (_aggAbort) {
+    try { _aggAbort.abort(); } catch { /* ignore */ }
+    _aggAbort = null;
+  }
+  const m = mode || (_lastAgg ? "chart" : "full");
+  if (m === "chart") {
+    endChartLoad();
+    _aggLoadMode = null;
+    _chartLoaderAwaitCold = true;
+  } else {
+    _chartLoaderAwaitCold = false;
+    beginViewLoad();
+  }
   if (_pollRef) _pollRef();
 }
 
@@ -341,14 +433,14 @@ function setOffset(delta) {
   _offset += delta;
   if (_offset > 0) _offset = 0;
   applyScopeChrome();
-  requestAggFetch({ showLoader: !_lastAgg });
+  requestAggFetch();
 }
 
 function setGrain(g) {
   _grain = normalizeGrain(_scope, g);
   persist();
   applyScopeChrome();
-  requestAggFetch({ showLoader: !_lastAgg });
+  requestAggFetch();
 }
 
 function setMode(m) {
@@ -375,16 +467,22 @@ function paintCards(tot) {
   const s2 = $("costOfficialSub");
   const s3 = $("costEstimateSub");
   const s4 = $("genRateSub");
+  const allUsd =
+    (Number(tot.cost_in_usd) || 0)
+    + (Number(tot.cost_cached_usd) || 0)
+    + (Number(tot.cost_out_usd) || 0);
   if (s1) { s1.textContent = fmtUsd(tot.cost_in_usd); s1.className = "sub"; }
   if (s2) { s2.textContent = fmtUsd(tot.cost_cached_usd); s2.className = "sub"; }
   if (s3) { s3.textContent = fmtUsd(tot.cost_out_usd); s3.className = "sub"; }
-  if (s4) { s4.textContent = fmtUsd(tot.official_usd); s4.className = "sub"; }
-  // Period reuses kpi2 — disable session flip chrome.
+  // Match the three I/O cards (not official API bill, which can diverge).
+  if (s4) { s4.textContent = fmtUsd(allUsd); s4.className = "sub"; }
+  // Period reuses kpi2 — disable session flip chrome; amber = Cached.
   const kpi2 = $("kpi2");
   if (kpi2) {
-    kpi2.classList.add("card-flip-off");
-    kpi2.classList.remove("is-flipped");
+    kpi2.classList.add("card-flip-off", "amber");
+    kpi2.classList.remove("is-flipped", "green");
     kpi2.setAttribute("aria-pressed", "false");
+    kpi2.removeAttribute("title");
     kpi2.tabIndex = -1;
   }
 }
@@ -405,7 +503,9 @@ export function leavePeriodView() {
   hideAllChartTips();
   const kpi2 = $("kpi2");
   if (kpi2) {
-    kpi2.classList.remove("card-flip-off");
+    kpi2.classList.remove("card-flip-off", "amber");
+    kpi2.classList.add("green");
+    kpi2.title = "Flip: implied $/M ↔ session tokens";
     kpi2.tabIndex = 0;
   }
 }
@@ -629,20 +729,117 @@ function showPeriodError(msg) {
   if (tree) tree.innerHTML = `<div class="sess-empty">${esc(msg)}</div>`;
 }
 
+async function readAggregateSse(response, onProgress) {
+  if (!response.body || typeof response.body.getReader !== "function") {
+    // Extremely old engines — fall back to buffering the whole SSE body.
+    const text = await response.text();
+    let result = null;
+    for (const block of text.split("\n\n")) {
+      let event = "message";
+      let data = "";
+      for (const line of block.split("\n")) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("data:")) data += (data ? "\n" : "") + line.slice(5).trimStart();
+      }
+      if (!data) continue;
+      const obj = JSON.parse(data);
+      if (event === "progress" && onProgress) onProgress(obj.done, obj.total, obj);
+      else if (event === "result") result = obj;
+      else if (event === "error") throw new Error(obj.error || "aggregate error");
+    }
+    return result;
+  }
+  const reader = response.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  let result = null;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let sep;
+    while ((sep = buf.indexOf("\n\n")) >= 0) {
+      const block = buf.slice(0, sep);
+      buf = buf.slice(sep + 2);
+      let event = "message";
+      let data = "";
+      for (const line of block.split("\n")) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("data:")) data += (data ? "\n" : "") + line.slice(5).trimStart();
+      }
+      if (!data) continue;
+      let obj;
+      try { obj = JSON.parse(data); } catch { continue; }
+      if (event === "progress" && onProgress) onProgress(obj.done, obj.total, obj);
+      else if (event === "result") result = obj;
+      else if (event === "error") throw new Error(obj.error || "aggregate error");
+    }
+  }
+  return result;
+}
+
 export async function fetchPeriod() {
+  const reqKey = aggRequestKey();
+  // Quiet 1s poll: same period params already on screen — do not restream / flash loader.
+  if (!_aggDirty && _lastAgg && reqKey === _aggKey) {
+    return;
+  }
+
   const badge = $("liveBadge");
   if (badge && !_lastAgg) {
     badge.textContent = "loading";
     badge.className = "badge idle";
   }
+  // Loader: full-page on first paint; chart overlay deferred until SSE cold>0.
+  if (_aggDirty && !_aggLoadMode && !_chartLoaderAwaitCold) {
+    if (_lastAgg) beginChartLoad();
+    else beginViewLoad();
+  }
+  if (_aggAbort) {
+    try { _aggAbort.abort(); } catch { /* ignore */ }
+  }
+  _aggAbort = new AbortController();
+  const signal = _aggAbort.signal;
   // rate=1 when user is on tok/s (includes sub-agent points). Otherwise still
   // returns Parts/Tools cats + mains tps so stack switches stay local.
-  const url = `/api/aggregate?period=${encodeURIComponent(_scope)}&offset=${_offset}&grain=${encodeURIComponent(_grain)}&stack=${encodeURIComponent(_stack)}&rate=${_rate ? "1" : "0"}&_=${Date.now()}`;
-  const r = await fetch(url);
-  if (!r.ok) throw new Error("HTTP " + r.status);
-  const agg = await r.json();
-  if (!isPeriodScope()) return;
+  const url = `/api/aggregate?period=${encodeURIComponent(_scope)}&offset=${_offset}&grain=${encodeURIComponent(_grain)}&stack=${encodeURIComponent(_stack)}&rate=${_rate ? "1" : "0"}&stream=1&_=${Date.now()}`;
+  let agg = null;
+  try {
+    const r = await fetch(url, { signal });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const ctype = (r.headers.get("content-type") || "").toLowerCase();
+    if (ctype.includes("text/event-stream")) {
+      agg = await readAggregateSse(r, setAggProgress);
+    } else {
+      agg = await r.json();
+    }
+  } catch (e) {
+    if (e && e.name === "AbortError") return;
+    _chartLoaderAwaitCold = false;
+    endAggLoaders();
+    throw e;
+  }
+  if (!isPeriodScope()) {
+    _chartLoaderAwaitCold = false;
+    endAggLoaders();
+    return;
+  }
+  // Params changed while this stream ran — keep dirty; a follow-up poll will refetch.
+  if (aggRequestKey() !== reqKey) {
+    _aggDirty = true;
+    return;
+  }
+  if (!agg || agg.error) {
+    _chartLoaderAwaitCold = false;
+    endAggLoaders();
+    throw new Error((agg && agg.error) || "empty aggregate");
+  }
   paintPeriod(agg);
+  _aggKey = reqKey;
+  _aggDirty = false;
+  _chartLoaderAwaitCold = false;
+  // Hide chart-local overlay immediately; full-page spinner is cleared by poll().
+  endChartLoad();
   // endViewLoad left to poll() so a superseded in-flight fetch does not hide the spinner.
 }
 

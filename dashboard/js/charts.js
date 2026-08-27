@@ -3465,7 +3465,9 @@ function drawAggBars(canvas, buckets, opts) {
   const stack = (opts && opts.stack) || "io";
   const prev = window.__aggChart || {};
   const hidden = prev.hiddenLegend instanceof Set ? prev.hiddenLegend : new Set();
-  let src = cumulative ? _cumBuckets(buckets) : (buckets || []).slice();
+  // By-label must use observation-window buckets only. Cumulative prefixes would
+  // be re-summed across bars and massively overestimate every label.
+  let src = (cumulative && !byLabel) ? _cumBuckets(buckets) : (buckets || []).slice();
   // By-label collapses to one segment per bar — skip 100% stack (all bars = 100%).
   const doNorm = normalized && !byLabel;
   const segsFromCats = (list) => (list || []).map((s) => ({

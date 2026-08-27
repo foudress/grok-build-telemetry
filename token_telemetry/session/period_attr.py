@@ -429,6 +429,31 @@ def extract_session_events(session_dir: Path) -> list[dict[str, Any]]:
     return events
 
 
+def is_attr_warm(session_dir: Path) -> bool:
+    """True if attr events are already in mem or disk calc-cache (no rebuild)."""
+    from token_telemetry.session.calc_cache import code_sig
+
+    path = session_dir / "updates.jsonl"
+    key = str(path)
+    try:
+        st = path.stat()
+        mtime, size = st.st_mtime, st.st_size
+    except OSError:
+        return True
+    sig = code_sig()
+    with _lock:
+        hit = _attr_cache.get(key)
+        if (
+            hit
+            and hit.get("mtime") == mtime
+            and hit.get("size") == size
+            and hit.get("code") == sig
+        ):
+            return True
+    blob = load_calc(session_dir)
+    return bool(blob is not None and "events" in blob)
+
+
 def cached_attr_events(session_dir: Path) -> list[dict[str, Any]]:
     from token_telemetry.session.calc_cache import code_sig
 

@@ -2,7 +2,7 @@
 
 Live companion dashboard for **[Grok Build](https://x.ai)** sessions: exact token fields Grok already writes, cache vs uncached split, official `$` ticks, and list-price estimates — outside the TUI.
 
-> Package: `token-telemetry` **v1.0.1** (`pip install -e .` / `token-telemetry` CLI).
+> Package: `token-telemetry` **v1.0.2** (`pip install -e .` / `token-telemetry` CLI).
 
 ```
 ~/.grok/sessions/.../updates.jsonl  ──tail──►  live dashboard  ──►  http://127.0.0.1:8765/
@@ -18,7 +18,7 @@ Live companion dashboard for **[Grok Build](https://x.ai)** sessions: exact toke
 - **Per-call cache** — last LLM call Cached = 0 (no harness after it). R1 ctx line is `0 → end`. R1 official Cached is shared across every call except last (Call 1 = System + User)
 - **Compact / Recap** — compact is Cached **or** In (miss) plus compressed **Out**; recaps and compacts keep trigger order. Compact continuation glue is not treated as the first user prompt
 - **Cost chart** — **I/O · Parts · Tools** stacks on rounds, drill, or **By label**. Recap stays In/Cached/Out in I/O; Parts/Tools fold it. Wheel-zoom only on the X-axis (full unzoom by default). Sub-agent $ stacks on the parent (violet)
-- **Daily / Weekly / Monthly** — same I/O · Parts · Tools. Parts/Tools use our hierarchy cats, bucketed by each turn’s time (not the whole session). Timeframe / Cumulative / **Normalized**; grains including **Session**. Session list is parent → sub-agent. Titles from `summary.json` `session_summary` (UTF-8 BOM-safe). **← Back** returns from a session opened out of a period. Closed sessions are **cached on disk**; **Reset calc** forces a full recompute
+- **Daily / Weekly / Monthly** — same I/O · Parts · Tools. Parts/Tools use our hierarchy cats, bucketed by each turn’s time (not the whole session). Timeframe / Cumulative / **Normalized**; grains including **Session**. Session list is parent → sub-agent. Titles from `summary.json` `session_summary` (UTF-8 BOM-safe). **← Back** returns from a session opened out of a period. Closed sessions are **cached on disk**; **Reset calc** forces a full recompute. Long period calcs stream **`X/N` progress** (full-page or chart-local); warm cache option switches skip the graph spinner. Total All `$` matches In+Cached+Out; By label always uses the observation window (not Cumulative prefixes)
 - Session picker shows the summary title (not the UUID) in the header
 - **Sub-agents** — child sessions are peeled out of the parent LLM-call math, then shown as tabs + Sub Agent N rows (In / Cached / Out / $). **Sub Agent N Sys** sits after the spawn LLM (In = copy of that tab’s System header; display-only, not Round 2 In). Click the line to open the tab; **Sub Agent N RN** opens Round N. `get_command` In is the parent-facing tool_result body. First-round prompt is **Super Agent** (not User / not System Other), including resume tabs. Period totals skip child dirs (parent bill already includes them)
 - **Context over time** chart (200k rate-cliff line) — Session view only

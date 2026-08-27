@@ -73,6 +73,12 @@ header {
   font-size: var(--font-size-sm);
 }
 .view-loader[hidden] { display: none !important; }
+.view-loader-prog,
+.chart-loader-prog {
+  font-variant-numeric: tabular-nums;
+  color: #cfe6ff;
+  font-weight: 600;
+}
 
 body.is-loading main {
   opacity: 0.18;
@@ -87,6 +93,11 @@ body.is-loading main {
   border-top-color: #7ec8ff;
   border-radius: 50%;
   animation: spin 0.7s linear infinite;
+}
+.spinner.spinner-sm {
+  width: 22px;
+  height: 22px;
+  border-width: 2px;
 }
 
 @keyframes spin {

@@ -12,7 +12,7 @@ import threading
 from calendar import monthrange
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from token_telemetry.session.discover import (
     _parse_iso_to_epoch,
@@ -21,7 +21,11 @@ from token_telemetry.session.discover import (
     pick_session_title,
 )
 from token_telemetry.session.calc_cache import code_sig, load_calc, save_calc
-from token_telemetry.session.period_attr import cached_attr_events, clear_attr_mem
+from token_telemetry.session.period_attr import (
+    cached_attr_events,
+    clear_attr_mem,
+    is_attr_warm,
+)
 from token_telemetry.pricing.rates import normalize_model_id
 from token_telemetry.session.subagents import (
     UUID_RE,
@@ -943,6 +947,7 @@ def build_aggregate(
     now: Optional[datetime] = None,
     stack: str = "io",
     rate: bool = False,
+    on_progress: Optional[Callable[[int, int], None]] = None,
 ) -> dict[str, Any]:
     period = (period or "daily").strip().lower()
     if period not in ("daily", "weekly", "monthly"):
@@ -1000,6 +1005,56 @@ def build_aggregate(
             if c and c not in child_to_parent:
                 child_to_parent[c] = pid
 
+    def _turns_in_window(row: dict[str, Any]) -> int:
+        n = 0
+        for t in row.get("turns") or []:
+            ep = t.get("epoch")
+            if ep is None or ep < start_e or ep >= end_e:
+                continue
+            n += 1
+        return n
+
+    progress_total = sum(1 for row in files if _turns_in_window(row) > 0)
+    progress_done = 0
+
+    def _session_dir(row: dict[str, Any]) -> Optional[Path]:
+        d = Path(row.get("path") or "")
+        if not d.is_dir():
+            d = Path(str(row.get("updates") or ""))
+            if d.is_file():
+                d = d.parent
+        return d if d.is_dir() else None
+
+    # How many sessions will rebuild attr (cache miss → HierarchyBuilder + save).
+    cold = 0
+    for row in files:
+        if _turns_in_window(row) <= 0:
+            continue
+        billed = not is_subagent_kind(row.get("kind"))
+        if not (billed or want_rate or session_grain):
+            continue
+        d = _session_dir(row)
+        if d is not None and not is_attr_warm(d):
+            cold += 1
+
+    def _emit_progress(done: int, total: int, *, cold_n: Optional[int] = None) -> None:
+        if on_progress is None:
+            return
+        try:
+            if cold_n is None:
+                on_progress(done, total)
+            else:
+                on_progress(done, total, cold=cold_n)
+        except TypeError:
+            try:
+                on_progress(done, total)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    _emit_progress(0, progress_total, cold_n=cold)
+
     for row in files:
         kind = row.get("kind")
         billed = not is_subagent_kind(kind)
@@ -1029,13 +1084,8 @@ def build_aggregate(
         need_attr = billed or want_rate or session_grain
         if need_attr:
             try:
-                d = Path(row.get("path") or "")
-                if not d.is_dir():
-                    # recover from updates path
-                    d = Path(str(row.get("updates") or ""))
-                    if d.is_file():
-                        d = d.parent
-                if d.is_dir():
+                d = _session_dir(row)
+                if d is not None:
                     for ev in cached_attr_events(d):
                         ep = ev.get("epoch")
                         if ep is None or ep < start_e or ep >= end_e:
@@ -1157,6 +1207,8 @@ def build_aggregate(
                 **_round_acc(sess_acc),
             }
         )
+        progress_done += 1
+        _emit_progress(progress_done, progress_total, cold_n=cold)
 
     sessions = _order_sessions(sessions)
     # Parent API bill includes subs — peel latest linked kids so I/O matches

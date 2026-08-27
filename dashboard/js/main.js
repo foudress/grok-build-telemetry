@@ -904,10 +904,10 @@ let _pollAgain = false;
 
 async function poll() {
   if (_pollBusy) {
-    // Mode switch / offset while a fetch is in flight — queue one follow-up
-    // and invalidate the in-flight paint so we don't keep stale stack/rate.
+    // Queue one follow-up. For D/W/M, do not bump epoch on every 1s tick —
+    // that used to invalidate a long aggregate and retrigger the chart loader.
     _pollAgain = true;
-    _pollEpoch += 1;
+    if (!isPeriodScope()) _pollEpoch += 1;
     return;
   }
   _pollBusy = true;
@@ -924,11 +924,21 @@ async function poll() {
     if (!r.ok) throw new Error("HTTP " + r.status);
     const state = await r.json();
     if (epoch !== _pollEpoch) return;
-    if (typeof window.__pendingSid === "string" && window.__pendingSid
-      && state.session_id && state.session_id !== window.__pendingSid) {
-      return;
+    const pending = (typeof window.__pendingSid === "string" && window.__pendingSid)
+      ? String(window.__pendingSid)
+      : "";
+    if (pending && state.session_id
+      && String(state.session_id).toLowerCase() !== pending.toLowerCase()) {
+      // Still switching — retry ASAP; do not clear the loader here.
+      if (window.__sessionSwitching) {
+        _pollAgain = true;
+        return;
+      }
+      // Switch finished but ids still differ — paint anyway (avoid permanent spinner).
+      window.__pendingSid = null;
+    } else {
+      window.__pendingSid = null;
     }
-    window.__pendingSid = null;
     render(state);
     endViewLoad();
   } catch (e) {
@@ -1071,7 +1081,7 @@ $("sessionSelect")?.addEventListener("change", (ev) => {
       return;
     }
     beginViewLoad();
-    setScope("session");
+    setScope("session", { poll: false });
     switchSession(null);
     return;
   }
