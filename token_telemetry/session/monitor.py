@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
@@ -175,6 +176,53 @@ MAX_READ_CHUNK = 1_500_000  # bytes per tick when catching up
 API_ROUNDS = MAX_ROUNDS_RETAINED
 
 
+def _slim_wire(obj: Any) -> Any:
+    """Drop nulls / full user_text / plan step bodies before /api/state JSON.
+
+    Keeps the tree/chart fields the dashboard reads while cutting idle poll
+    allocation (browser re-parses this blob every second when unchanged).
+    """
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in obj.items():
+            if v is None:
+                continue
+            if k == "user_text":
+                continue
+            if k == "plan" and isinstance(v, dict):
+                steps_in = v.get("steps")
+                steps_out: list[dict[str, Any]] = []
+                if isinstance(steps_in, list):
+                    for s in steps_in:
+                        if not isinstance(s, dict):
+                            continue
+                        steps_out.append(
+                            {
+                                "n": s.get("n", s.get("id")),
+                                "status": s.get("status"),
+                            }
+                        )
+                plan: dict[str, Any] = {}
+                if v.get("is_plan") is not None:
+                    plan["is_plan"] = v.get("is_plan")
+                if v.get("mode") is not None:
+                    plan["mode"] = v.get("mode")
+                sc = v.get("step_count")
+                if sc is None and steps_out:
+                    sc = len(steps_out)
+                if sc is not None:
+                    plan["step_count"] = sc
+                if steps_out:
+                    plan["steps"] = steps_out
+                out[k] = plan
+                continue
+            out[k] = _slim_wire(v)
+        return out
+    if isinstance(obj, list):
+        return [_slim_wire(x) for x in obj]
+    return obj
+
+
 class _ChildWatch:
     """Incremental hierarchy for one sub-agent session under a parent."""
 
@@ -300,6 +348,7 @@ class SessionMonitor:
         # Cached /api/state payload (avoid re-json every browser poll)
         self._snap_rev: int = -1
         self._snap_bytes: Optional[bytes] = None
+        self._snap_etag: Optional[str] = None
         self._snap_sig_key: Optional[tuple] = None
         self._children: dict[str, "_ChildWatch"] = {}
 
@@ -346,6 +395,7 @@ class SessionMonitor:
         self.error = None
         self._snap_rev = -1
         self._snap_bytes = None
+        self._snap_etag = None
         self._snap_sig_key = None
         self._children = {}
         self.live["model"] = getattr(self.hierarchy, "_pricing_model", None)
@@ -398,6 +448,7 @@ class SessionMonitor:
             d = self.session_dir
             if d is None:
                 self._snap_bytes = None
+                self._snap_etag = None
                 self._snap_rev = -1
                 self._snap_sig_key = None
                 return {"rebuilt": False, "session_id": None}
@@ -407,6 +458,7 @@ class SessionMonitor:
         self._catch_up_yielding()
         with self.lock:
             self._snap_bytes = None
+            self._snap_etag = None
             self._snap_rev = -1
             self._snap_sig_key = None
             return {"rebuilt": True, "session_id": sid}
@@ -1310,54 +1362,70 @@ class SessionMonitor:
             kind = None
             if self.session_dir is not None:
                 kind = (read_session_summary(self.session_dir) or {}).get("session_kind")
-            payload = {
-                "watching": self.bootstrapped and self.error is None,
-                "error": self.error,
-                "session_id": self.session_id,
-                "session_kind": kind,
-                "pinned_session_id": self.pinned_session_id,
-                "follow_active": self.pinned_session_id is None,
-                "sessions": sessions,
-                "source": str(self.session_dir) if self.session_dir else None,
-                "live": dict(self.live),
-                "signals": _slim_signals(self.signals),
-                "turns": list(self.turns),
-                "rounds": rounds,
-                "sub_sessions": sub_sessions,
-                "context_series": list(self.context_series),
-                "feed": list(self.feed),
-                "totals": {
-                    "official_usd": round(official, 6),
-                    "estimate_usd": round(est, 6),
-                    "official_ticks": ticks_sum,
-                    "turns": len(self.turns),
-                    "parent_only_usd": round(parent_only, 6),
-                    "children_usd": round(children_official, 6),
-                    "parent_estimate_usd": round(parent_est, 6),
-                    "children_estimate_usd": round(children_est, 6),
-                    "combined_usd": round(official, 6),
-                    "subagent_count": len(sub_sessions),
-                    "gen_tokens_per_sec": _mean_round_tps(rounds_all),
-                },
-                "pricing": pricing_payload(
-                    model=getattr(self.hierarchy, "_pricing_model", None),
-                    models_raw=list(getattr(self.hierarchy, "_models_raw", None) or []),
-                    assumed=getattr(self.hierarchy, "_pricing_model", None) is None,
-                ),
-                "context_now_estimate_note": (
-                    "Context card uses signals.contextTokensUsed (TUI-aligned). "
-                    f"Current context {ctx} → tier {pick_tier(ctx or 0)['name']}."
-                    if ctx is not None
-                    else None
-                ),
-            }
+            payload = _slim_wire(
+                {
+                    "watching": self.bootstrapped and self.error is None,
+                    "error": self.error,
+                    "session_id": self.session_id,
+                    "session_kind": kind,
+                    "pinned_session_id": self.pinned_session_id,
+                    "follow_active": self.pinned_session_id is None,
+                    "sessions": sessions,
+                    "source": str(self.session_dir) if self.session_dir else None,
+                    "live": dict(self.live),
+                    "signals": _slim_signals(self.signals),
+                    "turns": list(self.turns),
+                    "rounds": rounds,
+                    "sub_sessions": sub_sessions,
+                    "context_series": list(self.context_series),
+                    "feed": list(self.feed),
+                    "totals": {
+                        "official_usd": round(official, 6),
+                        "estimate_usd": round(est, 6),
+                        "official_ticks": ticks_sum,
+                        "turns": len(self.turns),
+                        "parent_only_usd": round(parent_only, 6),
+                        "children_usd": round(children_official, 6),
+                        "parent_estimate_usd": round(parent_est, 6),
+                        "children_estimate_usd": round(children_est, 6),
+                        "combined_usd": round(official, 6),
+                        "subagent_count": len(sub_sessions),
+                        "gen_tokens_per_sec": _mean_round_tps(rounds_all),
+                    },
+                    "pricing": pricing_payload(
+                        model=getattr(self.hierarchy, "_pricing_model", None),
+                        models_raw=list(getattr(self.hierarchy, "_models_raw", None) or []),
+                        assumed=getattr(self.hierarchy, "_pricing_model", None) is None,
+                    ),
+                    "context_now_estimate_note": (
+                        "Context card uses signals.contextTokensUsed (TUI-aligned). "
+                        f"Current context {ctx} → tier {pick_tier(ctx or 0)['name']}."
+                        if ctx is not None
+                        else None
+                    ),
+                    "revision": rev,
+                }
+            )
             body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
                 "utf-8"
             )
             self._snap_bytes = body
+            self._snap_etag = '"' + hashlib.sha1(body).hexdigest()[:16] + '"'
             self._snap_rev = rev
             self._snap_sig_key = sig_key
             return body
+
+    def snapshot_etag(self) -> str:
+        """ETag for the last snapshot_bytes() payload (call after snapshot_bytes)."""
+        with self.lock:
+            if self._snap_etag:
+                return self._snap_etag
+            if self._snap_bytes is not None:
+                self._snap_etag = (
+                    '"' + hashlib.sha1(self._snap_bytes).hexdigest()[:16] + '"'
+                )
+                return self._snap_etag
+            return '"0"'
 
 
 MONITOR = SessionMonitor()

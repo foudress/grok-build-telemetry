@@ -26,6 +26,36 @@ const CHART_AXIS = {
   placeholder: "#4a5568",
 };
 
+const DPR_CAP = 2;
+let _measureCtx = null;
+
+/** Reuse one offscreen 2d context for label measurement (avoid detached canvases each paint). */
+function measureCtx() {
+  if (!_measureCtx) {
+    _measureCtx = document.createElement("canvas").getContext("2d");
+  }
+  return _measureCtx;
+}
+
+/**
+ * Size a canvas backing store only when CSS px / DPR change.
+ * Reassigning width/height every poll reallocates bitmaps and drives browser RSS up.
+ */
+function fitCanvas(canvas, cssW, cssH, dprCap = DPR_CAP) {
+  const dpr = Math.min(dprCap, window.devicePixelRatio || 1);
+  const w = Math.max(1, cssW | 0);
+  const h = Math.max(1, cssH | 0);
+  const bw = Math.max(1, Math.floor(w * dpr));
+  const bh = Math.max(1, Math.floor(h * dpr));
+  if (canvas.width !== bw || canvas.height !== bh) {
+    canvas.width = bw;
+    canvas.height = bh;
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, dpr, w, h };
+}
+
 /**
  * Show DOM chart tooltip (fade/translate via CSS .is-visible).
  * Uses fixed viewport coords so #costChartWrap overflow cannot clip it.
@@ -362,9 +392,8 @@ function drawLineChart(canvas, series, color, rounds) {
   const plotWGuess = Math.max(1, wGuess - left - right);
   const avgPxGuess = pts.length > 1 ? plotWGuess / (pts.length - 1) : plotWGuess;
   // Same X-label planner as Cost / tok/s — rotate + grow bottom pad when cramped.
-  const measure = document.createElement("canvas").getContext("2d");
   const xPlan = planXLabels(
-    measure,
+    measureCtx(),
     (pts || []).map((p) => p.label || ""),
     avgPxGuess,
     { temporal: false }
@@ -372,13 +401,9 @@ function drawLineChart(canvas, series, color, rounds) {
   const bottom = Math.max(28, xPlan.padB || 28);
   canvas.style.height = (baseH + Math.max(0, bottom - 28)) + "px";
 
-  const dpr = window.devicePixelRatio || 1;
   const w = canvas.clientWidth || wGuess;
   const h = canvas.clientHeight || baseH;
-  canvas.width = Math.floor(w * dpr);
-  canvas.height = Math.floor(h * dpr);
-  const ctx = canvas.getContext("2d");
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const { ctx } = fitCanvas(canvas, w, h);
   ctx.clearRect(0, 0, w, h);
 
   const plotW = w - left - right;
@@ -2122,8 +2147,7 @@ function guessXPlan(labels, barCount, temporal) {
   const viewW = (scroller && scroller.clientWidth) || 600;
   const nSlots = Math.max(barCount || 1, temporal ? MIN_COST_SLOTS : 1);
   const groupW = Math.max(1, (viewW - PLOT_PAD_L - 12) / nSlots);
-  const ctx = document.createElement("canvas").getContext("2d");
-  return planXLabels(ctx, labels, groupW, { temporal });
+  return planXLabels(measureCtx(), labels, groupW, { temporal });
 }
 
 function applyXPadHeight(canvas, padB) {
@@ -2387,11 +2411,7 @@ function layoutGanttCanvas(canvas) {
   canvas.style.height = h + "px";
   if (yAxis) yAxis.style.height = h + "px";
   if (scroller) scroller.classList.remove("is-overflow");
-  const dpr = Math.min(2, window.devicePixelRatio || 1);
-  canvas.width = Math.max(1, Math.floor(viewW * dpr));
-  canvas.height = Math.max(1, Math.floor(h * dpr));
-  const ctx = canvas.getContext("2d");
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const { ctx } = fitCanvas(canvas, viewW, h);
   ctx.clearRect(0, 0, viewW, h);
   bindYStretch();
   bindChartResize();
@@ -2436,11 +2456,7 @@ function layoutCostCanvas(canvas, barCount, { forceFit, maxSlot } = {}) {
   // Never CSS-stretch a narrower bitmap — that desyncs hit-test vs bars.
   canvas.style.width = w + "px";
   if (scroller) scroller.classList.toggle("is-overflow", overflow);
-  const dpr = window.devicePixelRatio || 1;
-  canvas.width = Math.max(1, Math.floor(w * dpr));
-  canvas.height = Math.max(1, Math.floor(h * dpr));
-  const ctx = canvas.getContext("2d");
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const { ctx } = fitCanvas(canvas, w, h);
   ctx.clearRect(0, 0, w, h);
   if (scroller) {
     const max = Math.max(0, scroller.scrollWidth - scroller.clientWidth);
@@ -2559,14 +2575,10 @@ function drawCostYOverlay({ min, max, step, unit, top, bottom, h }) {
   const yAxis = $("costYAxis");
   if (!yAxis) return;
   yAxis.hidden = false;
-  const dpr = window.devicePixelRatio || 1;
   const w = COST_Y_LEFT;
-  yAxis.width = Math.max(1, Math.floor(w * dpr));
-  yAxis.height = Math.max(1, Math.floor(h * dpr));
   yAxis.style.width = w + "px";
   yAxis.style.height = h + "px";
-  const ctx = yAxis.getContext("2d");
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const { ctx } = fitCanvas(yAxis, w, h);
   ctx.clearRect(0, 0, w, h);
   let bg = "#121a24";
   const plot = $("costChart");
@@ -3845,14 +3857,10 @@ function drawYSessionLabels(rows, padT, padB, h) {
   const yAxis = $("costYAxis");
   if (!yAxis) return;
   yAxis.hidden = false;
-  const dpr = Math.min(2, window.devicePixelRatio || 1);
   const w = COST_Y_LEFT;
-  yAxis.width = Math.max(1, Math.floor(w * dpr));
-  yAxis.height = Math.max(1, Math.floor(h * dpr));
   yAxis.style.width = w + "px";
   yAxis.style.height = h + "px";
-  const ctx = yAxis.getContext("2d");
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const { ctx } = fitCanvas(yAxis, w, h);
   ctx.clearRect(0, 0, w, h);
   let bg = "#121a24";
   const plot = $("costChart");
@@ -4413,11 +4421,7 @@ function layoutRateCanvas(canvas, barCount, ids) {
   const overflow = w > viewW + 1;
   canvas.style.width = w + "px";
   if (scroller) scroller.classList.toggle("is-overflow", overflow);
-  const dpr = window.devicePixelRatio || 1;
-  canvas.width = Math.max(1, Math.floor(w * dpr));
-  canvas.height = Math.max(1, Math.floor(h * dpr));
-  const ctx = canvas.getContext("2d");
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const { ctx } = fitCanvas(canvas, w, h);
   ctx.clearRect(0, 0, w, h);
   if (scroller) {
     const max = Math.max(0, scroller.scrollWidth - scroller.clientWidth);
@@ -4447,14 +4451,10 @@ function drawRateYOverlay(ids, { min, max, step, top, h, padB, format }) {
   const yAxis = $(ids.yAxis);
   if (!yAxis) return;
   yAxis.hidden = false;
-  const dpr = window.devicePixelRatio || 1;
   const w = COST_Y_LEFT;
-  yAxis.width = Math.max(1, Math.floor(w * dpr));
-  yAxis.height = Math.max(1, Math.floor(h * dpr));
   yAxis.style.width = w + "px";
   yAxis.style.height = h + "px";
-  const ctx = yAxis.getContext("2d");
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const { ctx } = fitCanvas(yAxis, w, h);
   ctx.clearRect(0, 0, w, h);
   ctx.fillStyle = CHART_AXIS.label;
   ctx.font = "10px system-ui, Segoe UI, sans-serif";
@@ -4524,13 +4524,9 @@ export function drawIoStepChart(canvas, pts, opts) {
       canvas.style.width = "100%";
       canvas.style.height = ensureCostChartH(ids.store) + "px";
     }
-    const dpr = window.devicePixelRatio || 1;
     const w = canvas.clientWidth || 600;
     const h = canvas.clientHeight || 240;
-    canvas.width = Math.floor(w * dpr);
-    canvas.height = Math.floor(h * dpr);
-    const ctx = canvas.getContext("2d");
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const { ctx } = fitCanvas(canvas, w, h);
     ctx.clearRect(0, 0, w, h);
     drawChartEmpty(ctx, w, h, "No sessions");
     canvas._ratePts = null;
@@ -4786,13 +4782,9 @@ export function drawRateChart(canvas, pts, opts) {
       const h = host === "ctx" ? storedCtxChartH() : ensureCostChartH(ids.store);
       canvas.style.height = h + "px";
     }
-    const dpr = window.devicePixelRatio || 1;
     const w = canvas.clientWidth || 600;
     const h = canvas.clientHeight || 240;
-    canvas.width = Math.floor(w * dpr);
-    canvas.height = Math.floor(h * dpr);
-    const ctx = canvas.getContext("2d");
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const { ctx } = fitCanvas(canvas, w, h);
     ctx.clearRect(0, 0, w, h);
     drawChartEmpty(ctx, w, h, "No tok/s samples");
     canvas._ratePts = null;

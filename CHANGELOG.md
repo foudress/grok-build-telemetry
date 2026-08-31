@@ -19,6 +19,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 -
 
+## [1.0.3] — 2026-08-31
+
+Browser RAM leak when the live dashboard stays open for hours (multi‑GB).
+Package **1.0.3**.
+
+### Fixed
+
+- **Idle poll leak**: the 1s `/api/state` loop re-downloaded, `JSON.parse`’d, and
+  fully re-rendered tree + charts even when hierarchy revision was unchanged
+  (~2.5 MB JSON/s on busy sessions). Heap never returned to the OS.
+- **`GET /api/state` ETag + HTTP 304**: server stamps `ETag` (SHA‑1 of the cached
+  snapshot body); client sends `If-None-Match`. Unchanged → empty 304, no parse,
+  no redraw.
+- **Canvas bitmap churn**: every paint reassigned `canvas.width`/`height` (and
+  Y-axis canvases), reallocating backing stores each second even at the same
+  size. `fitCanvas()` only resizes when CSS px or DPR changes; DPR capped at 2.
+- **Detached measure canvases**: `planXLabels` / `guessXPlan` created a new
+  offscreen `<canvas>` every paint; now reuse one `measureCtx()`.
+- **Listener stacking on tabs**: per-poll `addEventListener` on `[data-sub-tab]`
+  and task-tab buttons replaced with one-time event delegation.
+
+### Changed
+
+- **Wire slim** (`_slim_wire` before `/api/state` JSON): drop `null` fields,
+  drop full `user_prompt.user_text` (preview kept), slim `plan.steps` to
+  `{n, status}` only (UI plan chips unchanged).
+- Snapshot payload includes `revision` for debugging; CORS exposes `ETag` and
+  allows `If-None-Match`.
+- Client clears ETag on session switch and **Reset calc**.
+- `__version__` / package metadata aligned at **1.0.3**.
+- Tests: `test/test_state_wire_slim.py` (gitignore allowlist).
+
 ## [1.0.2] — 2026-08-27
 
 Period (D/W/M) correctness, session-open reliability, and calc progress UX.

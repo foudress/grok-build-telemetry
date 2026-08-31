@@ -2,7 +2,7 @@
 
 Live companion dashboard for **[Grok Build](https://x.ai)** sessions: exact token fields Grok already writes, cache vs uncached split, official `$` ticks, and list-price estimates — outside the TUI.
 
-> Package: `token-telemetry` **v1.0.2** (`pip install -e .` / `token-telemetry` CLI).
+> Package: `token-telemetry` **v1.0.3** (`pip install -e .` / `token-telemetry` CLI).
 
 ```
 ~/.grok/sessions/.../updates.jsonl  ──tail──►  live dashboard  ──►  http://127.0.0.1:8765/

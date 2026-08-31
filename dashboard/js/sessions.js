@@ -179,6 +179,8 @@ async function switchSession(sessionId) {
   _sessionSwitching = true;
   window.__sessionSwitching = true;
   window.__pendingSid = sessionId ? String(sessionId) : null;
+  // Force a fresh /api/state body after pin/follow change.
+  try { window.__clearStateEtag && window.__clearStateEtag(); } catch { /* ignore */ }
   beginViewLoad();
   try {
     const r = await fetch("/api/session", {

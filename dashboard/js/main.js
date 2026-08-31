@@ -45,6 +45,27 @@ let _graphHydrated = false;
 let _graphSeen = new Set();
 let _graphFocusSid = undefined;
 let _officialFlipBound = false;
+let _stateEtag = null;
+let _subTabClicksBound = false;
+
+function clearStateEtag() {
+  _stateEtag = null;
+}
+window.__clearStateEtag = clearStateEtag;
+
+function bindSubTabClicks() {
+  if (_subTabClicksBound) return;
+  _subTabClicksBound = true;
+  document.addEventListener("click", (ev) => {
+    const el = ev.target && ev.target.closest && ev.target.closest("[data-sub-tab]");
+    if (!el) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const id = el.getAttribute("data-sub-tab");
+    if (!id) return;
+    switchTaskTab(id, el.getAttribute("data-sub-round"));
+  });
+}
 
 /** Sum official In (uncached) / Cached / Out tokens from turn rows. */
 function sumTurnIoTokens(turns) {
@@ -258,11 +279,14 @@ function paintTaskTabs(state) {
   el.innerHTML = bits.map((b) => (
     `<button type="button" class="task-tab${_taskTab === b.id ? " is-on" : ""}" data-tab="${esc(b.id)}" title="${esc(b.tip || b.label)}">${esc(b.label)}</button>`
   )).join("");
-  el.querySelectorAll("[data-tab]").forEach((btn) => {
-    btn.addEventListener("click", () => {
+  if (!el._tabBound) {
+    el._tabBound = true;
+    el.addEventListener("click", (ev) => {
+      const btn = ev.target && ev.target.closest && ev.target.closest("[data-tab]");
+      if (!btn || !el.contains(btn)) return;
       switchTaskTab(btn.getAttribute("data-tab") || "main");
     });
-  });
+  }
 }
 
 function activeTaskView(state) {
@@ -886,16 +910,6 @@ function render(state) {
     revealRound(_pendingRevealRound);
     _pendingRevealRound = null;
   }
-  document.querySelectorAll("[data-sub-tab]").forEach((el) => {
-    el.addEventListener("click", (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      const id = el.getAttribute("data-sub-tab");
-      if (!id) return;
-      switchTaskTab(id, el.getAttribute("data-sub-round"));
-    });
-  });
-
 }
 
 let _pollBusy = false;
@@ -920,8 +934,19 @@ async function poll() {
       endViewLoad();
       return;
     }
-    const r = await fetch("/api/state?_=" + Date.now());
+    const headers = {};
+    if (_stateEtag) headers["If-None-Match"] = _stateEtag;
+    const r = await fetch("/api/state?_=" + Date.now(), {
+      headers,
+      cache: "no-store",
+    });
+    if (r.status === 304) {
+      endViewLoad();
+      return;
+    }
     if (!r.ok) throw new Error("HTTP " + r.status);
+    const et = r.headers.get("ETag");
+    if (et) _stateEtag = et;
     const state = await r.json();
     if (epoch !== _pollEpoch) return;
     const pending = (typeof window.__pendingSid === "string" && window.__pendingSid)
@@ -1052,6 +1077,7 @@ restorePrefs();
 bindPeriodControls();
 bindPanelCollapse();
 bindOfficialFlip();
+bindSubTabClicks();
 bindCtxChartResize(() => {
   if (window.__lastState) paintCtxChart(window.__lastState);
 });
@@ -1063,6 +1089,7 @@ $("cacheReset")?.addEventListener("click", async () => {
   try {
     await fetch("/api/cache/reset", { method: "POST" });
   } catch { /* ignore */ }
+  clearStateEtag();
   _pollEpoch += 1;
   _pollBusy = false;
   try {

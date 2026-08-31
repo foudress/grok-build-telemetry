@@ -46,7 +46,14 @@ class Handler(BaseHTTPRequestHandler):
         if args and str(args[0]).startswith("5"):
             super().log_message(fmt, *args)
 
-    def _send(self, code: int, body: bytes, content_type: str) -> None:
+    def _send(
+        self,
+        code: int,
+        body: bytes,
+        content_type: str,
+        *,
+        extra: Optional[dict[str, str]] = None,
+    ) -> None:
         # Client often aborts mid-response (Ctrl+F5, tab close, poll race).
         # That is WinError 10053 / BrokenPipe — not a server bug; stay quiet.
         try:
@@ -56,9 +63,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                "Content-Type, If-None-Match",
+            )
+            self.send_header("Access-Control-Expose-Headers", "ETag")
+            if extra:
+                for k, v in extra.items():
+                    self.send_header(k, v)
             self.end_headers()
-            self.wfile.write(body)
+            if body:
+                self.wfile.write(body)
         except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError):
             return
 
@@ -190,7 +205,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/state":
             body = MONITOR.snapshot_bytes()
-            self._send(200, body, "application/json; charset=utf-8")
+            etag = MONITOR.snapshot_etag()
+            inm = (self.headers.get("If-None-Match") or "").strip()
+            if inm and inm == etag:
+                self._send(
+                    304,
+                    b"",
+                    "application/json; charset=utf-8",
+                    extra={"ETag": etag},
+                )
+                return
+            self._send(
+                200,
+                body,
+                "application/json; charset=utf-8",
+                extra={"ETag": etag},
+            )
             return
         if path == "/api/sessions":
             # Full picker (recent tail) — used when the user opens the dropdown.

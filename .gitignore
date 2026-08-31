@@ -34,6 +34,7 @@ out/
 !/test/test_graph_projects.py
 !/test/test_graph_activity.py
 !/test/test_graph_api.py
+!/test/test_state_wire_slim.py
 
 # Maintainer session notes (not required for install)
 .grok/
