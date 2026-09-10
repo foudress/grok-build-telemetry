@@ -1,5 +1,5 @@
 ﻿"""Continuity: prev LLM answer counts in next-round User In."""
-from token_telemetry.hierarchy.cache_miss import _attach_prev_llm_answer
+from token_telemetry.hierarchy.user_continuity import _attach_prev_llm_answer
 
 
 class _HB:
@@ -235,3 +235,41 @@ def test_partial_miss_peels_only_available_mass():
     assert cur["breakdown"]["cache_miss_in_tokens"] == 0
     assert cur["breakdown"]["user_in_tokens"] == 83
     assert cur.get("cache_miss") is False
+
+
+def test_compact_out_folds_into_user_in_and_peels_miss():
+    """Between-rounds Compact Out is User In, not leftover cache miss."""
+    cur = {
+        "index": 2,
+        "user_text": "hi",
+        "context_start": 6000,
+        "compact_before": {
+            "kind": "compaction",
+            "placement": "between_rounds",
+            "out_tokens": 5000,
+            "tokens_after": 5000,
+            "out_usd": 0.02,
+        },
+        "breakdown": {
+            "cache_miss_in_tokens": 5200,
+            "uncached_in_tokens": 5300,
+            "paid_uncached_tokens": 5300,
+        },
+        "user_prompt": {
+            "kind": "user_prompt",
+            "tokens_in": 100,
+            "uncached_est": 100,
+            "cost_in_usd": 0.0002,
+            "preview": "hi",
+        },
+    }
+    hb = _HB([cur])
+    _attach_prev_llm_answer(hb, cur)
+    up = cur["user_prompt"]
+    assert up["compact_out"]["tokens_in"] == 5000
+    assert up["compact_out_in_user_in"] is True
+    assert up["tokens_in"] == 5100
+    assert up["prompt_tokens_in"] == 100
+    assert up["display_in_tokens"] == 5100
+    assert cur["breakdown"]["cache_miss_in_tokens"] == 200
+    assert cur["breakdown"]["user_in_tokens"] == 5100

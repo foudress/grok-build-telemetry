@@ -14,6 +14,7 @@ from typing import Any, Optional
 
 from token_telemetry.hierarchy import HierarchyBuilder
 from token_telemetry.session.calc_cache import load_calc, save_calc
+from token_telemetry.util import as_float as _f, as_int as _i
 
 
 _lock = threading.Lock()
@@ -23,13 +24,6 @@ _attr_cache: dict[str, dict[str, Any]] = {}
 _X_N = re.compile(r"\s*[x×]\s*\d+\s*$", re.I)
 
 
-def _f(v: Any) -> float:
-    try:
-        return float(v or 0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
 def _first_present(d: dict[str, Any], *keys: str) -> Optional[float]:
     if not isinstance(d, dict):
         return None
@@ -37,13 +31,6 @@ def _first_present(d: dict[str, Any], *keys: str) -> Optional[float]:
         if k in d and d[k] is not None:
             return _f(d[k])
     return None
-
-
-def _i(v: Any) -> int:
-    try:
-        return int(v or 0)
-    except (TypeError, ValueError):
-        return 0
 
 
 def _ms_epoch(ms: Any) -> Optional[float]:

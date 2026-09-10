@@ -7,7 +7,6 @@ from pathlib import Path
 
 from token_telemetry.session import calc_cache as cc
 from token_telemetry.session import period_attr as pa
-from token_telemetry.session import aggregate as agg_mod
 
 
 def _sid_dir(root: Path, sid="aaaa1111-0000-0000-0000-000000000001") -> Path:
@@ -87,7 +86,9 @@ def test_reset_forces_recompute(tmp_path, monkeypatch):
     assert cc.reset_all_calcs() >= 1
     pa.cached_attr_events(d)
     assert calls["n"] == 2
-    assert agg_mod._file_cache == {}
+    from token_telemetry.session.scan import _file_cache as scan_file_cache
+
+    assert scan_file_cache == {}
 
 
 def test_code_sig_change_misses_disk(tmp_path, monkeypatch):
@@ -98,6 +99,51 @@ def test_code_sig_change_misses_disk(tmp_path, monkeypatch):
     assert cc.load_calc(d) is not None
     monkeypatch.setattr(cc, "code_sig", lambda: "after")
     assert cc.load_calc(d) is None
+
+
+def test_code_sig_picks_up_file_change(tmp_path, monkeypatch):
+    monkeypatch.setattr(cc, "_PKG", tmp_path)
+    monkeypatch.setattr(cc, "_CODE_FILES", ("finalize.py",))
+    cc._code_sig = None
+    cc._code_probe = None
+    p = tmp_path / "finalize.py"
+    p.write_text("a", encoding="utf-8")
+    first = cc.code_sig()
+    p.write_text("ab", encoding="utf-8")
+    second = cc.code_sig()
+    assert first != second
+
+
+def test_ensure_cache_fresh_wipes_on_ver_mismatch(tmp_path, monkeypatch):
+    monkeypatch.setattr(cc, "CACHE_DIR", tmp_path / "cache")
+    d = _sid_dir(tmp_path / "sess")
+    cc.save_calc(d, events=[{"epoch": 1}])
+    assert cc.load_calc(d) is not None
+    (tmp_path / "cache" / cc.STAMP_NAME).write_text(
+        json.dumps({"v": int(cc.CACHE_VER) - 1, "code": "old"}),
+        encoding="utf-8",
+    )
+    n = cc.ensure_cache_fresh()
+    assert n >= 1
+    assert cc.load_calc(d) is None
+    stamp = json.loads((tmp_path / "cache" / cc.STAMP_NAME).read_text(encoding="utf-8"))
+    assert stamp.get("v") == cc.CACHE_VER
+    assert int(stamp.get("gen") or 0) == cc.cache_gen()
+    assert cc.ensure_cache_fresh() == 0
+    assert cc.cache_gen() == int(stamp.get("gen") or 0)
+
+
+def test_clear_calc_cache_keeps_stamp(tmp_path, monkeypatch):
+    monkeypatch.setattr(cc, "CACHE_DIR", tmp_path / "cache")
+    d = _sid_dir(tmp_path / "sess")
+    cc.save_calc(d, events=[{"epoch": 1}])
+    cc._write_stamp()
+    gen0 = cc.cache_gen()
+    n = cc.clear_calc_cache()
+    assert n >= 1
+    assert cc.cache_gen() == gen0 + 1
+    assert (tmp_path / "cache" / cc.STAMP_NAME).is_file()
+    assert cc._path_for(d).is_file() is False
 
 
 def test_cache_ver_rejects_previous_blob(tmp_path, monkeypatch):

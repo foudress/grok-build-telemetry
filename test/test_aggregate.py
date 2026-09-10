@@ -10,9 +10,9 @@ from token_telemetry.session.aggregate import (
     build_aggregate,
     period_window,
     week_monday,
-    _file_cache,
     _priced_from_io_segs,
 )
+from token_telemetry.session.scan import _file_cache
 from token_telemetry.session import aggregate as agg_mod
 
 
@@ -602,6 +602,61 @@ def test_rate_full_includes_flag(tmp_path, monkeypatch):
     hot = build_aggregate("daily", 0, rate=True, now=now)
     assert hot.get("rate_full") is True
     assert hot["tps_sessions"][0]["v"] == 12.5
+
+
+def test_direct_foudres_parent_aggregates_child_io(tmp_path, monkeypatch):
+    """direct_foudres wait-turns do not include the child bill — do not peel to 0."""
+    now = _aware(2026, 8, 14, 18, 0)
+    day0 = datetime(2026, 8, 14, tzinfo=timezone.utc)
+    t10 = (day0 + timedelta(hours=10, minutes=5)).timestamp()
+    t11 = (day0 + timedelta(hours=11)).timestamp()
+    main = "aaaa1111-0000-0000-0000-000000000001"
+    sub = "bbbb2222-0000-0000-0000-000000000002"
+    # Parent own work only (100/0/10) — child bill is separate (8000/7000/20).
+    _write_session(tmp_path, main, [(t10, 100, 0, 10)], title="Foudres parent")
+    p = tmp_path / main / "updates.jsonl"
+    p.write_text(
+        p.read_text(encoding="utf-8")
+        + json.dumps(
+            {
+                "timestamp": t10,
+                "params": {
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCall": {
+                            "toolName": "direct_foudres",
+                            "rawInput": {"task_ids": [sub]},
+                        },
+                    }
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_session(
+        tmp_path,
+        sub,
+        [(t11, 8000, 7000, 20)],
+        kind="subagent",
+        title="Foudres child",
+        parent=main,
+    )
+    monkeypatch.setattr(agg_mod, "list_session_dirs", lambda: list(tmp_path.iterdir()))
+    _file_cache.clear()
+
+    out = build_aggregate("daily", 0, now=now)
+    tot = out["totals"]
+    # Parent own 100/0/10 + child uncached 1000 / cache 7000 / out 20
+    assert tot["tokens_in"] == 100 + 1000
+    assert tot["tokens_cached"] == 7000
+    assert tot["tokens_out"] == 10 + 20
+    by_sid = {s["session_id"]: s for s in out["sessions"]}
+    assert by_sid[main]["tokens_in"] == 100
+    assert by_sid[main]["tokens_out"] == 10
+    assert by_sid[sub]["tokens_in"] == 1000
+    assert by_sid[sub]["tokens_cached"] == 7000
+    assert "_fold_kids" not in by_sid[main]
 
 
 def test_build_aggregate_progress_callback(tmp_path, monkeypatch):

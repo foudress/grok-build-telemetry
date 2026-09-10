@@ -16,7 +16,6 @@ from token_telemetry.graph.api import (
     sessions_payload,
 )
 from token_telemetry.graph.projects import normalize_cwd
-from token_telemetry.server.http import DASHBOARD_DIR, GRAPH_HTML
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "graph_updates.jsonl"
 
@@ -44,10 +43,6 @@ def _session_dir(tmp_path: Path, name: str, src: Path | None = None) -> Path:
     else:
         (d / "updates.jsonl").write_text("", encoding="utf-8")
     return d
-
-
-def test_graph_html_constant():
-    assert GRAPH_HTML == DASHBOARD_DIR / "graph.html"
 
 
 def test_missing_root_is_400():

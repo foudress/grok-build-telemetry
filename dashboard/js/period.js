@@ -47,6 +47,8 @@ let _aggLoadMode = null;
 let _aggKey = "";
 /** True when scope/grain/offset/rate changed and needs a fresh fetch + loader. */
 let _aggDirty = true;
+/** Server calc-cache generation from /api/health or aggregate. */
+let _cacheGen = null;
 /**
  * Chart refetch waiting on first SSE progress: show loader only if cold>0
  * (attr cache miss / rebuild). Warm cache → no spinner.
@@ -343,6 +345,16 @@ export function openSessionFromPeriod(sid) {
     };
   }
   beginViewLoad();
+  // Leave period chrome immediately so one click is full session view
+  // (not a hybrid Sessions list + Round hierarchy title).
+  leavePeriodView();
+  const tree = $("roundTree");
+  if (tree) {
+    tree.classList.remove("sess-list");
+    tree.innerHTML = "";
+  }
+  const treeTitle = $("treeTitle");
+  if (treeTitle) treeTitle.textContent = "Round hierarchy";
   // Do not kick a parallel /api/state poll before POST /api/session finishes —
   // that race left is-loading stuck when __pendingSid never matched.
   setScope("session", { poll: false });
@@ -390,11 +402,16 @@ export function restorePeriodReturn() {
 export function setScope(scope, opts = {}) {
   const next = PERIODS.has(scope) || scope === "session" ? scope : "session";
   if (next !== _scope) {
-    beginViewLoad();
     if (PERIODS.has(next)) {
       _periodReturn = null;
-      _aggDirty = true;
-      _aggKey = "";
+      const nextKey = [next, _offset, _grain, _stack, _rate ? 1 : 0].join("|");
+      if (nextKey !== _aggKey) {
+        _aggDirty = true;
+        _aggKey = "";
+        beginViewLoad();
+      }
+    } else {
+      beginViewLoad();
     }
     _scope = next;
     _offset = 0;
@@ -405,6 +422,8 @@ export function setScope(scope, opts = {}) {
   }
   persist();
   applyScopeChrome();
+  const sel = $("scopeSelect");
+  if (sel && sel.value !== _scope) sel.value = _scope;
   if (opts.poll === false) return;
   if (_pollRef) _pollRef();
 }
@@ -599,7 +618,8 @@ function paintSessionList(sessions) {
       if (!sid) return;
       if (_timeline) {
         ev.preventDefault();
-        toggleGanttSel(sid);
+        if (ev.detail === 2) return;
+        openSessionFromPeriod(sid);
         return;
       }
       openSessionFromPeriod(sid);
@@ -778,11 +798,34 @@ async function readAggregateSse(response, onProgress) {
   return result;
 }
 
+export function invalidatePeriodCache() {
+  _lastAgg = null;
+  _aggKey = "";
+  _aggDirty = true;
+  _cacheGen = null;
+}
+
 export async function fetchPeriod() {
   const reqKey = aggRequestKey();
   // Quiet 1s poll: same period params already on screen — do not restream / flash loader.
+  // Still notice Reset calc / dashboard relaunch via cache_gen.
   if (!_aggDirty && _lastAgg && reqKey === _aggKey) {
-    return;
+    let same = true;
+    try {
+      const r = await fetch("/api/health");
+      const j = await r.json();
+      if (
+        j
+        && typeof j.cache_gen === "number"
+        && _cacheGen != null
+        && j.cache_gen !== _cacheGen
+      ) {
+        same = false;
+        _aggDirty = true;
+        _lastAgg = null;
+      }
+    } catch { /* ignore */ }
+    if (same) return;
   }
 
   const badge = $("liveBadge");
@@ -837,6 +880,7 @@ export async function fetchPeriod() {
   paintPeriod(agg);
   _aggKey = reqKey;
   _aggDirty = false;
+  if (typeof agg.cache_gen === "number") _cacheGen = agg.cache_gen;
   _chartLoaderAwaitCold = false;
   // Hide chart-local overlay immediately; full-page spinner is cleared by poll().
   endChartLoad();

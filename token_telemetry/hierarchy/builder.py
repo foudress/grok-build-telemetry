@@ -67,6 +67,7 @@ from token_telemetry.hierarchy.finalize import (
     _stamp_step_reasoning,
     _stamp_tool_chat_args,
     _stamp_tool_chat_results,
+    stamp_r1_tooldef_jump,
 )
 from token_telemetry.hierarchy.hooks import _hook_slot
 from token_telemetry.hierarchy.recap_compact import (
@@ -372,6 +373,7 @@ class HierarchyBuilder:
                 r["turn_start_ms"] = turn_ms
 
             step = self._ensure_model_step(r, stream_ms, agent_ms, tt)
+            stamp_r1_tooldef_jump(r, kind, tt)
 
             if kind == "agent_thought_chunk":
                 self._note_ctx(r, step, tt, agent_ms)

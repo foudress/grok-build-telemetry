@@ -1,0 +1,78 @@
+{
+  "nodes": [
+    {
+      "id": "a.py",
+      "path": "a.py",
+      "dir": "",
+      "loc": 12,
+      "deg": 1,
+      "kind": "file"
+    },
+    {
+      "id": "b.py",
+      "path": "b.py",
+      "dir": "",
+      "loc": 5,
+      "deg": 1,
+      "kind": "file"
+    },
+    {
+      "id": "c.py",
+      "path": "c.py",
+      "dir": "",
+      "loc": 7,
+      "deg": 1,
+      "kind": "file"
+    },
+    {
+      "id": "d.py",
+      "path": "d.py",
+      "dir": "",
+      "loc": 5,
+      "deg": 1,
+      "kind": "file"
+    },
+    {
+      "id": "dir:sub",
+      "path": "sub",
+      "dir": "",
+      "loc": 0,
+      "deg": 0,
+      "kind": "cluster"
+    },
+    {
+      "id": "sub/e.py",
+      "path": "sub/e.py",
+      "dir": "sub",
+      "loc": 1,
+      "deg": 0,
+      "kind": "file"
+    }
+  ],
+  "edges": [
+    {
+      "src": "a.py",
+      "dst": "b.py",
+      "kind": "call",
+      "w": 1,
+      "sites": [
+        {
+          "caller": "caller",
+          "callee": "foo"
+        }
+      ]
+    },
+    {
+      "src": "c.py",
+      "dst": "d.py",
+      "kind": "import",
+      "w": 1,
+      "sites": [
+        {
+          "caller": "use",
+          "callee": "not_a_real_function"
+        }
+      ]
+    }
+  ]
+}

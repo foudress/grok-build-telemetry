@@ -1,6 +1,6 @@
 """Wire slim + ETag helpers for /api/state RAM control."""
 
-from token_telemetry.session.monitor import _slim_wire
+from token_telemetry.session.wire import _slim_wire
 
 
 def test_slim_wire_drops_nulls_and_user_text():

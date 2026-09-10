@@ -8,8 +8,10 @@ from pathlib import Path
 
 from token_telemetry.session.subagents import (
     attach_subagents_after_steps,
+    child_ids_from_session_update,
     child_ids_to_peel,
     collect_child_ids_from_round,
+    ensure_lineage_subagent_cards,
     extract_task_ids,
     load_session_official_usage,
     parse_subagent_meta,
@@ -213,7 +215,7 @@ def test_sibling_session_dir_finds_other_cwd_folder(tmp_path: Path, monkeypatch)
 
 
 def test_last_call_context_stays_on_stream_window():
-    from token_telemetry.hierarchy.finalize import _anchor_call_context_to_input
+    from token_telemetry.hierarchy.attach_price import _anchor_call_context_to_input
 
     r = {
         "context_end": 159101,
@@ -435,7 +437,7 @@ def test_price_child_usage_uses_avg_prompt_not_lifetime_sum():
 
 
 def test_sum_rounds_estimate_uses_api_total_not_ticks():
-    from token_telemetry.session.monitor import _sum_rounds_estimate
+    from token_telemetry.session.enrich import _sum_rounds_estimate
 
     rounds = [
         {"breakdown": {"api_total_usd": 1.2}, "estimate_usd": 0.3},
@@ -445,7 +447,7 @@ def test_sum_rounds_estimate_uses_api_total_not_ticks():
 
 
 def test_session_estimate_adds_child_round_bills():
-    from token_telemetry.session.monitor import _sum_rounds_estimate
+    from token_telemetry.session.enrich import _sum_rounds_estimate
 
     parent = [{"breakdown": {"api_total_usd": 1.0}}]
     child_a = [{"breakdown": {"api_total_usd": 0.25}}]
@@ -453,6 +455,45 @@ def test_session_estimate_adds_child_round_bills():
     total = _sum_rounds_estimate(parent) + _sum_rounds_estimate(child_a) + _sum_rounds_estimate(child_b)
     assert abs(total - 1.35) < 1e-9
     assert abs(_sum_rounds_estimate(parent) - 1.0) < 1e-9
+
+
+def test_child_ids_from_subagent_spawned_update():
+    kid = "019ffb89-3d51-77d2-aef5-4394b3c13903"
+    ids = child_ids_from_session_update({
+        "sessionUpdate": "subagent_spawned",
+        "subagent_id": kid,
+    })
+    assert ids == [kid]
+    assert child_ids_from_session_update({"sessionUpdate": "tool_call"}) == []
+
+
+def test_ensure_lineage_cards_for_spawned_without_tool(tmp_path: Path):
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    kid_id = "019ffb89-3d51-77d2-aef5-4394b3c13903"
+    kid = tmp_path / kid_id
+    kid.mkdir()
+    (kid / "summary.json").write_text(
+        json.dumps({"session_kind": "subagent", "agent_name": "explore"}),
+        encoding="utf-8",
+    )
+    (kid / "updates.jsonl").write_text("{}\n", encoding="utf-8")
+    r = {"model_steps": [{"tools": [], "subagents_after": []}]}
+
+    class _Hb:
+        rounds = [r]
+        _session_dir = parent
+        _resume_alias = {}
+        _subagent_ordinal = {}
+        _subagent_next_n = 0
+        _child_round_snaps = {}
+
+    hb = _Hb()
+    ensure_lineage_subagent_cards([r], [kid_id], hb=hb)
+    after = r["model_steps"][0]["subagents_after"]
+    assert len(after) == 1
+    assert after[0]["session_id"] == kid_id
+    assert after[0].get("n") == 1
 
 
 def test_extract_resume_from_and_root_walk(tmp_path: Path):
@@ -980,8 +1021,225 @@ def test_clipped_spawn_preview_is_not_an_id():
     ) == ["01a01f99-b56e-7363-80e2-766701f6c487"]
 
 
+def test_child_watch_attaches_worker_spawn_cards(tmp_path: Path):
+    """Mapper session (subagent) must paint worker Sys cards like a parent."""
+    from token_telemetry.session.children import _ChildWatch
+
+    mapper_id = "01a01f99-b56e-7363-80e2-766701f6c487"
+    worker_id = "01a01f99-b56e-7363-80e2-767028a0dc91"
+    mapper = tmp_path / mapper_id
+    worker = tmp_path / worker_id
+    mapper.mkdir()
+    worker.mkdir()
+    (mapper / "summary.json").write_text(
+        json.dumps({"session_kind": "subagent", "agent_name": "mapper"}),
+        encoding="utf-8",
+    )
+    (worker / "summary.json").write_text(
+        json.dumps({"session_kind": "subagent", "agent_name": "worker"}),
+        encoding="utf-8",
+    )
+    (mapper / "updates.jsonl").write_text("{}\n", encoding="utf-8")
+    (worker / "updates.jsonl").write_text("{}\n", encoding="utf-8")
+
+    watch = _ChildWatch(mapper)
+    watch.hierarchy._session_dir = mapper
+    watch.hierarchy._child_round_snaps = {
+        worker_id: [{"system_prompt": {"tokens_in": 400, "cost_in_usd": 0.01}}]
+    }
+    r = {
+        "model_steps": [
+            {
+                "tools": [
+                    {
+                        "name": "spawn_subagent",
+                        "subagent_id": worker_id,
+                        "result_preview": (
+                            "Subagent started in background.\nsubagent_id: " + worker_id
+                        ),
+                    }
+                ]
+            }
+        ]
+    }
+    watch.hierarchy.rounds = [r]
+    watch._attach_own_subagent_cards()
+    after = r["model_steps"][0]["subagents_after"]
+    assert len(after) == 1
+    assert after[0]["session_id"] == worker_id
+    assert after[0].get("is_sys") is True
+    snap = watch.snapshot(lambda rr: rr)
+    assert "gen_tokens_per_sec" in snap
+    assert snap["gen_tokens_per_sec"] is None or isinstance(
+        snap["gen_tokens_per_sec"], (int, float)
+    )
+
+
+def test_agent_line_is_round_io_not_session_total_with_system():
+    """get_command Agent line = that child round, never System (already on Sys)."""
+    kid = "019ffb89-3d51-77d2-aef5-4394b3c13903"
+
+    class _HB:
+        _session_dir = None
+        _subagent_ordinal = {}
+        _subagent_next_n = 0
+        rounds = []
+        _child_round_snaps = {
+            kid: [
+                {
+                    "completed": True,
+                    "index": 1,
+                    "tree_in_tokens": 500,
+                    "output_tokens": 20,
+                    "cost_tree_in_usd": 0.001,
+                    "cost_out_usd": 0.0002,
+                    "system_prompt": {
+                        "kind": "system_prompt",
+                        "tokens_in": 10000,
+                        "parts": [
+                            {"kind": "system", "tokens": 2000},
+                            {"kind": "tool_definitions", "tokens": 8000},
+                        ],
+                    },
+                    "user_prompt": {"kind": "user_prompt", "tokens_in": 400},
+                    "model_steps": [
+                        {"tokens_in": 100, "tokens_out": 20, "tokens_cached": 0}
+                    ],
+                    "usage_raw": {
+                        "inputTokens": 10500,
+                        "cachedReadTokens": 0,
+                        "outputTokens": 20,
+                    },
+                    "breakdown": {"tree_in_tokens": 500, "cached_tokens": 0},
+                }
+            ]
+        }
+        _child_sys = {}
+        _resume_alias = {}
+
+    hb = _HB()
+    r = {
+        "model_steps": [
+            {
+                "tools": [
+                    {
+                        "name": "get_command_or_subagent_output",
+                        "subagent_id": kid,
+                    }
+                ]
+            }
+        ]
+    }
+    attach_subagents_after_steps(
+        r,
+        {
+            "children": [
+                {
+                    "session_id": kid,
+                    "usage": {
+                        "inputTokens": 10500,
+                        "cachedReadTokens": 0,
+                        "outputTokens": 20,
+                    },
+                    "turns": [
+                        {
+                            "inputTokens": 10500,
+                            "cachedReadTokens": 0,
+                            "outputTokens": 20,
+                        }
+                    ],
+                }
+            ]
+        },
+        hb=hb,
+    )
+    after = r["model_steps"][0]["subagents_after"]
+    assert len(after) == 1
+    card = after[0]
+    assert card.get("is_sys") is not True
+    assert card["tokens_in"] == 500
+    assert card["tokens_out"] == 20
+    assert card["tokens_in"] != 10500
+    assert card["tokens_in"] != 10000
+
+
+def test_agent_line_tree_in_zero_is_ledger_not_user_plus_calls():
+    """Present tree_in=0 must not fall through to user+call re-sum (legacy no-snap)."""
+    kid = "019ffb89-3d51-77d2-aef5-4394b3c13904"
+
+    class _HB:
+        _session_dir = None
+        _subagent_ordinal = {}
+        _subagent_next_n = 0
+        rounds = []
+        _child_round_snaps = {
+            kid: [
+                {
+                    "completed": True,
+                    "index": 1,
+                    "tree_in_tokens": 0,
+                    "output_tokens": 20,
+                    "user_prompt": {"kind": "user_prompt", "tokens_in": 400},
+                    "model_steps": [
+                        {"tokens_in": 100, "tokens_out": 20, "tokens_cached": 0}
+                    ],
+                    "usage_raw": {
+                        "inputTokens": 10500,
+                        "cachedReadTokens": 0,
+                        "outputTokens": 20,
+                    },
+                    "breakdown": {"tree_in_tokens": 0, "cached_tokens": 0},
+                }
+            ]
+        }
+        _child_sys = {}
+        _resume_alias = {}
+
+    hb = _HB()
+    r = {
+        "model_steps": [
+            {
+                "tools": [
+                    {
+                        "name": "get_command_or_subagent_output",
+                        "subagent_id": kid,
+                    }
+                ]
+            }
+        ]
+    }
+    attach_subagents_after_steps(
+        r,
+        {
+            "children": [
+                {
+                    "session_id": kid,
+                    "usage": {
+                        "inputTokens": 10500,
+                        "cachedReadTokens": 0,
+                        "outputTokens": 20,
+                    },
+                    "turns": [
+                        {
+                            "inputTokens": 10500,
+                            "cachedReadTokens": 0,
+                            "outputTokens": 20,
+                        }
+                    ],
+                }
+            ]
+        },
+        hb=hb,
+    )
+    card = r["model_steps"][0]["subagents_after"][0]
+    assert card.get("is_sys") is not True
+    assert card["tokens_in"] == 0
+    assert card["tokens_out"] == 20
+    assert card["tokens_in"] != 500
+
+
 def test_parent_plus_each_tab_estimate():
-    from token_telemetry.session.monitor import _sum_child_tab_estimates
+    from token_telemetry.session.enrich import _sum_child_tab_estimates
 
     parent = 23.182
     tabs = [

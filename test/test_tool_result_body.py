@@ -9,7 +9,7 @@ from token_telemetry.hierarchy.bootstrap import (
     load_chat_history_tool_requests,
     load_chat_history_tool_results,
 )
-from token_telemetry.hierarchy.finalize import (
+from token_telemetry.hierarchy.thoughts_enc import (
     _stamp_tool_chat_args,
     _stamp_tool_chat_results,
 )
@@ -213,7 +213,7 @@ def test_stamp_results_always_body_not_envelope(tmp_path):
         _tool_results_mtime = None
 
         def _load_tool_results_fresh(self):
-            from token_telemetry.hierarchy.finalize import _load_tool_results_fresh
+            from token_telemetry.hierarchy.thoughts_enc import _load_tool_results_fresh
 
             return _load_tool_results_fresh(self)
 
@@ -261,7 +261,7 @@ def test_stamp_args_overwrites_inflated_update_raw_input(tmp_path):
         _tool_requests_mtime = None
 
         def _load_tool_requests_fresh(self):
-            from token_telemetry.hierarchy.finalize import _load_tool_requests_fresh
+            from token_telemetry.hierarchy.thoughts_enc import _load_tool_requests_fresh
 
             return _load_tool_requests_fresh(self)
 

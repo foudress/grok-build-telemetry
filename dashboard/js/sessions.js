@@ -89,7 +89,7 @@ function fillSessionSelect(state) {
   if (!sel) return;
   _lastStateRef = state;
   if (!state.pinned_session_id) _fullPickerLoaded = false;
-  const sessions = state.sessions || [];
+  const sessions = (state.sessions || []).slice();
   const current = state.session_id || "";
   const pinned = state.pinned_session_id || null;
   const follow = state.follow_active !== false && !pinned;
@@ -114,8 +114,9 @@ function fillSessionSelect(state) {
       : clipTitle((curRow && (curRow.title || curRow.label)) || "Session", 52);
     btn.title = curTitle;
   }
-  if (key === _lastSessionOptsKey && sel.options.length > 1) {
-    if (sel.value !== current && current) sel.value = current;
+  const optsHasCurrent = !current || [...sel.options].some((o) => o.value === current);
+  if (key === _lastSessionOptsKey && sel.options.length > 1 && optsHasCurrent) {
+    if (sel.value !== current) sel.value = current || "";
     return;
   }
   _lastSessionOptsKey = key;
@@ -126,8 +127,21 @@ function fillSessionSelect(state) {
   followOpt.textContent = follow ? "● Follow active (auto)" : "○ Follow active (auto)";
   frag.appendChild(followOpt);
 
-  const active = sessions.filter((s) => s.active);
-  const other = sessions.filter((s) => !s.active);
+  if (current && !sessions.some((s) => s.session_id === current)) {
+    const curRow = {
+      session_id: current,
+      label: current,
+      title: current,
+      active: true,
+      last_active_epoch: Date.now() / 1000,
+    };
+    sessions.unshift(curRow);
+  }
+  const byRecent = (a, b) =>
+    (Number(b.last_active_epoch) || Number(b.mtime) || 0)
+    - (Number(a.last_active_epoch) || Number(a.mtime) || 0);
+  const active = sessions.filter((s) => s.active).sort(byRecent);
+  const other = sessions.filter((s) => !s.active).sort(byRecent);
   function addGroup(label, list) {
     if (!list.length) return;
     const og = document.createElement("optgroup");
@@ -175,10 +189,41 @@ function fillSessionSelect(state) {
   }
 }
 
+function _wantSid(sessionId) {
+  return sessionId ? String(sessionId) : "";
+}
+
+function _optimisticPicker(sessionId) {
+  const sid = _wantSid(sessionId);
+  const sel = $("sessionSelect");
+  if (sel) {
+    // First /telemetry load used to leave the native <select> on "loading…"
+    // until poll painted — pin POST + sid-mismatch retries never called
+    // fillSessionSelect, so the header stayed stuck until a full reload.
+    ensureSessionDd(sel);
+    if (sid && ![...sel.options].some((o) => o.value === sid)) {
+      const o = document.createElement("option");
+      o.value = sid;
+      o.textContent = sid.slice(0, 8);
+      sel.appendChild(o);
+    }
+    sel.value = sid;
+  }
+  const btn = $("sessionDdBtn");
+  if (!btn) return;
+  const sessions = (_lastStateRef && _lastStateRef.sessions) || [];
+  const row = sessions.find((s) => String(s.session_id) === sid);
+  const title = (row && (row.title || row.label)) || (sid ? sid.slice(0, 8) : "Follow active");
+  btn.textContent = sid ? clipTitle(title, 52) : `● ${clipTitle(title, 48)}`;
+  btn.title = title;
+}
+
 async function switchSession(sessionId) {
+  const want = _wantSid(sessionId);
   _sessionSwitching = true;
   window.__sessionSwitching = true;
-  window.__pendingSid = sessionId ? String(sessionId) : null;
+  window.__pendingSid = want || null;
+  _optimisticPicker(sessionId);
   // Force a fresh /api/state body after pin/follow change.
   try { window.__clearStateEtag && window.__clearStateEtag(); } catch { /* ignore */ }
   beginViewLoad();
@@ -199,12 +244,15 @@ async function switchSession(sessionId) {
     }
     // Prefer server-resolved id so pending checks match /api/state.
     if (res.session_id) window.__pendingSid = String(res.session_id);
+    else if (!want) window.__pendingSid = null;
     _lastSessionOptsKey = "";
     if (_pollRef) {
       await _pollRef();
-      // If a parallel poll was in flight, the await can return without paint.
+      // Parallel / busy poll used to return without paint; keep retrying
+      // until /api/state session_id matches (poll clears __pendingSid).
       for (let i = 0; i < 40 && window.__pendingSid; i++) {
         await new Promise((resolve) => setTimeout(resolve, 50));
+        try { window.__clearStateEtag && window.__clearStateEtag(); } catch { /* ignore */ }
         await _pollRef();
       }
     }
@@ -214,8 +262,8 @@ async function switchSession(sessionId) {
   } finally {
     _sessionSwitching = false;
     window.__sessionSwitching = false;
-    // Never leave the period→session spinner up if paint was skipped.
-    if (window.__pendingSid) window.__pendingSid = null;
+    // Keep __pendingSid until poll() paints matching session_id so the
+    // header picker does not stay on the previous row after D/W/M open.
     endViewLoad();
   }
 }

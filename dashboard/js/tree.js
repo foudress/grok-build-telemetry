@@ -24,6 +24,13 @@ function eventMs(e) {
   return Number.isFinite(n) ? n : 0;
 }
 
+/** Present ledger number. 0 is valid; null / "" / NaN → missing. */
+function ledgerNum(v) {
+  if (v == null || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 /** User-owned Compact Out mass on a step (between-rounds — shown under User[N]). */
 function userCompactPeel(step) {
   let t = 0;
@@ -148,20 +155,27 @@ function systemBoxPartsAndTotal(sp) {
   const residualTok = Math.round(Number(sp && sp.message_residual_tokens) || 0);
   if (
     residualTok > 0
-    && !rawParts.some((p) => p.kind === "tool_definitions" || p.kind === "tool_defs_message")
+    && !rawParts.some((p) =>
+      p.kind === "tool_definitions" || p.kind === "tool_defs_message" || p.kind === "unknown" || p.kind === "message"
+    )
   ) {
     rawParts.push({
-      kind: "tool_defs_message",
-      label: "Tool definitions + Message",
+      kind: "tool_definitions",
+      label: "Tool Definitions",
       tokens: residualTok,
       tokenizer_tokens: residualTok,
     });
   }
-  const partsTok = rawParts.reduce((s, p) => s + (Number(p.tokens ?? p.tokens_in) || 0), 0);
-  const tot = (sp && (sp.message_residual_tokens != null || rawParts.length))
+  const parts = rawParts.map((p) => (
+    p && (p.kind === "message" || p.kind === "tool_defs_message")
+      ? { ...p, kind: "tool_definitions", label: "Tool Definitions" }
+      : p
+  ));
+  const partsTok = parts.reduce((s, p) => s + (Number(p.tokens ?? p.tokens_in) || 0), 0);
+  const tot = (sp && (sp.message_residual_tokens != null || parts.length))
     ? partsTok
     : (sp && (sp.tokens_in ?? sp.logical_tokens ?? sp.uncached_est));
-  return { rawParts, tot };
+  return { rawParts: parts, tot };
 }
 
 function findSubSession(subs, sa) {
@@ -507,13 +521,14 @@ function renderChildNode(c, phaseKey) {
     const outTok = Math.round(Number(
       c.tokens_out ?? c.estimate_output_tokens ?? m.to
     ) || 0);
-    // Prefer stamped encrypted TokZ — never raw chars (chars//4 is last resort only)
+    // Prefer stamped encrypted TokZ — never raw chars (chars//4 is last resort only).
+    // tokenizer_tokens=0 is missing (reconstruct used to write 0 and hide tokZ).
+    const encZ = Number(c.tokenizer_tokens) > 0
+      ? c.tokenizer_tokens
+      : (Number(c.encrypted_tokens) > 0 ? c.encrypted_tokens : null);
     const metaNode = {
       ...c,
-      tokenizer_tokens:
-        c.tokenizer_tokens
-        ?? c.encrypted_tokens
-        ?? null,
+      tokenizer_tokens: encZ,
     };
     return `<div class="node" title="${esc(c.estimate_note || "encrypted_content TokZ; residual Out bill separate")}">
       <span class="tag reasoning">reasoning</span>
@@ -695,14 +710,13 @@ function renderRoundTree(rounds, opts) {
       return "";
     const { rawParts, tot } = systemBoxPartsAndTotal(sp);
     const parts = rawParts.map(p => {
-      const tokF = Math.round(Number(p.tokens ?? p.tokens_in) || 0);
+      const tokZ = Math.round(Number(
+        p.tokenizer_tokens || p.tok_w || p.tokens || p.tokens_in
+      ) || 0);
+      const tokF = tokZ || Math.round(Number(p.tokens ?? p.tokens_in) || 0);
       const usd = p.cost_in_usd;
       const toolN = p.tool_count != null ? `${p.tool_count} tools` : "";
       const prev = String(p.preview || toolN || "").slice(0, 70);
-      const tokZ = Math.round(Number(
-        p.tokenizer_tokens || p.tok_w || tokF
-      ) || 0) || null;
-      // Same layout as tree .node: label · preview · In$ · tokZ (EOL)
       return `<div class="part-line node" title="${esc(p.note || prev || p.label || "")}">
         <span class="tag system">${esc(p.label || p.kind || "part")}</span>
         ${prev ? `<span class="sum-gray" title="${esc(prev)}">${esc(prev)}</span>` : ""}
@@ -712,7 +726,7 @@ function renderRoundTree(rounds, opts) {
     }).join("");
     return `<div class="compact-row system-row" title="${esc(sp.note || "Session bootstrap (before Round 1)")}">
       <span class="tag system">System</span>
-      <span class="compact-meta muted">${esc(sp.label || "System / tools / reminders / MCP / Message")}</span>
+      <span class="compact-meta muted">${esc(sp.label || "System / tools / reminders / MCP / Tool Definitions")}</span>
       <span class="compact-ledger">
         ${joinParts([partIn(tot, sp.cost_in_usd)])}
         ${sp.estimate_usd != null ? totalPrice(sp.estimate_usd) : ""}
@@ -731,24 +745,24 @@ function renderRoundTree(rounds, opts) {
     const priorCache = su.prior_context_tokens ?? r.cache_baseline_at_start;
     const up = r.user_prompt || {};
 
-    // Round In = user-prompt uncached In + sum(LLM call In / Harness).
-    // System stays on its own card (R1). Not paid@start API uncached.
-    const stepsForSum = r.model_steps || [];
-    let sumCallIn = 0;
-    let sumCallInUsd = 0;
-    for (const s of stepsForSum) {
-      const uc = userCompactPeelFromTotals(s);
-      sumCallIn += Math.max(0, (Number(s.tokens_in) || 0) - uc.t);
-      sumCallInUsd += Math.max(0, (Number(s.cost_in_usd) || 0) - uc.u);
+    // Round In = breakdown.tree_in (user+harness+miss). Re-sum only if absent.
+    let rIn = ledgerNum(bd.tree_in_tokens);
+    let rInUsd = ledgerNum(bd.tree_in_usd);
+    if (rIn == null || rInUsd == null) {
+      // legacy no-snap: payload without breakdown.tree_in
+      const stepsForSum = r.model_steps || [];
+      let sumCallIn = 0;
+      let sumCallInUsd = 0;
+      for (const s of stepsForSum) {
+        const uc = userCompactPeelFromTotals(s);
+        sumCallIn += Math.max(0, (Number(s.tokens_in) || 0) - uc.t);
+        sumCallInUsd += Math.max(0, (Number(s.cost_in_usd) || 0) - uc.u);
+      }
+      const userInTok = Number(up.tokens_in ?? up.uncached_est ?? bd.user_in_tokens) || 0;
+      const userInUsd = Number(up.cost_in_usd ?? bd.user_in_usd) || 0;
+      if (rIn == null) rIn = userInTok + sumCallIn;
+      if (rInUsd == null) rInUsd = userInUsd + sumCallInUsd;
     }
-    const userInTok = Number(up.tokens_in ?? up.uncached_est ?? bd.user_in_tokens) || 0;
-    const userInUsd = Number(up.cost_in_usd ?? bd.user_in_usd) || 0;
-    const rIn = (bd.tree_in_tokens != null && bd.tree_in_tokens !== "")
-      ? Number(bd.tree_in_tokens)
-      : (userInTok + sumCallIn);
-    const rInUsd = (bd.tree_in_usd != null && bd.tree_in_usd !== "")
-      ? Number(bd.tree_in_usd)
-      : (userInUsd + sumCallInUsd);
     const rCache = r.cached_read_tokens ?? bd.cached_tokens ?? su.totals?.cached_read;
     const rOut = r.output_tokens ?? bd.output_tokens ?? su.totals?.output;
     const rCacheUsd = r.cost_cached_usd ?? bd.cached_usd ?? su.totals?.cost_cached_usd;
@@ -765,24 +779,22 @@ function renderRoundTree(rounds, opts) {
     // + prompt residual — no double-count. Server peels when answer fits in pool.
     // On cache miss: prior re-read already includes answer N-1 — hide/skip it.
     // Miss lives on Attribution Reread→LLM + red box, never under User.
-    const missTok = Number(
-      bd.cache_miss_in_tokens
-      ?? r.cache_miss_in_tokens
-      ?? up.cache_miss_in_tokens
-      ?? r.reread_in_tokens
-      ?? up.reread_in_tokens
-      ?? up.reread_tokens
-      ?? bd.reread_in_tokens
-      ?? bd.reread_tokens
-    ) || 0;
-    const missUsd = Number(
-      bd.cache_miss_in_usd
-      ?? r.cache_miss_in_usd
-      ?? up.cache_miss_in_usd
-      ?? r.reread_in_usd
-      ?? up.reread_in_usd
-      ?? bd.reread_in_usd
-    ) || 0;
+    const missTok = ledgerNum(bd.cache_miss_in_tokens)
+      ?? ledgerNum(r.cache_miss_in_tokens)
+      ?? ledgerNum(up.cache_miss_in_tokens)
+      ?? ledgerNum(r.reread_in_tokens)
+      ?? ledgerNum(up.reread_in_tokens)
+      ?? ledgerNum(up.reread_tokens)
+      ?? ledgerNum(bd.reread_in_tokens)
+      ?? ledgerNum(bd.reread_tokens)
+      ?? 0;
+    const missUsd = ledgerNum(bd.cache_miss_in_usd)
+      ?? ledgerNum(r.cache_miss_in_usd)
+      ?? ledgerNum(up.cache_miss_in_usd)
+      ?? ledgerNum(r.reread_in_usd)
+      ?? ledgerNum(up.reread_in_usd)
+      ?? ledgerNum(bd.reread_in_usd)
+      ?? 0;
     const rereadHit = !!(missTok > 0 || missUsd > 0
       || up.session_restart || up.cache_miss || r.session_restart
       || up.context_reread || r.context_reread || r.cache_miss
@@ -800,10 +812,14 @@ function renderRoundTree(rounds, opts) {
     const prevOutInUsd = prevAbsorbed ? 0 : (Number(prevAns.cost_in_usd) || 0);
     const prevFromPool = !prevAbsorbed && !!prevAns.from_user_pool;
     const prevRoundN = prevAns.round_index || Math.max(0, (r.index || 1) - 1);
-    // Prompt residual (never includes answer mass)
+    // Prompt residual (never includes answer mass or Compact Out)
+    const coTokEarly = Math.round(Number((up.compact_out || {}).tokens_in) || 0);
+    const coFoldedEarly = !!up.compact_out_in_user_in;
     let promptIn = Number(
       up.prompt_tokens_in != null ? up.prompt_tokens_in : up.tokens_in ?? up.uncached_est
     ) || 0;
+    if (up.prompt_tokens_in == null && coFoldedEarly)
+      promptIn = Math.max(0, promptIn - coTokEarly - prevInTok);
     let promptUsd = Number(
       up.prompt_cost_in_usd != null ? up.prompt_cost_in_usd : up.cost_in_usd
     ) || 0;
@@ -813,7 +829,7 @@ function renderRoundTree(rounds, opts) {
       promptIn = Math.max(0, rawUser - prevInTok);
       if (rawUser > 0) promptUsd = (Number(up.cost_in_usd) || 0) * (promptIn / rawUser);
     }
-    // Prefer server tokens_in (prompt + billed peel only). Never invent answer In.
+    // Prefer server tokens_in (prompt + billed peel + Compact Out when folded).
     const userTreeIn = Number(up.tokens_in ?? up.uncached_est) || promptIn || 0;
     const userTreeUsd = Number(up.cost_in_usd) || 0;
     // Keep User Cached even on round KV miss (unknown which prefix missed).
@@ -836,15 +852,17 @@ function renderRoundTree(rounds, opts) {
     const promptPreview = promptFull.length > 48
       ? promptFull.slice(0, 48) + "…"
       : promptFull;
-    // Header In = prompt + billed LLM answer [N-1] + Compact Out (aligned with tree).
+    // Header In = billed User In (prompt + LLM answer [N-1] + Compact Out).
+    // Never prefer TokZ display_in — that made User In < User→LLM attribution.
     const coTokHead = Math.round(Number((up.compact_out || {}).tokens_in) || 0);
     const coUsdHead = Number((up.compact_out || {}).cost_in_usd) || 0;
-    const userHeadIn = Number(up.display_in_tokens)
-      || (userTreeIn + coTokHead)
-      || (promptIn + prevInTok + coTokHead);
-    const userHeadInUsd = Number(up.display_in_usd)
-      || (userTreeUsd + coUsdHead)
-      || (promptUsd + prevOutInUsd + coUsdHead);
+    const coFolded = !!up.compact_out_in_user_in;
+    let userHeadIn = ledgerNum(bd.user_in_tokens);
+    if (userHeadIn == null)
+      userHeadIn = (coFolded ? userTreeIn : (userTreeIn + coTokHead)) || userTreeIn;
+    let userHeadInUsd = ledgerNum(bd.user_in_usd);
+    if (userHeadInUsd == null)
+      userHeadInUsd = (coFolded ? userTreeUsd : (userTreeUsd + coUsdHead)) || userTreeUsd;
     const userHeadTot = userHeadInUsd + upCacheUsd;
     const uid = `${rid}-user`;
     const uOpen = openSteps.has(uid) ? " open" : "";
@@ -883,8 +901,8 @@ function renderRoundTree(rounds, opts) {
       <div class="node prompt-node" title="${esc(promptFull)}">
         <span class="tag user">prompt</span>
         <span class="sum-gray" title="${esc(promptFull)}">${esc(promptPreview) || ""}</span>
-        ${partIn(promptTokZ || promptTokF, promptUsd)}
-        ${eolTokenizerMeta({ tokenizer_tokens: promptTokZ }, promptTokZ || promptTokF || null)}
+        ${partIn(promptTokF, promptUsd)}
+        ${eolTokenizerMeta({ tokenizer_tokens: promptTokZ }, promptTokF || null)}
       </div>`;
     // User-section hooks (user_prompt_submit + future user_prompt_*) after prompt
     const userHooks = (up.hooks || r.user_hooks || []).filter(Boolean);
@@ -912,8 +930,12 @@ function renderRoundTree(rounds, opts) {
     const attrParts = [];
     if (missTok || missUsd)
       attrParts.push(`Reread${AR}LLM ${partIn(missTok, missUsd)}`);
-    if (bd.user_in_tokens || bd.user_in_usd)
-      attrParts.push(`${isSuper ? "Super Agent" : "User"}${AR}LLM ${partIn(bd.user_in_tokens, bd.user_in_usd)}`);
+    {
+      const attrUserT = ledgerNum(bd.user_in_tokens) ?? userHeadIn ?? 0;
+      const attrUserU = ledgerNum(bd.user_in_usd) ?? userHeadInUsd ?? 0;
+      if (attrUserT || attrUserU)
+        attrParts.push(`${isSuper ? "Super Agent" : "User"}${AR}LLM ${partIn(attrUserT, attrUserU)}`);
+    }
     // Harness→LLM = tools/hooks only — subtract LLM→Harness In (Out re-entry)
     // so the same tokens are not attributed twice.
     {

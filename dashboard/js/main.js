@@ -22,6 +22,7 @@ import {
   restoreScope,
   beginViewLoad,
   endViewLoad,
+  invalidatePeriodCache,
   openSessionFromPeriod,
   setScope,
 } from './period.js';
@@ -915,6 +916,28 @@ function render(state) {
 let _pollBusy = false;
 let _pollEpoch = 0;
 let _pollAgain = false;
+let _pendingRetryN = 0;
+let _pendingRetryTimer = null;
+
+let _pollWaiters = [];
+
+function _schedulePendingRetry() {
+  // Never recurse poll() synchronously on sid mismatch — that froze
+  // switchSession's 40×50ms loop and left Round hierarchy empty.
+  if (_pendingRetryN >= 40) {
+    window.__pendingSid = null;
+    _pendingRetryN = 0;
+    endViewLoad();
+    poll();
+    return;
+  }
+  _pendingRetryN += 1;
+  if (_pendingRetryTimer) return;
+  _pendingRetryTimer = setTimeout(() => {
+    _pendingRetryTimer = null;
+    poll();
+  }, 50);
+}
 
 async function poll() {
   if (_pollBusy) {
@@ -922,7 +945,7 @@ async function poll() {
     // that used to invalidate a long aggregate and retrigger the chart loader.
     _pollAgain = true;
     if (!isPeriodScope()) _pollEpoch += 1;
-    return;
+    return new Promise((resolve) => { _pollWaiters.push(resolve); });
   }
   _pollBusy = true;
   const epoch = _pollEpoch;
@@ -934,13 +957,22 @@ async function poll() {
       endViewLoad();
       return;
     }
+    const pendingPre = (typeof window.__pendingSid === "string" && window.__pendingSid)
+      ? String(window.__pendingSid)
+      : "";
     const headers = {};
-    if (_stateEtag) headers["If-None-Match"] = _stateEtag;
+    // A pin change can keep the same ETag body until catch-up; never 304 while pending.
+    if (_stateEtag && !pendingPre) headers["If-None-Match"] = _stateEtag;
     const r = await fetch("/api/state?_=" + Date.now(), {
       headers,
       cache: "no-store",
     });
     if (r.status === 304) {
+      if (pendingPre) {
+        _stateEtag = null;
+        _schedulePendingRetry();
+        return;
+      }
       endViewLoad();
       return;
     }
@@ -954,14 +986,17 @@ async function poll() {
       : "";
     if (pending && state.session_id
       && String(state.session_id).toLowerCase() !== pending.toLowerCase()) {
-      // Still switching — retry ASAP; do not clear the loader here.
-      if (window.__sessionSwitching) {
-        _pollAgain = true;
-        return;
-      }
-      // Switch finished but ids still differ — paint anyway (avoid permanent spinner).
+      // Still the previous session — do not paint KPIs or drop __pendingSid.
+      // Do populate the picker so startup pin does not stay on "loading…".
+      fillSessionSelect(state);
+      _schedulePendingRetry();
+      return;
+    }
+    _pendingRetryN = 0;
+    if (pending && state.session_id
+      && String(state.session_id).toLowerCase() === pending.toLowerCase()) {
       window.__pendingSid = null;
-    } else {
+    } else if (!pending) {
       window.__pendingSid = null;
     }
     render(state);
@@ -986,8 +1021,11 @@ async function poll() {
     _pollBusy = false;
     if (_pollAgain) {
       _pollAgain = false;
-      poll();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      await poll();
     }
+    const waiters = _pollWaiters.splice(0);
+    for (const w of waiters) w();
   }
 }
 
@@ -1086,6 +1124,7 @@ $("cacheReset")?.addEventListener("click", async () => {
   const btn = $("cacheReset");
   if (btn) btn.disabled = true;
   beginViewLoad();
+  invalidatePeriodCache();
   try {
     await fetch("/api/cache/reset", { method: "POST" });
   } catch { /* ignore */ }

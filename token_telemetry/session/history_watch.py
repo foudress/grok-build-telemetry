@@ -14,6 +14,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Optional
 
+from token_telemetry.compact_glue import is_compact_continuation
 from token_telemetry.session.discover import (
     SESSIONS_ROOT,
     _read_session_summary,
@@ -22,20 +23,10 @@ from token_telemetry.session.discover import (
     session_has_usage,
 )
 
-
 PREVIEW_LEN = 160
 MAX_EVENTS = 400
 MAX_CHANGES_PER_EVENT = 48
 MAX_SESSIONS = 80
-
-# Same phrases as hierarchy bootstrap — do not import from that freeze zone.
-_COMPACT_GLUE = (
-    "this session is being continued",
-    "ran out of context",
-    "conversation is summarized below",
-    "previous conversation that ran out",
-    "compaction/segment_",
-)
 
 
 def content_text(content: Any) -> str:
@@ -79,10 +70,7 @@ def is_compact_signal(text: Any, synthetic_reason: Any = None) -> bool:
     syn = str(synthetic_reason or "").lower()
     if "compact" in syn:
         return True
-    low = str(text or "").lower()
-    if not low.strip():
-        return False
-    return any(m in low for m in _COMPACT_GLUE)
+    return is_compact_continuation(text)
 
 
 def rec_type(obj: dict[str, Any]) -> str:

@@ -126,8 +126,8 @@ def json_dumps_len(obj: Any) -> str:
     except (TypeError, ValueError):
         return str(obj)
 
-# Keep only recent rounds in RAM (dashboard only needs a sliding window)
-MAX_ROUNDS_RETAINED = 24
+# Retain all rounds (period/cost charts); do not drop old turns after ~20.
+MAX_ROUNDS_RETAINED = 4000
 _PREVIEW_MAX = 80
 
 

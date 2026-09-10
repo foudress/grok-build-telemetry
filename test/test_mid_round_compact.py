@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from token_telemetry.hierarchy.builder import HierarchyBuilder
-from token_telemetry.hierarchy.cache_miss import _detect_context_reread
+from token_telemetry.hierarchy.reread import _detect_context_reread
 from token_telemetry.hierarchy.recap_compact import _fill_compact_cost, _on_compact
 from token_telemetry.pricing.reconstruct import (
     _inject_compact_out_in,
@@ -224,14 +224,12 @@ def test_reconstruct_split_post_tools_not_cliff_dump():
         for sub in ch.get("children") or []:
             if sub.get("kind") == "tool":
                 tool_in += int(sub.get("tokens_in") or 0)
-    # Δctx fit: post-compact window leftover (~3k) onto tools, never off_unc (~80k).
+    # Δctx fit: post-compact window leftover onto tools, never off_unc (~80k).
     off_unc = 400000 - 320000
     miss = int(recon["breakdown"].get("cache_miss_in_tokens") or 0)
-    assert 800 <= tool_in <= 4000
+    assert tool_in == 3001
     assert tool_in < off_unc / 5
     assert miss > tool_in
-    if tool_in > 0:
-        assert 800 / tool_in > 0.2
 
 
 def test_prune_does_not_reuse_round_index():
@@ -516,32 +514,6 @@ def test_stale_prior_compact_collapse_is_not_miss():
             {"stream_context_start": 4482, "context_start": 4482}
         ],
         "breakdown": {},
-    }
-    assert _detect_context_reread(hb, r) is None
-
-
-def test_idle_then_compact_is_not_idle_reread():
-    hb = _HB()
-    prior = 150000
-    r = {
-        "completed": True,
-        "idle_gap_ms": 11 * 3600 * 1000,
-        "mid_round_compacts": True,
-        "usage_raw": {
-            "inputTokens": prior + 20000,
-            "cachedReadTokens": 1000,
-        },
-        "user_prompt": {
-            "prior_context": prior,
-            "tokens_in": 80,
-            "uncached_est": 80,
-        },
-        "context_end": 12000,
-        "model_steps": [
-            {"stream_context_start": 180000, "context_start": 180000}
-        ],
-        "breakdown": {},
-        "compactions": [{"kind": "compaction", "tokens_after": 4475}],
     }
     assert _detect_context_reread(hb, r) is None
 

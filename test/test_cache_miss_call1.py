@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from token_telemetry.hierarchy.cache_miss import (
+from token_telemetry.hierarchy.reread import _detect_context_reread
+from token_telemetry.hierarchy.user_continuity import (
     _apply_session_restart_cache_miss,
-    _detect_context_reread,
 )
 from token_telemetry.pricing.reconstruct import reconstruct_model_step_usage
 

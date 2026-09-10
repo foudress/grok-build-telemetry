@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
+
 from token_telemetry.pricing.reconstruct import reconstruct_model_step_usage
+from token_telemetry.pricing.reconstruct.in_cache import _fit_tools_to_delta_ctx
 
 
 def _step(start: int, *, context_start: int | None = None, **extra) -> dict:
@@ -120,29 +123,71 @@ def test_cold_r1_call1_not_empty_with_user():
     _identities(recon, 52518, 29440)
 
 
-def test_enc_residual_not_stacked_on_one_call():
-    """Leftover Out after thought+message+toolreq lands on Enc pro-rata Enc TokZ."""
+def _enc_child():
+    return {
+        "kind": "phase_llm",
+        "children": [{"kind": "reasoning", "label": "Reasoning"}],
+    }
+
+
+def _enc_outs(recon) -> list[int]:
+    return [
+        int((s.get("composition") or {}).get("reasoning_encrypted_out") or 0)
+        for s in recon["steps"]
+    ]
+
+
+@pytest.mark.parametrize(
+    "steps,expect",
+    [
+        pytest.param(
+            [
+                _step(
+                    10000,
+                    thought_summary_tokens=40,
+                    thought_encrypted_tokens=800,
+                    thought_encrypted_chars=1200,
+                ),
+                _step(
+                    11000,
+                    thought_summary_tokens=40,
+                    thought_encrypted_tokens=400,
+                    thought_encrypted_chars=600,
+                ),
+                _step(
+                    12000,
+                    thought_summary_tokens=40,
+                    thought_encrypted_tokens=200,
+                    thought_encrypted_chars=300,
+                ),
+            ],
+            "desc_stamps",
+            id="pro_rata_enc_tokz",
+        ),
+        pytest.param(
+            [
+                _step(10000, thought_summary_tokens=10, children=[_enc_child()]),
+                _step(11000, thought_summary_tokens=40, children=[_enc_child()]),
+                _step(12000, thought_summary_tokens=80, children=[_enc_child()]),
+            ],
+            "asc_thought",
+            id="no_stamps_thought_tokz",
+        ),
+        pytest.param(
+            [
+                _step(10000, thought_summary_tokens=40, thought_encrypted_tokens=800),
+                _step(11000, thought_summary_tokens=40),
+                _step(12000, thought_summary_tokens=40),
+            ],
+            "fill_unstamped",
+            id="unstamped_filled",
+        ),
+    ],
+)
+def test_enc_residual_allocation(steps, expect):
+    """Leftover Out Enc is pro-rata (stamps or thought TokZ), never stacked on one call."""
     recon = reconstruct_model_step_usage(
-        [
-            _step(
-                10000,
-                thought_summary_tokens=40,
-                thought_encrypted_tokens=800,
-                thought_encrypted_chars=1200,
-            ),
-            _step(
-                11000,
-                thought_summary_tokens=40,
-                thought_encrypted_tokens=400,
-                thought_encrypted_chars=600,
-            ),
-            _step(
-                12000,
-                thought_summary_tokens=40,
-                thought_encrypted_tokens=200,
-                thought_encrypted_chars=300,
-            ),
-        ],
+        steps,
         official_usage={
             "inputTokens": 33000,
             "cachedReadTokens": 20000,
@@ -158,37 +203,55 @@ def test_enc_residual_not_stacked_on_one_call():
     user = int(bd.get("llm_out_to_user_tokens") or 0)
     assert thought + reason + harness + user == 900
     assert sum(int(s.get("tokens_out") or 0) for s in recon["steps"]) == 900
-    encs = [
-        int((s.get("composition") or {}).get("reasoning_encrypted_out") or 0)
-        for s in recon["steps"]
-    ]
+    encs = _enc_outs(recon)
     assert all(e > 0 for e in encs), encs
-    assert encs[0] > encs[1] > encs[2]
+    if expect == "desc_stamps":
+        assert encs[0] > encs[1] > encs[2]
+        return
+    if expect == "asc_thought":
+        assert len(set(encs)) == 3, encs
+        assert encs[0] < encs[1] < encs[2]
+        assert encs[2] > encs[0] * 4
+        seen = 0
+        for s in recon["steps"]:
+            for ch in s.get("children") or []:
+                kids = ch.get("children") if ch.get("kind") == "phase_llm" else [ch]
+                for c in kids or []:
+                    if c.get("kind") == "reasoning":
+                        seen += 1
+                        assert "tokenizer_tokens" not in c or c.get("tokenizer_tokens")
+        assert seen == 3
+        return
+    assert encs[0] > encs[1]
+    assert encs[1] > 0 and encs[2] > 0
 
 
-def test_thought_peeled_from_enc_probe_r1():
-    """thought_Z=22, message_Z=1, off_out=30 → thought_F=22, reasoning_F=7, Call Out=30."""
-    recon = reconstruct_model_step_usage(
-        [
-            _step(
-                10000,
-                thought_summary_tokens=22,
-                message_tokens=1,
-                thought_encrypted_tokens=100,
-            ),
-        ],
-        official_usage=_usage(10000, 0, 30),
+def test_tools_fit_does_not_eat_last_call_out():
+    """Δctx leftover last-call Out must not be spread onto tool In."""
+    tools_z = [100.0, 0.0]
+    reentry = [50, 0]
+    compact = [0, 0]
+    user = 20
+    last_out = 80
+    delta = user + sum(reentry) + 100 + last_out
+    got = _fit_tools_to_delta_ctx(
+        tools_z=tools_z,
+        reentry=reentry,
+        compact_per=compact,
+        user_in=user,
+        delta_ctx=delta,
+        last_out=last_out,
     )
-    s = recon["steps"][0]
-    comp = s.get("composition") or {}
-    assert int(comp.get("thought_out") or 0) == 22
-    assert int(comp.get("reasoning_encrypted_out") or 0) == 7
-    assert int(comp.get("message_out") or 0) == 1
-    assert int(s.get("tokens_out") or 0) == 30
-    bd = recon["breakdown"]
-    assert int(bd.get("llm_thought_summary_tokens") or 0) == 22
-    assert int(bd.get("llm_reasoning_tokens") or 0) == 7
-    assert int(bd.get("llm_out_to_user_tokens") or 0) == 1
+    assert sum(got) == 100
+    inflated = _fit_tools_to_delta_ctx(
+        tools_z=tools_z,
+        reentry=reentry,
+        compact_per=compact,
+        user_in=user,
+        delta_ctx=delta,
+        last_out=0,
+    )
+    assert sum(inflated) == 100 + last_out
 
 
 def test_cold_r1_nonlast_share_official_cache():

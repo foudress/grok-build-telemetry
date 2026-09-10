@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -18,50 +19,20 @@ from token_telemetry.hierarchy.text_metrics import (
     _preview,
     _scale_chars_to_tokens,
 )
-
-
-_COMPACT_GLUE = (
-    "this session is being continued",
-    "ran out of context",
-    "conversation is summarized below",
-    "previous conversation that ran out",
-    "compaction/segment_",
+from token_telemetry.compact_glue import (
+    COMPACT_GLUE_PHRASES as _COMPACT_GLUE,
+    is_compact_continuation as _is_compact_continuation,
 )
-
-
-def _is_compact_continuation(text: str) -> bool:
-    """True for compact rewrite glue (not the real first user prompt)."""
-    low = (text or "").lower()
-    if not low.strip():
-        return False
-    return any(m in low for m in _COMPACT_GLUE)
 
 
 def _session_is_subagent(session_dir: Optional[Path]) -> bool:
     """True for spawn *and* resume — both show Super Agent [1], not System Other."""
-    if session_dir is None:
-        return False
-    sm = Path(session_dir) / "summary.json"
-    if sm.is_file():
-        try:
-            data = json.loads(sm.read_text(encoding="utf-8-sig", errors="replace"))
-        except (OSError, json.JSONDecodeError, UnicodeError):
-            data = None
-        if isinstance(data, dict):
-            kind = data.get("session_kind") or (data.get("info") or {}).get(
-                "session_kind"
-            )
-            if str(kind or "").strip().lower() in ("subagent", "subagent_resume"):
-                return True
-    sp = Path(session_dir) / "system_prompt.txt"
-    if sp.is_file():
-        try:
-            blob = sp.read_text(encoding="utf-8-sig", errors="replace")[:400].lower()
-        except OSError:
-            blob = ""
-        if "subagent" in blob:
-            return True
-    return False
+    from token_telemetry.session.kind import (
+        is_subagent_kind,
+        session_kind_from_dir_files,
+    )
+
+    return is_subagent_kind(session_kind_from_dir_files(session_dir))
 
 
 def _classify_bootstrap_message(
@@ -305,20 +276,67 @@ def load_chat_history_tool_requests(
     return out
 
 
-def load_chat_history_reasonings(session_dir: Optional[Path]) -> list[dict[str, Any]]:
-    """
-    Ordered reasoning items from chat_history.jsonl (full JSON incl. encrypted_content).
+def _reasoning_summary_text(summary: Any) -> str:
+    if isinstance(summary, list):
+        parts: list[str] = []
+        for s in summary:
+            if isinstance(s, dict):
+                parts.append(str(s.get("text") or ""))
+            elif isinstance(s, str):
+                parts.append(s)
+        return "".join(parts)
+    if isinstance(summary, str):
+        return summary
+    return ""
 
-    Each entry maps ~1:1 to a model step (reasoning before assistant/tools).
-    """
-    out: list[dict[str, Any]] = []
-    if session_dir is None:
-        return out
-    ch_path = Path(session_dir) / "chat_history.jsonl"
-    if not ch_path.is_file():
-        return out
+
+def _enc_blob_fp(enc: str, enc_chars: int, preview: str) -> tuple:
+    if enc:
+        digest = hashlib.sha256(enc.encode("utf-8", errors="replace")).hexdigest()[:16]
+    else:
+        digest = ""
+    return (int(enc_chars), digest, str(preview or "")[:48])
+
+
+def _reasoning_enc_text(o: dict[str, Any]) -> str:
+    enc = o.get("encrypted_content") or ""
+    if isinstance(enc, str):
+        return enc
     try:
-        with ch_path.open(encoding="utf-8") as f:
+        return json.dumps(enc, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(enc)
+
+
+def _parse_reasoning_obj(o: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Tokenize one chat_history reasoning row (encrypted_content + summary)."""
+    if (o.get("type") or o.get("role")) != "reasoning":
+        return None
+    enc = _reasoning_enc_text(o)
+    enc_chars = len(enc)
+    sum_text = _reasoning_summary_text(o.get("summary"))
+    preview = _preview(sum_text, 80) if sum_text else ""
+    try:
+        full_chars = len(json.dumps(o, ensure_ascii=False))
+    except (TypeError, ValueError):
+        full_chars = enc_chars + len(sum_text)
+    sum_tok = count_tokens(sum_text) if sum_text else 0
+    enc_tok = count_tokens(enc) if enc else count_chars_as_tokens(enc_chars)
+    return {
+        "full_chars": full_chars,
+        "encrypted_chars": enc_chars,
+        "encrypted_tokens": int(enc_tok),
+        "enc_fp": _enc_blob_fp(enc, enc_chars, preview),
+        "summary_chars": len(sum_text),
+        "summary_text": sum_text,
+        "summary_tokens": int(sum_tok),
+        "preview": preview,
+    }
+
+
+def _iter_jsonl_objs(path: Path):
+    try:
+        with path.open(encoding="utf-8-sig") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -327,46 +345,82 @@ def load_chat_history_reasonings(session_dir: Optional[Path]) -> list[dict[str, 
                     o = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if (o.get("type") or o.get("role")) != "reasoning":
-                    continue
-                enc = o.get("encrypted_content") or ""
-                enc_chars = len(enc) if isinstance(enc, str) else len(
-                    json.dumps(enc, ensure_ascii=False)
-                )
-                summary = o.get("summary") or []
-                sum_text = ""
-                if isinstance(summary, list):
-                    for s in summary:
-                        if isinstance(s, dict):
-                            sum_text += str(s.get("text") or "")
-                        elif isinstance(s, str):
-                            sum_text += s
-                elif isinstance(summary, str):
-                    sum_text = summary
-                try:
-                    full_chars = len(json.dumps(o, ensure_ascii=False))
-                except (TypeError, ValueError):
-                    full_chars = enc_chars + len(sum_text)
-                sum_tok = count_tokens(sum_text) if sum_text else 0
-                # Encrypted blob is opaque; BPE still better relative weight than //4
-                enc_tok = (
-                    count_tokens(enc)
-                    if isinstance(enc, str) and enc
-                    else count_chars_as_tokens(enc_chars)
-                )
-                out.append(
-                    {
-                        "full_chars": full_chars,
-                        "encrypted_chars": enc_chars,
-                        "encrypted_tokens": int(enc_tok),
-                        "summary_chars": len(sum_text),
-                        "summary_text": sum_text,
-                        "summary_tokens": int(sum_tok),
-                        "preview": _preview(sum_text, 80) if sum_text else "",
-                    }
-                )
+                if isinstance(o, dict):
+                    yield o
     except OSError:
+        return
+
+
+def _sidecar_histories(session_dir: Path) -> list[list[Any]]:
+    """Pre-compact chat_history snapshots, oldest request first.
+
+    compaction_requests (and recap_requests) keep Enc blobs that jsonl
+    dropped after compact. Order by created_at so recovered Enc maps
+    onto early LLM calls.
+    """
+    found: list[tuple[str, str, list[Any]]] = []
+    for sub in ("compaction_requests", "recap_requests"):
+        folder = session_dir / sub
+        if not folder.is_dir():
+            continue
+        try:
+            files = list(folder.glob("*.json"))
+        except OSError:
+            continue
+        for fp in files:
+            try:
+                data = json.loads(fp.read_text(encoding="utf-8-sig"))
+            except (OSError, json.JSONDecodeError, UnicodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            hist = data.get("chat_history")
+            if not isinstance(hist, list):
+                continue
+            created = str(data.get("created_at") or "")
+            found.append((created, fp.name, hist))
+    found.sort(key=lambda row: (row[0], row[1]))
+    return [hist for _, _, hist in found]
+
+
+def load_chat_history_reasonings(session_dir: Optional[Path]) -> list[dict[str, Any]]:
+    """
+    Ordered Enc reasoning items for the whole session.
+
+    chat_history.jsonl is only the *current* window. Pre-compact Enc blobs
+    live in compaction_requests (and recap_requests) ``chat_history``.
+    Merge unique in time order: oldest sidecar snapshot first, then jsonl.
+    """
+    out: list[dict[str, Any]] = []
+    if session_dir is None:
         return out
+    root = Path(session_dir)
+    seen: set[tuple] = set()
+
+    def _take(o: Any) -> None:
+        if not isinstance(o, dict):
+            return
+        if (o.get("type") or o.get("role")) != "reasoning":
+            return
+        enc = _reasoning_enc_text(o)
+        sum_text = _reasoning_summary_text(o.get("summary"))
+        preview = _preview(sum_text, 80) if sum_text else ""
+        fp = _enc_blob_fp(enc, len(enc), preview)
+        if fp in seen:
+            return
+        rec = _parse_reasoning_obj(o)
+        if rec is None:
+            return
+        seen.add(fp)
+        out.append(rec)
+
+    for hist in _sidecar_histories(root):
+        for item in hist:
+            _take(item)
+    ch_path = root / "chat_history.jsonl"
+    if ch_path.is_file():
+        for o in _iter_jsonl_objs(ch_path):
+            _take(o)
     return out
 
 
@@ -383,8 +437,10 @@ def parse_session_bootstrap(
     model prompt / API input. The ``hooks`` arg is accepted for call-site
     compatibility only.
 
-    Heuristic: tokenize each JSON message (xai-token-estimation bytes/4), then
-    scale group totals so system-card + user_prompt == target_tokens (context_start).
+    Heuristic: tokenize each JSON message (TokZ). Parts keep that stamp as In;
+    do not pro-rata scale System / user_info into the stream window (that
+    swallowed subcats into Tool definitions). Remainder vs context jump is
+    attributed later in finalize.
     """
     empty = {
         "kind": "session_bootstrap",
@@ -533,25 +589,26 @@ def parse_session_bootstrap(
     if total_chars <= 0 and sys_w + user_w <= 0:
         return empty
 
-    tgt = (
-        int(target_tokens)
-        if target_tokens and target_tokens > 0
-        else max(1, int(sys_w + user_w) or count_chars_as_tokens(total_chars))
-    )
-    # Two-group split first (system vs user), then subdivide system parts
-    # by tokenizer weights (not raw chars)
-    group_tok = _scale_chars_to_tokens([max(1, sys_w), max(0, user_w) or 0], tgt)
-    sys_tok_total, user_tok_total = group_tok[0], group_tok[1]
+    # TokZ as In — never scale hist into stream start (ToolDef remainder
+    # used to absorb System / user_info after that squash).
+    _ = target_tokens
+    sys_tok_total = int(sys_w)
+    user_tok_total = int(user_w)
+    if sys_tok_total + user_tok_total <= 0:
+        sys_tok_total = max(0, count_chars_as_tokens(sys_chars))
+        user_tok_total = max(0, count_chars_as_tokens(user_chars))
 
     sys_kinds = [
         k
         for k in system_order
         if k in buckets and (buckets[k]["chars"] > 0 or buckets[k].get("tok_w"))
     ]
-    sys_weights = [
-        int(buckets[k].get("tok_w") or buckets[k]["chars"] or 0) for k in sys_kinds
+    sys_parts_tok = [
+        int(buckets[k].get("tok_w") or count_chars_as_tokens(int(buckets[k]["chars"])) or 0)
+        for k in sys_kinds
     ]
-    sys_parts_tok = _scale_chars_to_tokens(sys_weights, sys_tok_total)
+    if sys_tok_total <= 0:
+        sys_tok_total = int(sum(sys_parts_tok))
 
     labels = {
         "system": "System",
@@ -587,10 +644,9 @@ def parse_session_bootstrap(
     if user_chars > 0 and (user_query_chars or skill_chars):
         uq_w = count_chars_as_tokens(user_query_chars) or max(1, user_query_chars)
         sk_w = count_chars_as_tokens(skill_chars) if skill_chars else 0
-        ud = _scale_chars_to_tokens([max(1, uq_w), max(0, sk_w)], user_tok_total)
         user_detail = {
-            "user_query_tokens": ud[0],
-            "skill_information_tokens": ud[1] if len(ud) > 1 else 0,
+            "user_query_tokens": int(uq_w),
+            "skill_information_tokens": int(sk_w),
             "user_query_chars": user_query_chars,
             "skill_information_chars": skill_chars,
         }
@@ -600,7 +656,7 @@ def parse_session_bootstrap(
         "parts": parts,
         "system_tokens": int(sys_tok_total),
         "user_tokens": int(user_tok_total),
-        "total_tokens": int(tgt),
+        "total_tokens": int(sys_tok_total) + int(user_tok_total),
         "system_chars": int(sys_chars),
         "user_chars": int(user_chars),
         "user_preview": user_preview,
@@ -609,9 +665,10 @@ def parse_session_bootstrap(
         "tokenizer": tokenizer_mode(),
         "note": (
             f"Tokenizer({tokenizer_mode()}) split: each chat_history JSON bracket "
-            f"tokenized, pro-rata scaled to first stream context_start ({tgt}). "
+            "TokZ is In (not scaled to stream start). "
             "System card = system+user_info+reminders+MCP "
-            "(+ tool definitions added separately; hooks excluded — not in prompt); "
+            "(+ Tool Definitions from the first totalTokens jump; "
+            "hooks excluded — not in prompt); "
             "User prompt = prompt index 0 (user_query + skill_information)."
         ),
     }
@@ -703,7 +760,7 @@ def inject_tool_definitions_into_bootstrap(
     parts.append(
         {
             "kind": "tool_definitions",
-            "label": "Tool definitions",
+            "label": "Tool Definitions",
             "chars": 0,
             "tokens": tok,
             "tokenizer_tokens": tok,

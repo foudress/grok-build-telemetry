@@ -1,6 +1,8 @@
 # Generated / local extract output (batch dumps, summaries)
 /out/
 out/
+out/_probe*
+out/_tmp*
 *.log
 
 # Session payloads — may contain prompts, paths, tool args (never publish)
@@ -35,6 +37,9 @@ out/
 !/test/test_graph_activity.py
 !/test/test_graph_api.py
 !/test/test_state_wire_slim.py
+!/test/test_ledger_identities.py
+!/test/fixtures/
+!/test/fixtures/**
 
 # Maintainer session notes (not required for install)
 .grok/
@@ -55,6 +60,9 @@ htmlcov/
 .venv/
 venv/
 ENV/
+# Graph scan fixture (a venv dir that must be skipped — keep it tracked)
+!test/fixtures/graph_pkg/venv/
+!test/fixtures/graph_pkg/venv/**
 
 # Editors / OS
 .idea/
@@ -67,3 +75,4 @@ Thumbs.db
 .env
 .env.*
 *.local.json
+.token-savior-cache.json

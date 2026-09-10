@@ -286,12 +286,18 @@ def list_sessions_for_ui(
             "agent_name": agent_name,
         }
 
-    # Active first (stable order from file, last = most recent open)
+    # Active first, most-recent last_active first (file order is oldest→newest).
+    active_rows: list[dict[str, Any]] = []
     for sid in active_ids:
         row = _row(sid, active=True)
         if row:
-            out.append(row)
+            active_rows.append(row)
             seen.add(sid)
+    active_rows.sort(
+        key=lambda r: float(r.get("last_active_epoch") or r.get("mtime") or 0),
+        reverse=True,
+    )
+    out.extend(active_rows)
 
     # Always surface the pinned /telemetry session even if not in active list yet.
     if focus and focus not in seen:

@@ -2,7 +2,7 @@
 
 Live companion dashboard for **[Grok Build](https://x.ai)** sessions: exact token fields Grok already writes, cache vs uncached split, official `$` ticks, and list-price estimates — outside the TUI.
 
-> Package: `token-telemetry` **v1.0.3** (`pip install -e .` / `token-telemetry` CLI).
+> Package: `token-telemetry` **v1.1.0** (`pip install -e .` / `token-telemetry` CLI).
 
 ```
 ~/.grok/sessions/.../updates.jsonl  ──tail──►  live dashboard  ──►  http://127.0.0.1:8765/
@@ -13,14 +13,14 @@ Live companion dashboard for **[Grok Build](https://x.ai)** sessions: exact toke
 - **Context size** live (`_meta.totalTokens` + `signals.json`)
 - **Official $** from `costUsdTicks` (1 USD = 10¹⁰ ticks)
 - **Estimate $** from published xAI rates (≤200k / >200k); **model-aware cache** (4.5 vs 4.6). Session estimate = parent rounds + each sub-agent tab (one `$` per agent, not spawn+resume)
-- **Round tree** — user / system / tools / thoughts with In · Cached · Out · $ (Standard / Expert density). Recap / Compact / System ledgers right-pad like Round heads. Recaps and compacts sit in trigger order (`agent_ms`)
-- **System card** — history parts (system / user info / reminders / MCP) plus one **Tool definitions + Message** bucket so `System + R1 In = context_end` (not a hardcoded 8.2k, not official `Σ uncached`)
+- **Round tree** — user / system / tools / thoughts with In · Cached · Out · $ (Standard / Expert density). Recap / Compact / System ledgers right-pad like Round heads. Recaps and compacts sit in trigger order (`agent_ms`). Long sessions keep all rounds (not a 24-round window)
+- **System card** — history parts (system / user info / reminders / MCP) plus one **Tool definitions + Message** jump (`tt_high − hist − user − call1_out`) so `System + R1 In = context_end` (not a hardcoded 8.2k, not official `Σ uncached`). Three In ledgers stay distinct — see [docs/ledger.md](docs/ledger.md)
 - **Per-call cache** — last LLM call Cached = 0 (no harness after it). R1 ctx line is `0 → end`. R1 official Cached is shared across every call except last (Call 1 = System + User)
-- **Compact / Recap** — compact is Cached **or** In (miss) plus compressed **Out**; recaps and compacts keep trigger order. Compact continuation glue is not treated as the first user prompt
+- **Compact / Recap** — compact is Cached **or** In (miss) plus compressed **Out**; recaps and compacts keep trigger order. Compact continuation glue is matched only in the first 800 characters (packed-card Super Agent is not glue)
 - **Cost chart** — **I/O · Parts · Tools** stacks on rounds, drill, or **By label**. Recap stays In/Cached/Out in I/O; Parts/Tools fold it. Wheel-zoom only on the X-axis (full unzoom by default). Sub-agent $ stacks on the parent (violet)
-- **Daily / Weekly / Monthly** — same I/O · Parts · Tools. Parts/Tools use our hierarchy cats, bucketed by each turn’s time (not the whole session). Timeframe / Cumulative / **Normalized**; grains including **Session**. Session list is parent → sub-agent. Titles from `summary.json` `session_summary` (UTF-8 BOM-safe). **← Back** returns from a session opened out of a period. Closed sessions are **cached on disk**; **Reset calc** forces a full recompute. Long period calcs stream **`X/N` progress** (full-page or chart-local); warm cache option switches skip the graph spinner. Total All `$` matches In+Cached+Out; By label always uses the observation window (not Cumulative prefixes)
-- Session picker shows the summary title (not the UUID) in the header
-- **Sub-agents** — child sessions are peeled out of the parent LLM-call math, then shown as tabs + Sub Agent N rows (In / Cached / Out / $). **Sub Agent N Sys** sits after the spawn LLM (In = copy of that tab’s System header; display-only, not Round 2 In). Click the line to open the tab; **Sub Agent N RN** opens Round N. `get_command` In is the parent-facing tool_result body. First-round prompt is **Super Agent** (not User / not System Other), including resume tabs. Period totals skip child dirs (parent bill already includes them)
+- **Daily / Weekly / Monthly** — same I/O · Parts · Tools. Parts/Tools use our hierarchy cats, bucketed by each turn’s time (not the whole session). Timeframe / Cumulative / **Normalized**; grains including **Session**. Session list is parent → sub-agent. Titles from `summary.json` `session_summary` (UTF-8 BOM-safe). **← Back** returns from a session opened out of a period. Closed sessions are **cached on disk**; **Reset calc** forces a full recompute and refetches Daily/Weekly/Monthly. Long period calcs stream **`X/N` progress** (full-page or chart-local); warm cache option switches skip the graph spinner. Total All `$` matches In+Cached+Out; By label always uses the observation window (not Cumulative prefixes)
+- Session picker shows the summary title (not the UUID) in the header; active sessions are most-recent first; first paint unblocks the selector (not stuck on loading)
+- **Sub-agents** — child sessions are peeled out of the parent LLM-call math, then shown as tabs + Sub Agent N rows (In / Cached / Out / $). Nested workers (a child that itself spawns) also get rows + Sys cards on the parent. **Sub Agent N Sys** sits after the spawn LLM (In = copy of that tab’s System header; display-only, not Round 2 In). Click the line to open the tab; **Sub Agent N RN** opens Round N. `get_command` In is the parent-facing tool_result body. First-round prompt is **Super Agent** (not User / not System Other), including resume tabs. Period totals skip native child dirs (parent bill already includes them) and fold workflow kids into the parent
 - **Context over time** chart (200k rate-cliff line) — Session view only
 - Header **KV** chip (warm / stale idle / miss) + context pressure bar
 - Latency & tools from `signals.json`

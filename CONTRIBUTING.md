@@ -43,10 +43,15 @@ Period I/O $/M).
 ## Scope rules
 
 1. **One focused change per PR** — easier review, safer accounting.
-2. **Round 1 / System window identity:** `System + R1 In = context_end`. ToolDef+Message is the remainder after history parts — do not revert to official multi-call `Σ off_unc` or a hardcoded 8.2k on the card. The R1 **ctx line** is `0 → context_end`. Call-level cache: last = 0; R1 official Cached is shared across non-last calls (Call 1 = System + User).
-3. **Prefer pure functions** for pricing math; keep `HierarchyBuilder` orchestration thin.
+2. **Three distinct In ledgers** (do not unify — see [docs/ledger.md](docs/ledger.md)):
+   - **Window:** `System + R1 In = context_end`. The R1 **ctx line** is `0 → context_end`.
+   - **Bill:** `System + tree_in = paid_unc` (`paid_unc = inputTokens − cachedReadTokens`).
+   - **Tree In:** `tree_in = user_in + harness_in + cache_miss` (Compact Out already in `user_in`).
+   System card = history parts (TokZ) + ToolDef jump (`tt_high − hist − user − call1_out`), not a hardcoded 8.2k, not official `Σ off_unc`. Call-level cache: last = 0; R1 official Cached is shared across non-last calls (Call 1 = System + User). R1 User Cached = 0. Parent Agent line = child *round* I/O, never System. Lock these in `test/test_ledger_identities.py`, not helper names or a live SID.
+3. **Prefer pure functions** for pricing math; keep `HierarchyBuilder` orchestration thin. After `_merge_bootstrap_into_breakdown`, readers (monitor, tree.js, charts.js, period, subagent cards) **read** `breakdown.*` — they do not re-sum In.
 4. **Zero-build UI** — modular HTML/CSS/JS only (no React/npm build). Design tokens live in `dashboard/css/tokens.css`.
-5. **No personal paths or session dumps** in the repo (prompts, `updates.jsonl`, machine-specific cwd encodings).
+5. **No personal paths or session dumps** in the repo (prompts, `updates.jsonl`, machine-specific cwd encodings). Local ledger goldens: `python scripts/freeze_ledger.py --check`.
+6. **Frozen quirks** (do not “fix” in a cleanup PR): window fallback 500000; `$/M` palier 190k vs 200k cliff; chart resize reads main `state.turns`; context chart User Y via `display_in`; reread detector flags ignored for miss tokens; `_is_first_round` if `system_prompt` present; double ToolDef inject; `API_ROUNDS` = 4000.
 
 ## Where to edit
 
@@ -55,9 +60,11 @@ Period I/O $/M).
 | Package entry / CLI | `token_telemetry/__main__.py`, `token_telemetry/live_dashboard.py` |
 | Install / `/telemetry` | `docs/install.md`, `bootstrap_install.py`, `install_skills.py`, `launch_dashboard.py`, `skills/telemetry/` |
 | Feature gates | `token_telemetry/features.py`, `dashboard/js/features.js` |
-| Hierarchy / bootstrap | `token_telemetry/hierarchy/` (`builder.py`, `bootstrap.py`, …) |
-| Pricing rates & reconstruct | `token_telemetry/pricing/` (`rates.py`, `reconstruct.py`) |
-| Session discovery & monitor | `token_telemetry/session/` (`discover.py`, `monitor.py`, `subagents.py`, `aggregate.py`) |
+| Hierarchy / bootstrap | `token_telemetry/hierarchy/` (`builder.py`, `bootstrap.py`, `finalize.py`, …) |
+| Pricing rates & reconstruct | `token_telemetry/pricing/` (`rates.py`, `reconstruct/` package) |
+| Session discovery & monitor | `token_telemetry/session/` (`discover.py`, `monitor.py`, `kind.py`, `ids.py`, `subagents.py`, `aggregate.py`) |
+| Shared coercions / compact glue | `token_telemetry/util.py`, `token_telemetry/compact_glue.py` |
+| Ledger UI catalog | `docs/ledger.md` |
 | Agent graph (gated) | `token_telemetry/graph/`, `dashboard/graph.html`, `dashboard/js/graph-*.js` |
 | HTTP API & static serving | `token_telemetry/server/http.py` |
 | Tokenizer weights | `token_telemetry/tokenizer.py` |
@@ -74,8 +81,10 @@ Import the package (`from token_telemetry.hierarchy import HierarchyBuilder`, et
 - Reconstruct math stays model-agnostic — use `pricing_model_scope` / `rates_for`, do not thread `model` through `reconstruct.py` (R1 freeze).
 - Public rate tests: `pytest test/test_model_rates.py`.
 - Reconstruct / cache / R1 ctx: `pytest test/test_cache_reconstruct.py test/test_cache_miss_call1.py test/test_finalize_anchor.py test/test_system_window.py`.
+- Ledger identities (tree_in, R1 bill, Compact Out ∈ user, last Cached=0, Agent ≠ System): `pytest test/test_ledger_identities.py`.
 - Continuity / gates: `pytest test/test_prev_llm_continuity.py test/test_features.py`.
 - Full public suite: `pytest test` (only whitelisted files under `test/` are tracked).
+- After accounting edits: `python scripts/freeze_ledger.py --check` (local goldens; skip if none). `CACHE_VER` in `session/calc_cache.py` must stay listed with every new accounting file in `_CODE_FILES`.
 
 ## Style
 

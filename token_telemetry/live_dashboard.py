@@ -25,6 +25,7 @@ from typing import Optional
 from token_telemetry.tokenizer import preload as _preload_tokenizer, tokenizer_info
 
 # Session discovery + monitor
+from token_telemetry.session.calc_cache import CACHE_VER, ensure_cache_fresh
 from token_telemetry.session.discover import (
     ACTIVE_SESSIONS,
     SESSIONS_ROOT,
@@ -76,6 +77,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"  tokenizer fallback: {info['load_error']}", file=sys.stderr)
     except Exception as e:
         print(f"tokenizer preload skipped: {e}", file=sys.stderr)
+
+    dropped = ensure_cache_fresh()
+    print(f"calc-cache: v{CACHE_VER}" + (f"  dropped {dropped} stale" if dropped else ""))
 
     # Explicit --session-id (from /telemetry + GROK_SESSION_ID) must pin;
     # otherwise follow-active can jump to another concurrent Grok window.

@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlparse
 from token_telemetry import features as feat
 from token_telemetry.graph import api as graph_api
 from token_telemetry.session.aggregate import build_aggregate
+from token_telemetry.session.calc_cache import cache_meta
 from token_telemetry.session.discover import list_sessions_for_ui
 from token_telemetry.session.history_watch import WATCHER
 from token_telemetry.session.monitor import MONITOR
@@ -138,6 +139,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if alive:
             try:
+                if isinstance(payload, dict):
+                    payload = {**payload, **cache_meta()}
                 self._sse_write("result", payload)
             except Exception as exc:  # noqa: BLE001
                 self._sse_write("error", {"error": f"{type(exc).__name__}: {exc}"})
@@ -240,7 +243,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, body, "application/json; charset=utf-8")
             return
         if path == "/api/health":
-            self._send(200, b'{"ok":true}', "application/json")
+            body = json.dumps({"ok": True, **cache_meta()}, ensure_ascii=False).encode(
+                "utf-8"
+            )
+            self._send(200, body, "application/json; charset=utf-8")
             return
         if path == "/api/history":
             if not feat.MUTATION_HISTORY:
@@ -271,6 +277,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 payload = build_aggregate(period, offset, grain, stack=stack, rate=rate)
+                if isinstance(payload, dict):
+                    payload = {**payload, **cache_meta()}
             except Exception as exc:  # noqa: BLE001
                 payload = {"error": f"{type(exc).__name__}: {exc}"}
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -353,7 +361,7 @@ class Handler(BaseHTTPRequestHandler):
             n = reset_all_calcs()
             rebuilt = MONITOR.rebuild_current()
             body = json.dumps(
-                {"ok": True, "cleared": n, **rebuilt},
+                {"ok": True, "cleared": n, **rebuilt, **cache_meta()},
                 ensure_ascii=False,
             ).encode("utf-8")
             self._send(200, body, "application/json; charset=utf-8")

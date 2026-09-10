@@ -19,6 +19,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 -
 
+## [1.1.0] — 2026-09-10
+
+Same displayed ledger numbers, split accounting modules, plus dashboard nav / ToolDef / long-session
+fixes accumulated since v1.0.3. Package **1.1.0**. `CACHE_VER = 30`.
+Feature gates stay off (History, Gantt, tok/s, Graph, Period I/O $/M).
+
+### Added
+
+- Ledger catalog [`docs/ledger.md`](docs/ledger.md) and local freeze goldens (`scripts/freeze_ledger.py`).
+- Identity tests: `test/test_ledger_identities.py` (tree_in, R1 bill, Compact Out ∈ user, last Cached=0, Agent ≠ System).
+- Graph-scan fixtures under `test/fixtures/graph_pkg/` (committed golden `expected.json`).
+
+### Changed
+
+- Accounting split (same displayed numbers): `pricing/reconstruct/` package, finalize modules, session enrich/wire/children/usage/cards, aggregate windows/scan/peel_period, dashboard `cost-model.js` / `cost-draw.js` / gated extracts. Readers prefer `breakdown.*`; `0` is a present value.
+- Compact continuation glue is a shared `compact_glue.py` match on **head[:800]** only (history watch uses the same helper). Packed-card Super Agent prompts are not glue.
+- Round retention **24 → 4000** (`MAX_ROUNDS_RETAINED` / wire window). Long sessions no longer drop old rounds from the tree and cost chart.
+- Tests lock identities, not live session SIDs or `_private` re-exports. `hierarchy/__init__.py` is public-only.
+- `__version__` / package metadata aligned at **1.1.0**.
+
+### Fixed
+
+- **Header session selector** stuck on “loading…” at first `/telemetry` paint. Optimistic option + fill picker even while the pin is catching up; never send `If-None-Match` during a pending session switch (304 left the hierarchy empty). Active sessions sort most-recent first.
+- **D/W/M → session**: one click leaves period chrome immediately (Round hierarchy, not a hybrid Sessions list). `Reset calc` also invalidates the period cache and refetches when `cache_gen` bumps.
+- **Tool definitions** no longer swallow Super Agent / other System parts. Jump is hist remainder (`tt_high − hist − user − call1_out`), first `tool_call` floor, label stays “Tool definitions”. Not attributed to Round 1 tree In.
+- **Live Round 1** updates while the turn is still open (not only after finalize).
+- **Nested workers**: a child that itself spawns (workflow mapper → workers) gets Sub Agent rows + Sys cards on the parent; period totals fold those kids (`_fold_kids`) while still skipping native sub-agent dirs.
+- **Child `/api/state` snapshot**: after the monitor split, `_ChildWatch.snapshot` called `_mean_round_tps` without importing it (`NameError` on sessions with sub-agents).
+
 ## [1.0.3] — 2026-08-31
 
 Browser RAM leak when the live dashboard stays open for hours (multi‑GB).

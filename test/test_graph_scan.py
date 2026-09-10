@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from token_telemetry.graph.scan import scan_repo
@@ -102,3 +103,20 @@ def test_scan_fixture_shape():
     assert file_a["dir"] == ""
     assert file_a["kind"] == "file"
     assert file_a["loc"] > 0
+
+
+def test_scan_matches_committed_golden():
+    g = _scan()
+    expected = json.loads((FIXTURE / "expected.json").read_text(encoding="utf-8"))
+    got_nodes = {n["id"]: n for n in g["nodes"]}
+    exp_nodes = {n["id"]: n for n in expected["nodes"]}
+    assert set(got_nodes) == set(exp_nodes)
+    for nid, exp in exp_nodes.items():
+        got = got_nodes[nid]
+        for k in ("path", "dir", "loc", "deg", "kind"):
+            assert got[k] == exp[k], (nid, k, got[k], exp[k])
+    got_edges = {(e["src"], e["dst"], e["kind"], int(e["w"])) for e in g["edges"]}
+    exp_edges = {
+        (e["src"], e["dst"], e["kind"], int(e["w"])) for e in expected["edges"]
+    }
+    assert got_edges == exp_edges

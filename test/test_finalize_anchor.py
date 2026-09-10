@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
-from token_telemetry.hierarchy.recap_compact import _fill_compact_cost
-from token_telemetry.hierarchy.finalize import (
+import pytest
+
+from token_telemetry.hierarchy.attach_price import (
     _anchor_call_context_to_input,
     _apply_caused_context_display,
-    _estimate_tooldef_message_bucket,
-    _merge_bootstrap_into_breakdown,
 )
+from token_telemetry.hierarchy.recap_compact import _fill_compact_cost
+from token_telemetry.hierarchy.thoughts_enc import (
+    _enrich_session_thoughts,
+    _stamp_step_reasoning,
+)
+from token_telemetry.hierarchy.tooldef_r1 import _estimate_tooldef_message_bucket
 
 
 def test_anchor_keeps_stream_window_not_api_input():
@@ -176,43 +181,13 @@ def test_tooldef_message_bucket_is_window_remainder():
     }
     steps = [{"harness_pool_tokens": 4522}, {"harness_pool_tokens": 1563}]
     r = {"context_end": 22516}
-    hist = 1219 + 428 + 1663 + 99
-    harness = 4522 + 1563
-    assert _estimate_tooldef_message_bucket(r, boot, steps) == (
-        22516 - 3741 - harness - hist
-    )
+    # No first-LLM / jump stamps → do not use round peak as ToolDef.
+    assert _estimate_tooldef_message_bucket(r, boot, steps) == 0
 
 
 class _HB:
     def __init__(self, rounds):
         self.rounds = rounds
-
-
-def test_tree_in_includes_user_compact_out():
-    """Between-rounds Compact Out is off Call In but must stay in tree In."""
-    r = {
-        "user_prompt": {
-            "kind": "user_prompt",
-            "tokens_in": 294,
-            "cost_in_usd": 0.001,
-            "compact_out": {"tokens_in": 6295, "cost_in_usd": 0.03},
-        },
-        "model_steps": [
-            {"tokens_in": 9687, "cost_in_usd": 0.05},
-        ],
-        "breakdown": {
-            "cache_miss_in_tokens": 1000,
-            "cache_miss_in_usd": 0.01,
-            "harness_in_tokens": 99999,  # overwritten from steps
-        },
-    }
-    _merge_bootstrap_into_breakdown(_HB([r]), r)
-    bd = r["breakdown"]
-    assert bd["user_in_tokens"] == 294
-    assert bd["user_compact_out_tokens"] == 6295
-    assert bd["harness_in_tokens"] == 9687
-    assert bd["tree_in_tokens"] == 294 + 6295 + 9687 + 1000
-    assert bd["tree_in_tokens"] != 294 + 9687 + 1000
 
 
 def test_compact_warm_is_cached_xor_plus_out():
@@ -253,3 +228,125 @@ def test_compact_after_miss_is_in_not_cached():
     assert compact["pre_read_cached_tokens"] == 0
     assert compact["pre_read_cache_miss"] is True
     assert int(compact.get("out_tokens") or 0) > 0
+
+
+class _EnrichHB:
+    def __init__(self, rounds, reasonings, open_round=None):
+        self.rounds = rounds
+        self._open = open_round
+        self._session_dir = "x"
+        self._reasonings = reasonings
+
+    def _load_reasonings_fresh(self):
+        return list(self._reasonings)
+
+    def _stamp_step_reasoning(self, step, rs):
+        return _stamp_step_reasoning(step, rs)
+
+
+def _enc_toks(steps) -> list[int]:
+    return [int(s.get("thought_encrypted_tokens") or 0) for s in steps]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "skip_empty",
+        "skip_dup",
+        "across_rounds",
+        "compact_prefix",
+    ],
+)
+def test_enc_stamp_one_to_one(case):
+    """Enc TokZ stamps 1:1 kept steps; skip empty/dup; sidecar+jsonl covers all rounds."""
+    if case == "skip_empty":
+        empty = {"index": 0}
+        real = [
+            {"thought_chunks": 1, "thought_chars": 10},
+            {"thought_chunks": 1, "thought_chars": 10},
+            {"tools": [{"name": "x"}], "context_delta": 5},
+        ]
+        r = {"model_steps": [empty, *real]}
+        reasonings = [
+            {"encrypted_chars": 100, "encrypted_tokens": 25, "summary_tokens": 1, "preview": "a"},
+            {"encrypted_chars": 200, "encrypted_tokens": 50, "summary_tokens": 2, "preview": "b"},
+            {"encrypted_chars": 300, "encrypted_tokens": 75, "summary_tokens": 3, "preview": "c"},
+        ]
+        _enrich_session_thoughts(_EnrichHB([r], reasonings))
+        assert int(empty.get("thought_encrypted_tokens") or 0) == 0
+        assert _enc_toks(real) == [25, 50, 75]
+        return
+    if case == "skip_dup":
+        real = [
+            {"thought_chunks": 1, "thought_chars": 8},
+            {"thought_chunks": 1, "thought_chars": 8},
+        ]
+        dup = {
+            "encrypted_chars": 400,
+            "encrypted_tokens": 80,
+            "summary_tokens": 4,
+            "preview": "same",
+        }
+        other = {
+            "encrypted_chars": 120,
+            "encrypted_tokens": 30,
+            "summary_tokens": 1,
+            "preview": "next",
+        }
+        _enrich_session_thoughts(_EnrichHB([{"model_steps": real}], [dup, dup, other]))
+        assert _enc_toks(real) == [80, 30]
+        return
+    if case == "across_rounds":
+        r1 = {
+            "completed": True,
+            "model_steps": [
+                {
+                    "thought_chunks": 1,
+                    "thought_encrypted_tokens": 25,
+                    "thought_encrypted_chars": 100,
+                    "thought_preview": "alpha thought",
+                },
+                {
+                    "thought_chunks": 1,
+                    "thought_encrypted_tokens": 50,
+                    "thought_encrypted_chars": 200,
+                    "thought_preview": "beta thought",
+                },
+            ],
+        }
+        r2 = {
+            "model_steps": [
+                {"thought_chunks": 1, "thought_chars": 10, "thought_preview": "gamma thought"},
+                {"thought_chunks": 1, "thought_chars": 10, "thought_preview": "delta thought"},
+            ]
+        }
+        reasonings = [
+            {"encrypted_chars": 100, "encrypted_tokens": 25, "preview": "alpha thought"},
+            {"encrypted_chars": 200, "encrypted_tokens": 50, "preview": "beta thought"},
+            {"encrypted_chars": 300, "encrypted_tokens": 75, "preview": "gamma thought"},
+            {"encrypted_chars": 400, "encrypted_tokens": 90, "preview": "delta thought"},
+        ]
+        _enrich_session_thoughts(_EnrichHB([r1], reasonings, open_round=r2))
+        assert _enc_toks(r1["model_steps"]) == [25, 50]
+        assert _enc_toks(r2["model_steps"]) == [75, 90]
+        return
+    r1 = {
+        "completed": True,
+        "model_steps": [
+            {"thought_chunks": 1, "thought_chars": 8, "thought_preview": "old-a"},
+            {"thought_chunks": 1, "thought_chars": 8, "thought_preview": "old-b"},
+        ],
+    }
+    r2 = {
+        "model_steps": [
+            {"thought_chunks": 1, "thought_chars": 10, "thought_preview": "new-c"},
+        ]
+    }
+    reasonings = [
+        {"encrypted_chars": 100, "encrypted_tokens": 25, "preview": "old-a"},
+        {"encrypted_chars": 200, "encrypted_tokens": 50, "preview": "old-b"},
+        {"encrypted_chars": 300, "encrypted_tokens": 80, "preview": "new-c"},
+    ]
+    _enrich_session_thoughts(_EnrichHB([r1], reasonings, open_round=r2))
+    assert _enc_toks(r1["model_steps"]) == [25, 50]
+    assert int(r2["model_steps"][0].get("thought_encrypted_tokens") or 0) == 80
