@@ -41,7 +41,7 @@ out/_tmp*
 !/test/fixtures/
 !/test/fixtures/**
 
-# Maintainer session notes (not required for install)
+# Local agent handoff (AGENTS.md is public — keep it path-clean)
 .grok/
 
 # Python
