@@ -927,7 +927,7 @@ export function callCostParts(step, callIndex, round, opts) {
       v: causedIn, tok: causedInTok, color: COST_COLORS.in,
     });
   }
-  const ccacheTok = Number(step.cached_read_tokens ?? se.cached_read_tokens) || 0;
+  const ccacheTok = Number(step.cached_read_tokens ?? step.tokens_cached ?? se.cached_read_tokens) || 0;
   if (ccache > 0 || ccacheTok > 0) {
     bottomExtra.push({
       k: "cached",
@@ -936,6 +936,18 @@ export function callCostParts(step, callIndex, round, opts) {
       v: ccache,
       tok: ccacheTok,
       color: COST_COLORS.cached,
+    });
+  }
+  const missTok = Number(step.cache_miss_in_tokens) || 0;
+  const missUsd = Number(step.cache_miss_in_usd) || 0;
+  if (missTok > 0 || missUsd > 0) {
+    bottomExtra.push({
+      k: "cache_miss",
+      label: "cache miss",
+      legendKey: "cache_miss",
+      v: missUsd,
+      tok: missTok,
+      color: COST_COLORS.cache_miss,
     });
   }
 

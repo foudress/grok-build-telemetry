@@ -15,6 +15,7 @@ from token_telemetry.session.aggregate import build_aggregate
 from token_telemetry.session.calc_cache import cache_meta
 from token_telemetry.session.discover import list_sessions_for_ui
 from token_telemetry.session.history_watch import WATCHER
+from token_telemetry.codex.api import FEED as CODEX
 from token_telemetry.session.monitor import MONITOR
 
 
@@ -66,7 +67,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header(
                 "Access-Control-Allow-Headers",
-                "Content-Type, If-None-Match",
+                "Content-Type, If-None-Match, X-Telemetry-Have",
             )
             self.send_header("Access-Control-Expose-Headers", "ETag")
             if extra:
@@ -77,6 +78,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
         except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError):
             return
+
+    def _client_has_body(self, etag: str) -> bool:
+        """True only if this document already drew that payload.
+
+        If-None-Match is not consulted. Browsers replay it onto the next
+        document, so a Grok/Codex navigation 304'd before any paint and the
+        picker stayed on "loading…".
+        """
+        have = (self.headers.get("X-Telemetry-Have") or "").strip()
+        return bool(have) and bool(etag) and have == etag
 
     def _send_gated(self, surface: str) -> None:
         body = json.dumps(
@@ -175,6 +186,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
+        if path in ("/codex", "/codex.html"):
+            self._send(302, b"", "text/plain", extra={"Location": "/?source=codex"})
+            return
+        if path.startswith("/api/codex/"):
+            self._codex_get(path)
+            return
         if path in ("/", "/index.html"):
             if not DASHBOARD_HTML.is_file():
                 self._send(500, b"dashboard/index.html missing", "text/plain")
@@ -209,8 +226,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state":
             body = MONITOR.snapshot_bytes()
             etag = MONITOR.snapshot_etag()
-            inm = (self.headers.get("If-None-Match") or "").strip()
-            if inm and inm == etag:
+            if self._client_has_body(etag):
                 self._send(
                     304,
                     b"",
@@ -332,8 +348,119 @@ class Handler(BaseHTTPRequestHandler):
                 return
         self._send(404, b"not found", "text/plain")
 
+    def _codex_get(self, path: str) -> None:
+        tail = path[len("/api/codex"):] or "/"
+        try:
+            if tail == "/state":
+                body, etag = CODEX.state_bytes()
+                if self._client_has_body(etag):
+                    self._send(304, b"", "application/json; charset=utf-8", extra={"ETag": etag})
+                    return
+                self._send(200, body, "application/json; charset=utf-8", extra={"ETag": etag})
+                return
+            if tail == "/sessions":
+                body = json.dumps(CODEX.sessions(), ensure_ascii=False).encode("utf-8")
+                self._send(200, body, "application/json; charset=utf-8")
+                return
+            if tail == "/health":
+                body = json.dumps(CODEX.health(), ensure_ascii=False).encode("utf-8")
+                self._send(200, body, "application/json; charset=utf-8")
+                return
+            if tail == "/aggregate":
+                qs = parse_qs(urlparse(self.path).query)
+                period = (qs.get("period") or ["daily"])[0]
+                grain = (qs.get("grain") or ["hour"])[0]
+                try:
+                    offset = int((qs.get("offset") or ["0"])[0])
+                except ValueError:
+                    offset = 0
+                stream_raw = (qs.get("stream") or ["0"])[0]
+                stream = str(stream_raw).strip().lower() in ("1", "true", "yes", "on")
+                if stream:
+                    self._stream_codex_aggregate(period, offset, grain)
+                    return
+                payload = CODEX.aggregate(period, offset, grain)
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self._send(200, body, "application/json; charset=utf-8")
+                return
+        except Exception as exc:  # noqa: BLE001
+            err = json.dumps(
+                {"ok": False, "source": "codex", "error": f"{type(exc).__name__}: {exc}"},
+                ensure_ascii=False,
+            ).encode("utf-8")
+            self._send(500, err, "application/json; charset=utf-8")
+            return
+        self._send(404, b"not found", "text/plain")
+
+    def _stream_codex_aggregate(self, period: str, offset: int, grain: str) -> None:
+        """SSE progress while rollouts are read, then the period result.
+
+        The counter is what the page paints as n/n. Sending it only after the
+        scan finished left Daily/Weekly/Monthly on "Loading…" the whole time.
+        """
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError):
+            return
+        self.close_connection = True
+        alive = True
+
+        def on_progress(done: int, total: int, cold: int = 0) -> None:
+            nonlocal alive
+            if not alive:
+                return
+            alive = self._sse_write(
+                "progress",
+                {"done": int(done), "total": int(total), "cold": int(cold)},
+            )
+
+        try:
+            payload = CODEX.aggregate(period, offset, grain, on_progress=on_progress)
+        except Exception as exc:  # noqa: BLE001
+            if alive:
+                self._sse_write("error", {"error": f"{type(exc).__name__}: {exc}"})
+            return
+        if alive:
+            self._sse_write("result", payload)
+
+    def _read_json_body(self) -> Optional[dict[str, Any]]:
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        raw = self.rfile.read(n) if n > 0 else b"{}"
+        try:
+            data = json.loads(raw.decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            return None
+        return data if isinstance(data, dict) else {}
+
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
+        if path == "/api/codex/session":
+            data = self._read_json_body()
+            if data is None:
+                self._send(400, b'{"ok":false,"error":"invalid json"}', "application/json")
+                return
+            sid = data.get("session_id")
+            if sid is not None and not isinstance(sid, str):
+                sid = str(sid)
+            if sid is not None and sid.strip() == "":
+                sid = None
+            result = CODEX.select(sid)
+            body = json.dumps(result, ensure_ascii=False).encode("utf-8")
+            self._send(200 if result.get("ok") else 400, body, "application/json; charset=utf-8")
+            return
+        if path == "/api/codex/cache/reset":
+            body = json.dumps(CODEX.reset(), ensure_ascii=False).encode("utf-8")
+            self._send(200, body, "application/json; charset=utf-8")
+            return
         if path == "/api/session":
             try:
                 n = int(self.headers.get("Content-Length") or 0)

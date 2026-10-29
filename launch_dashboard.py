@@ -21,6 +21,197 @@ import webbrowser
 from pathlib import Path
 
 
+# A turn still being written counts as active. Older logs do not.
+_ACTIVE_S = 10 * 60
+
+
+def choose_source(*, grok_active: bool, codex_active: bool) -> str:
+    """Grok wins when both are in progress. Codex only when it is the one running."""
+    if grok_active or not codex_active:
+        return "grok"
+    return "codex"
+
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime if path.is_file() else 0.0
+    except OSError:
+        return 0.0
+
+
+def _grok_updates(sessions_root: Path, session_id: str) -> float:
+    if not session_id or not sessions_root.is_dir():
+        return 0.0
+    direct = _mtime(sessions_root / session_id / "updates.jsonl")
+    if direct:
+        return direct
+    try:
+        children = list(sessions_root.iterdir())
+    except OSError:
+        return 0.0
+    newest = 0.0
+    for child in children:
+        newest = max(newest, _mtime(child / session_id / "updates.jsonl"))
+    return newest
+
+
+def _codex_newest(codex_home: Path) -> float:
+    """Newest rollout under the latest day folder. Enough to see a live turn."""
+    day = codex_home / "sessions"
+    if not day.is_dir():
+        return 0.0
+    try:
+        for _ in range(3):
+            kids = [p for p in day.iterdir() if p.is_dir()]
+            if not kids:
+                break
+            day = max(kids, key=lambda p: p.name)
+        newest = 0.0
+        for path in day.iterdir():
+            name = path.name
+            if path.is_file() and (name.endswith(".jsonl") or name.endswith(".jsonl.zst")):
+                newest = max(newest, _mtime(path))
+        return newest
+    except OSError:
+        return 0.0
+
+
+def _read_active_ids(path: Path) -> list[str]:
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    out = []
+    for row in data:
+        if isinstance(row, dict) and row.get("session_id"):
+            out.append(str(row["session_id"]))
+        elif isinstance(row, str) and row:
+            out.append(row)
+    return out
+
+
+def _newest_grok(sessions_root: Path) -> tuple[float, str]:
+    """Latest updates.jsonl at session depth. Returns (mtime, session id)."""
+    best = 0.0
+    sid = ""
+    if not sessions_root.is_dir():
+        return best, sid
+    try:
+        children = list(sessions_root.iterdir())
+    except OSError:
+        return best, sid
+    for child in children:
+        if not child.is_dir():
+            continue
+        direct = child / "updates.jsonl"
+        candidates = [direct] if direct.is_file() else []
+        if not candidates:
+            try:
+                subs = list(child.iterdir())
+            except OSError:
+                continue
+            for sub in subs:
+                path = sub / "updates.jsonl"
+                if path.is_file():
+                    candidates.append(path)
+        for path in candidates:
+            if _is_subagent(path.parent):
+                continue
+            mt = _mtime(path)
+            if mt >= best:
+                best = mt
+                sid = path.parent.name
+    return best, sid
+
+
+def _is_subagent(session_dir: Path) -> bool:
+    summary = session_dir / "summary.json"
+    if not summary.is_file():
+        return False
+    try:
+        data = json.loads(summary.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    kind = data.get("session_kind") if isinstance(data, dict) else None
+    return isinstance(kind, str) and kind.strip().lower() in ("subagent", "subagent_resume")
+
+
+def launch_choice(
+    *,
+    session_id: str = "",
+    active_ids: list[str] | None = None,
+    sessions_root: Path | None = None,
+    codex_home: Path | None = None,
+    active_file: Path | None = None,
+    now: float | None = None,
+) -> tuple[str, str]:
+    """(source, grok session to open).
+
+    Active means a log written in the last 10 minutes. A stale id list is
+    not a running session. Both running → grok, and the URL pins that live
+    Grok session. Only Codex running → codex.
+    """
+    now_s = time.time() if now is None else now
+    root = sessions_root if sessions_root is not None else Path.home() / ".grok" / "sessions"
+    home = codex_home if codex_home is not None else Path.home() / ".codex"
+    if active_ids is None:
+        listing = active_file if active_file is not None else Path.home() / ".grok" / "active_sessions.json"
+        ids = _read_active_ids(listing)
+    else:
+        ids = list(active_ids)
+    grok_mtime, grok_sid = _newest_grok(root)
+    if session_id and session_id not in ids:
+        ids.append(session_id)
+    for sid in ids:
+        mt = _grok_updates(root, sid)
+        if mt >= grok_mtime:
+            grok_mtime, grok_sid = mt, sid
+    codex_mtime = _codex_newest(home)
+    # An explicit Grok session is the one the user just launched from.
+    grok_active = bool(session_id) or (
+        grok_mtime > 0 and now_s - grok_mtime <= _ACTIVE_S
+    )
+    codex_active = codex_mtime > 0 and now_s - codex_mtime <= _ACTIVE_S
+    source = choose_source(grok_active=grok_active, codex_active=codex_active)
+    if source != "grok":
+        return source, ""
+    return source, session_id or grok_sid
+
+
+def launch_source(
+    *,
+    session_id: str = "",
+    active_ids: list[str] | None = None,
+    sessions_root: Path | None = None,
+    codex_home: Path | None = None,
+    active_file: Path | None = None,
+    now: float | None = None,
+) -> str:
+    """Which dashboard to open. Both active → grok. Only Codex running → codex."""
+    source, _sid = launch_choice(
+        session_id=session_id,
+        active_ids=active_ids,
+        sessions_root=sessions_root,
+        codex_home=codex_home,
+        active_file=active_file,
+        now=now,
+    )
+    return source
+
+
+def dashboard_url(port: int, source: str, session_id: str = "") -> str:
+    base = f"http://127.0.0.1:{port}/"
+    if source == "codex":
+        return base + "?source=codex"
+    if session_id:
+        return base + "?source=grok&session=" + session_id
+    return base + "?source=grok"
+
+
 def resolve_root() -> Path:
     env = os.environ.get("GROK_TELEMETRY_ROOT")
     if env:
@@ -393,9 +584,9 @@ def main(argv: list[str] | None = None) -> int:
     session_id = (args.session_id or "").strip() or (
         os.environ.get("GROK_SESSION_ID") or ""
     ).strip()
-    url = f"http://127.0.0.1:{args.port}/"
-    if session_id:
-        url = f"{url}?session={session_id}"
+    source, live_sid = launch_choice(session_id=session_id)
+    open_sid = session_id or live_sid
+    url = dashboard_url(args.port, source, open_sid)
     health_url = f"http://127.0.0.1:{args.port}/api/health"
 
     if not args.no_kill:
@@ -403,8 +594,8 @@ def main(argv: list[str] | None = None) -> int:
         port_free_check(args.port)
 
     cmd = [str(py), "-u", "-m", "token_telemetry", "--port", str(args.port)]
-    if session_id:
-        cmd += ["--session-id", session_id]
+    if source == "grok" and open_sid:
+        cmd += ["--session-id", open_sid]
     # Always let this launcher own browser open when detached; avoid double-open
     if args.detached or args.no_open:
         cmd.append("--no-open")

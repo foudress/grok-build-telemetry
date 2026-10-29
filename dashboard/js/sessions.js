@@ -9,12 +9,6 @@ let _pollRef = null;
 /** @type {null | Record<string, any>} */
 let _lastStateRef = null;
 
-function beginViewLoad() {
-  document.body.classList.add("is-loading");
-  const el = document.getElementById("viewLoader");
-  if (el) el.hidden = false;
-}
-
 function endViewLoad() {
   document.body.classList.remove("is-loading");
   const el = document.getElementById("viewLoader");
@@ -106,6 +100,13 @@ function fillSessionSelect(state) {
   ensureSessionDd(sel);
   const btn = $("sessionDdBtn");
   const menu = $("sessionDdMenu");
+  if (!current && !sessions.length) {
+    if (btn) {
+      btn.textContent = "loading…";
+      btn.title = "";
+    }
+    return;
+  }
   const curRow = sessions.find((s) => s.session_id === current);
   const curTitle = (curRow && (curRow.title || curRow.label)) || current.slice(0, 8);
   if (btn) {
@@ -226,7 +227,6 @@ async function switchSession(sessionId) {
   _optimisticPicker(sessionId);
   // Force a fresh /api/state body after pin/follow change.
   try { window.__clearStateEtag && window.__clearStateEtag(); } catch { /* ignore */ }
-  beginViewLoad();
   try {
     const r = await fetch("/api/session", {
       method: "POST",
@@ -247,13 +247,24 @@ async function switchSession(sessionId) {
     else if (!want) window.__pendingSid = null;
     _lastSessionOptsKey = "";
     if (_pollRef) {
-      await _pollRef();
-      // Parallel / busy poll used to return without paint; keep retrying
-      // until /api/state session_id matches (poll clears __pendingSid).
-      for (let i = 0; i < 40 && window.__pendingSid; i++) {
-        await new Promise((resolve) => setTimeout(resolve, 50));
-        try { window.__clearStateEtag && window.__clearStateEtag(); } catch { /* ignore */ }
+      // One body after the pin returns. Interval polls stay out until this
+      // settles — a queued poll that awaited the next one never reached here,
+      // so the loader stayed up and the picker stayed on "loading…".
+      window.__allowPollDuringSwitch = true;
+      try {
         await _pollRef();
+      } finally {
+        window.__allowPollDuringSwitch = false;
+      }
+    }
+    if (window.__pendingSid && _pollRef) {
+      window.__pendingSid = null;
+      try { window.__clearStateEtag && window.__clearStateEtag(); } catch { /* ignore */ }
+      window.__allowPollDuringSwitch = true;
+      try {
+        await _pollRef();
+      } finally {
+        window.__allowPollDuringSwitch = false;
       }
     }
   } catch (e) {
@@ -262,8 +273,7 @@ async function switchSession(sessionId) {
   } finally {
     _sessionSwitching = false;
     window.__sessionSwitching = false;
-    // Keep __pendingSid until poll() paints matching session_id so the
-    // header picker does not stay on the previous row after D/W/M open.
+    window.__allowPollDuringSwitch = false;
     endViewLoad();
   }
 }

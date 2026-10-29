@@ -19,6 +19,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 -
 
+## [1.2.0] — 2026-10-29
+
+Codex sessions in the same dashboard, on their own data path. Grok Official API, Tree In, and System R1 stay as they were. Package **1.2.0**. `CACHE_VER` stays 30.
+
+### Added
+
+- Header switch **Grok Build / Codex** (`/?source=codex`). Codex calls `/api/codex/*` and does not use Grok hierarchy or reconstruct.
+- Rollout reader in `token_telemetry/codex/`: sum of `token_usage_record.usage` only, including `.jsonl.zst` (`zstandard`).
+- Same round tree, cost charts, and Daily/Weekly/Monthly. Tool rows use the Grok tool names. Estimates are OpenAI standard list prices; the Codex context line is 272k. `codex-auto-review` is priced as gpt-5.6-luna. `official_usd` stays 0.
+- Sub-agent tabs for the open parent's child rollouts. The session estimate is the parent plus those sub-agents.
+- Launch follows the live source: Grok when a Grok log was written in the last 10 minutes, or when a session is pinned. Codex opens only when it is the only live source.
+
+### Changed
+
+- Cost Per Turn hides the Official line when the amount is 0.
+- Daily/Weekly/Monthly stream `n/N` while rollouts are read. The chart spinner runs only for a file read from disk.
+
+### Fixed
+
+- Opening a session, or switching source, no longer waits on a full Codex history parse or on a Grok turn that is still thinking.
+- Harness shows this call's billed Out, and tool rows keep the rest of the next prompt's growth.
+- Display Cached is one call earlier: User shows call 1, and the last call of the round shows 0.
+
 ## [1.1.0] — 2026-09-10
 
 Same displayed ledger numbers, split accounting modules, plus dashboard nav / ToolDef / long-session

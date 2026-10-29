@@ -319,12 +319,14 @@ export function buildCtxPoints(rounds) {
 
     plottable.forEach((p) => {
       const m = callHierarchyMetrics(p.s);
-      // Calls Y = Cached. Last call / reminder-only LLM (no harness) is 0 —
-      // R{n} end already marks the round; plotting Call@0 is noise.
-      if (!(m.tokCache > 0)) return;
+      // Calls Y = Cached, unless the connector stamped the real prompt size.
+      // A cache miss must not draw a context drop: hit-count ≠ window.
+      const plotTok = Number(p.s.context_plot_tokens);
+      const y = Number.isFinite(plotTok) && plotTok > 0 ? plotTok : m.tokCache;
+      if (!(y > 0)) return;
       pts.push({
         label: String(p.li),
-        v: m.tokCache,
+        v: y,
         kind: "call",
         round: ri,
         call: p.li,
@@ -443,9 +445,9 @@ export function drawLineChart(canvas, series, color, rounds) {
   }
   ctx.textAlign = "left";
 
-  const TIER_CLIFF = 200000;
-  if (TIER_CLIFF > min && TIER_CLIFF < max) {
-    const yCliff = yOf(TIER_CLIFF);
+  const tierCliff = document.documentElement.dataset.source === "codex" ? 272000 : 200000;
+  if (tierCliff > min && tierCliff < max) {
+    const yCliff = yOf(tierCliff);
     ctx.save();
     ctx.strokeStyle = "rgba(240, 180, 41, 0.55)";
     ctx.setLineDash([4, 4]);
@@ -458,7 +460,7 @@ export function drawLineChart(canvas, series, color, rounds) {
     ctx.fillStyle = "#f0b429";
     ctx.font = "9px system-ui, Segoe UI, sans-serif";
     ctx.textAlign = "left";
-    ctx.fillText("200k", left + 4, yCliff - 4);
+    ctx.fillText(tierCliff >= 272000 ? "272k" : "200k", left + 4, yCliff - 4);
     ctx.restore();
   }
 
@@ -1232,6 +1234,12 @@ function eachCostYTick(yMin, max, step, unit, fn) {
   if (!seen.size) fn(yMin);
 }
 
+/** Official line only when the bill is non-zero. Codex list-price estimate stays. */
+function officialAmount(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n !== 0 ? n : null;
+}
+
 export function drawBars(canvas, turns, rounds, opts) {
   if (canvas) {
     clearCostPointerProps(canvas);
@@ -1439,8 +1447,9 @@ export function drawBars(canvas, turns, rounds, opts) {
   let rawMax = 0;
   bars.forEach((p, i) => {
     const visTot = visStacks[i].reduce((a, s) => a + costSegMetric(s, unit), 0);
-    const off = (!hidden.has("official") && unit === "usd" && p.official != null)
-      ? p.official : 0;
+    const offAmt = officialAmount(p.official);
+    const off = (!hidden.has("official") && unit === "usd" && offAmt != null)
+      ? offAmt : 0;
     rawMax = Math.max(rawMax, visTot, off, 0);
   });
   if (rawMax <= 0) rawMax = unit === "tokens" ? 1000 : 0.0001;
@@ -1511,7 +1520,7 @@ export function drawBars(canvas, turns, rounds, opts) {
       }
       segHits.push({ y0: yBase, y1: yBase + segH, seg });
     });
-    if (unit === "usd" && p.official != null && !hidden.has("official")) {
+    if (unit === "usd" && officialAmount(p.official) != null && !hidden.has("official")) {
       const oy = yOf(p.official);
       ctx.strokeStyle = COST_COLORS.official;
       ctx.lineWidth = 1.5;
@@ -1550,10 +1559,13 @@ export function drawBars(canvas, turns, rounds, opts) {
     ];
     if (bars.some((b) => b.kind === "subagent" || (b.segs || []).some((s) => s.k === "sub")))
       legendItems.push(["sub", { label: "Sub agent", color: COST_COLORS.sub, k: "sub" }]);
-    if (unit === "usd")
+    if (unit === "usd" && bars.some((b) => officialAmount(b.official) != null))
       legendItems.push(["official", { label: "Official", color: COST_COLORS.official }]);
   } else if (st.drillTurn == null && unit === "usd") {
-    if (!legendItems.some(([key]) => key === "official"))
+    if (
+      bars.some((b) => officialAmount(b.official) != null)
+      && !legendItems.some(([key]) => key === "official")
+    )
       legendItems.unshift(["official", { label: "official", color: COST_COLORS.official }]);
   }
   // Re-show hidden chips only if that category exists in *current* legendMap
@@ -1563,6 +1575,7 @@ export function drawBars(canvas, turns, rounds, opts) {
       // only if it was a fixed overview key still relevant
       const fixedOk = ["System", "In", "Cached", "Out", "official", "in", "cached", "out", "system"].includes(name);
       if (!fixedOk) continue; // drop stale tool hides from UI
+      if (name === "official" && !bars.some((b) => officialAmount(b.official) != null)) continue;
       const fallback =
         name === "System" || name === "system" ? COST_COLORS.system
         : name === "In" || name === "in" ? COST_COLORS.in
@@ -1634,7 +1647,7 @@ export function drawBars(canvas, turns, rounds, opts) {
         });
       }
       lines.push(`<b>→ ${fmtCostAxis(p.total || 0, u)}</b>`);
-      if (u === "usd" && p.official != null && !window.__costChart.hiddenLegend?.has("official"))
+      if (u === "usd" && officialAmount(p.official) != null && !window.__costChart.hiddenLegend?.has("official"))
         lines.push(`<span class="muted">official ${fmtUsd(p.official)}</span>`);
       if (p.kind === "turn") lines.push(`<span class="muted">click: tree + drill calls</span>`);
       if (p.kind === "subagent" || (p.segs || []).some((s) => s && s.session_id))
@@ -1806,7 +1819,10 @@ export function renderCostLegend(legendItems, hidden) {
 
 export function setCostUnit(unit) {
   window.__costChart.unit = unit === "tokens" ? "tokens" : "usd";
-  try { localStorage.setItem("tt-cost-unit", window.__costChart.unit); } catch { /* ignore */ }
+  const unitKey = document.documentElement.dataset.source === "codex"
+    ? "tt-cost-unit-codex"
+    : "tt-cost-unit";
+  try { localStorage.setItem(unitKey, window.__costChart.unit); } catch { /* ignore */ }
   const usdBtn = $("costUnitUsd");
   const tokBtn = $("costUnitTok");
   const isUsd = window.__costChart.unit === "usd";
@@ -2108,7 +2124,7 @@ export function drawAggBars(canvas, buckets, opts) {
           `<span class="tok-out">Out</span> ${fmtTokens(b.tokens_out)} · ${fmtUsd(b.cost_out_usd)}`,
           `<b>→ ${fmtCostAxis(tipTotal, unit)}</b>`,
         ];
-        if (unit === "usd" && b.official_usd != null)
+        if (unit === "usd" && officialAmount(b.official_usd) != null)
           lines.push(`<span class="muted">official ${fmtUsd(b.official_usd)}</span>`);
         html = lines.join("<br>");
       } else {
@@ -2118,7 +2134,7 @@ export function drawAggBars(canvas, buckets, opts) {
         });
         if (!isNorm)
           lines.push(`<b>→ ${fmtCostAxis(tipTotal, unit)}</b>`);
-        if (!isNorm && unit === "usd" && b.official_usd != null)
+        if (!isNorm && unit === "usd" && officialAmount(b.official_usd) != null)
           lines.push(`<span class="muted">official ${fmtUsd(b.official_usd)}</span>`);
         html = lines.join("<br>");
       }

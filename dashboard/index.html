@@ -4,6 +4,28 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Grok Build Telemetry</title>
+  <script>
+    (function () {
+      var q = new URLSearchParams(location.search).get("source");
+      var stored = "";
+      try { stored = localStorage.getItem("tt-source") || ""; } catch (e) {}
+      var source = q === "codex" || q === "grok" ? q : (stored === "codex" ? "codex" : "grok");
+      try { localStorage.setItem("tt-source", source); } catch (e) {}
+      document.documentElement.dataset.source = source;
+      if (source === "codex") document.title = "Codex Telemetry";
+      if (source !== "codex") return;
+      var orig = window.fetch.bind(window);
+      window.fetch = function (input, init) {
+        if (typeof input === "string" && input.indexOf("/api/") === 0 && input.indexOf("/api/codex/") !== 0) {
+          var i = input.indexOf("?");
+          var path = i < 0 ? input : input.slice(0, i);
+          var query = i < 0 ? "" : input.slice(i);
+          input = "/api/codex" + path.slice(4) + query;
+        }
+        return orig(input, init);
+      };
+    })();
+  </script>
   <link rel="stylesheet" href="css/tokens.css" />
   <link rel="stylesheet" href="css/layout.css" />
   <link rel="stylesheet" href="css/components.css" />
@@ -12,6 +34,10 @@
 </head>
 <body>
   <header>
+    <nav class="src-switch" aria-label="Telemetry source">
+      <a href="/?source=grok" data-source="grok">Grok Build</a>
+      <a href="/?source=codex" data-source="codex">Codex</a>
+    </nav>
     <button type="button" id="periodBack" class="ghost-btn period-back" hidden title="Back to period view">← Back</button>
     <h1>Grok Build Telemetry</h1>
     <a href="/history" class="meta" style="text-decoration:none" hidden>history</a>
@@ -209,6 +235,16 @@
     </section>
 
   </main>
+  <script>
+    (function () {
+      var source = document.documentElement.dataset.source || "grok";
+      document.querySelectorAll(".src-switch a").forEach(function (a) {
+        var on = a.getAttribute("data-source") === source;
+        a.classList.toggle("is-active", on);
+        if (on) a.setAttribute("aria-current", "page");
+      });
+    })();
+  </script>
   <script type="module" src="js/main.js"></script>
 </body>
 </html>

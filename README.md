@@ -2,7 +2,7 @@
 
 Live companion dashboard for **[Grok Build](https://x.ai)** sessions: exact token fields Grok already writes, cache vs uncached split, official `$` ticks, and list-price estimates — outside the TUI.
 
-> Package: `token-telemetry` **v1.1.0** (`pip install -e .` / `token-telemetry` CLI).
+> Package: `token-telemetry` **v1.2.0** (`pip install -e .` / `token-telemetry` CLI).
 
 ```
 ~/.grok/sessions/.../updates.jsonl  ──tail──►  live dashboard  ──►  http://127.0.0.1:8765/
@@ -43,6 +43,7 @@ Direct hits to gated pages show a short polish/debug note; gated APIs return `50
 
 - Python **3.10+**
 - Grok Build sessions on this machine (`~/.grok/sessions/`)
+- Codex sessions, optional (`~/.codex/sessions/` or `CODEX_HOME`). Compressed rollouts need `zstandard` (installed with the package)
 - Optional but recommended: `transformers` + local Grok-2 tokenizer under `vendor/grok-2-tokenizer/` (offline weights for In/Out pro-rata). Falls back to bytes÷4 if unavailable.
 
 ## Install (Grok Build — one line)
@@ -93,6 +94,8 @@ python scripts/live_dashboard.py --port 8765 --session-id <uuid> --no-open
 
 Opens **http://127.0.0.1:8765/** (with `?session=` when pinned) — leave it beside Grok Build.
 
+The header switch **Grok Build / Codex** reloads `/?source=grok` or `/?source=codex`. The two sources do not share sessions or ledgers. On launch, a Grok log touched in the last 10 minutes wins; Codex opens only when it is the only live source.
+
 ## Pricing estimates
 
 List rates (docs.x.ai). Session model is read from `signals.modelsUsed` / `_meta.modelId` / `usage.modelUsage` / `chat_history.model_id`. **Cached input is the only 4.5↔4.6 delta.**
@@ -110,6 +113,10 @@ List rates (docs.x.ai). Session model is read from `signals.modelsUsed` / `_meta
 - Reasoning is **not** billed on top of output (`totalTokens ≈ input+output` in logs)
 - Attribution Out: `Reasoning (Thought+Enc) + LLM→Harness + LLM→User = official Out` (tree still shows Thought and Enc as separate lines)
 - Official server `$` is `costUsdTicks / 10¹⁰`. List-rate estimate can diverge when the harness stamps a different internal scale; both cards are shown
+
+### Codex
+
+Codex has no dollar field in the logs. Estimates use OpenAI standard API list prices (short context ≤272k). `codex-auto-review` uses the gpt-5.6-luna row. Unknown model ids stay at $0. The Official line is hidden when that amount is 0. Token totals are the sum of each `token_usage_record.usage` (not the cumulative turn/thread counters).
 
 ## Data source
 
@@ -164,6 +171,7 @@ token_telemetry/                 # installable package
   pricing/                       # list rates + usage reconstruct
   session/                       # discovery, live tail, period aggregate
   graph/                         # agent animation graph (gated)
+  codex/                         # Codex rollout connector (separate from Grok ledgers)
   server/                        # local HTTP API + static files
 bootstrap_install.py             # venv + pip install -e . + /telemetry skill
 install_skills.py                # copy skills/telemetry → ~/.grok/skills

@@ -104,6 +104,29 @@ body.is-loading main {
   to { transform: rotate(360deg); }
 }
 
+.src-switch {
+  display: inline-flex;
+  flex: 0 0 auto;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-pill);
+  overflow: hidden;
+  background: var(--bg-sunken);
+}
+.src-switch a {
+  color: var(--muted);
+  text-decoration: none;
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: 0.02em;
+  padding: 5px 12px;
+  line-height: 1.2;
+}
+.src-switch a:hover { color: var(--text); }
+.src-switch a.is-active {
+  color: var(--text);
+  background: var(--accent-soft);
+}
+
 header h1 {
   margin: 0;
   font-size: var(--font-size-md);

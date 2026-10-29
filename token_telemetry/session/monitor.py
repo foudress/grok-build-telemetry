@@ -69,6 +69,8 @@ API_ROUNDS = MAX_ROUNDS_RETAINED
 class SessionMonitor:
     def __init__(self) -> None:
         self.lock = threading.Lock()
+        self._catch_gate = threading.Lock()
+        self._catch_thread: Optional[threading.Thread] = None
         self.session_dir: Optional[Path] = None
         self.session_id: Optional[str] = None
         # When set, auto-follow of newest active session is disabled
@@ -195,9 +197,10 @@ class SessionMonitor:
                     return {"ok": False, "error": f"unknown session {session_id}"}
                 self._attach_unlocked(d, pin=True)
                 out = {"ok": True, "session_id": d.name, "pinned": True}
-        # Drain outside the attach critical section: release between chunks so
-        # concurrent /api/state is not wedged for the whole replay (D/W/M open).
-        self._catch_up_yielding()
+        # Replay on a side thread. The request must return while a live turn
+        # is still appending updates.jsonl — that replay is what pinned the
+        # center spinner.
+        self._catch_up_async()
         return out
 
     def rebuild_current(self) -> dict[str, Any]:
@@ -224,6 +227,18 @@ class SessionMonitor:
             self._snap_rev = -1
             self._snap_sig_key = None
             return {"rebuilt": True, "session_id": sid}
+
+    def _catch_up_async(self) -> None:
+        """Drain the attached session without holding the HTTP request."""
+        with self._catch_gate:
+            if self._catch_thread is not None and self._catch_thread.is_alive():
+                return
+            self._catch_thread = threading.Thread(
+                target=self._catch_up_yielding,
+                name="telemetry-catch-up",
+                daemon=True,
+            )
+            self._catch_thread.start()
 
     def _catch_up_yielding(self) -> None:
         """Drain updates.jsonl; release the monitor lock between chunks."""
@@ -644,172 +659,211 @@ class SessionMonitor:
         return sync_children(self)
 
     def snapshot_bytes(self) -> bytes:
-        """Return JSON bytes for /api/state; rebuild only when data revision changes."""
-        with self.lock:
-            # Ingest new lines first (background poller also ticks; both under lock)
-            self.tick()
-            rev = self.hierarchy.revision
-            # Pinned (/telemetry): only active + focused session in the picker
-            # payload — avoid usage-scanning dozens of unrelated jsonl files.
-            sessions = list_sessions_for_ui(focus_session_id=self.pinned_session_id)
-            sig_key = (
-                self.live.get("context_tokens"),
-                self.live.get("context_tokens_ui"),
-                self.live.get("phase"),
-                len(self.turns),
-                len(self.feed),
-                len(self.context_series),
-                self.error,
-                self.signals.get("contextTokensUsed"),
-                self.signals.get("turnCount"),
-                self.signals.get("toolCallCount"),
-                self.signals.get("primaryModelId"),
-                getattr(self.hierarchy, "_pricing_model", None),
-                self.session_id,
-                self.pinned_session_id,
-                tuple(s["session_id"] for s in sessions[:20]),
-                tuple(
-                    (cid, w.hierarchy.revision, len(w.turns))
-                    for cid, w in self._children.items()
-                ),
-            )
-            if (
-                self._snap_bytes is not None
-                and self._snap_rev == rev
-                and self._snap_sig_key == sig_key
-            ):
+        """Publish the session already in memory.
+
+        Do not read updates.jsonl here. A live turn keeps appending that file;
+        the background poller is the only ingest. /api/state used to call
+        tick() under this lock, so a response in progress froze the page.
+        """
+        if not self.lock.acquire(blocking=False):
+            if self._snap_bytes is not None:
                 return self._snap_bytes
+            return self._shell_bytes()
+        try:
+            # Nothing ingested yet. Publishing here walks every session dir
+            # while holding the lock and the page draws that empty body as idle.
+            if not self.bootstrapped:
+                if self._snap_bytes is not None:
+                    return self._snap_bytes
+                return self._shell_bytes()
+            return self._publish_unlocked()
+        finally:
+            self.lock.release()
 
-            official = 0.0
-            ticks_sum = 0
-            for t in self.turns:
-                official += float(t.get("official_usd") or 0)
-                ticks_sum += int(t.get("official_ticks") or 0)
-            children_official = 0.0
-            for w in self._children.values():
-                children_official += sum(float(t.get("official_usd") or 0) for t in w.turns)
-            # Parent-only = harness bill minus children (same $ the peel removes)
-            parent_only = max(0.0, official - children_official)
+    def _shell_bytes(self) -> bytes:
+        """Tiny body so the page can draw before the first ingest finishes."""
+        payload = {
+            "watching": False,
+            "error": None,
+            "pending": True,
+            "session_id": self.session_id,
+            "session_kind": None,
+            "pinned_session_id": self.pinned_session_id,
+            "follow_active": self.pinned_session_id is None,
+            "sessions": [],
+            "source": str(self.session_dir) if self.session_dir else None,
+            "live": {},
+            "signals": {},
+            "turns": [],
+            "rounds": [],
+            "sub_sessions": [],
+            "context_series": [],
+            "feed": [],
+            "totals": {},
+            "pricing": {},
+            "revision": 0,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
-            ctx = self.live.get("context_tokens")
-            rounds_all = self.hierarchy.snapshot_rounds(include_open=True)
+    def _publish_unlocked(self) -> bytes:
+        """Return JSON bytes for /api/state; rebuild only when data revision changes."""
+        rev = self.hierarchy.revision
+        # Pinned (/telemetry): only active + focused session in the picker
+        # payload — avoid usage-scanning dozens of unrelated jsonl files.
+        sessions = list_sessions_for_ui(focus_session_id=self.pinned_session_id)
+        sig_key = (
+            self.live.get("context_tokens"),
+            self.live.get("context_tokens_ui"),
+            self.live.get("phase"),
+            len(self.turns),
+            len(self.feed),
+            len(self.context_series),
+            self.error,
+            self.signals.get("contextTokensUsed"),
+            self.signals.get("turnCount"),
+            self.signals.get("toolCallCount"),
+            self.signals.get("primaryModelId"),
+            getattr(self.hierarchy, "_pricing_model", None),
+            self.session_id,
+            self.pinned_session_id,
+            tuple(s["session_id"] for s in sessions[:20]),
+            tuple(
+                (cid, w.hierarchy.revision, len(w.turns))
+                for cid, w in self._children.items()
+            ),
+        )
+        if (
+            self._snap_bytes is not None
+            and self._snap_rev == rev
+            and self._snap_sig_key == sig_key
+        ):
+            return self._snap_bytes
 
-            # Session Cost estimate over *all* rounds (not the wire-truncated slice).
-            # R1 white UI total is peeled; session sum uses full API bill per turn
-            # so we never do peeled_rounds + System (double) or peeled-only (short).
-            parent_est = _sum_rounds_estimate(rounds_all)
-            _roots, _alias, latest_map = self._child_lineage()
+        official = 0.0
+        ticks_sum = 0
+        for t in self.turns:
+            official += float(t.get("official_usd") or 0)
+            ticks_sum += int(t.get("official_ticks") or 0)
+        children_official = 0.0
+        for w in self._children.values():
+            children_official += sum(float(t.get("official_usd") or 0) for t in w.turns)
+        # Parent-only = harness bill minus children (same $ the peel removes)
+        parent_only = max(0.0, official - children_official)
 
-            # Only last N rounds over the wire (browser tree)
-            rounds_raw = rounds_all
-            if len(rounds_raw) > API_ROUNDS:
-                rounds_raw = rounds_raw[-API_ROUNDS:]
-            rounds = [self._enrich_round_usage(r) for r in rounds_raw]
-            ordmap = getattr(self.hierarchy, "_subagent_ordinal", None) or {}
-            sub_sessions = []
-            seen_tab: set[str] = set()
-            for w in self._children.values():
-                sid = str(w.session_id or "").lower()
-                root = str(getattr(w, "root_id", None) or sid).lower()
-                # One tab per agent: latest resume, else the original spawn.
-                pick = str((latest_map or {}).get(root) or root).lower()
-                if sid != pick:
-                    continue
-                if root in seen_tab:
-                    continue
-                seen_tab.add(root)
-                snap = w.snapshot(self._enrich_round_usage)
-                snap["root_session_id"] = root
-                snap["n"] = ordmap.get(root) or ordmap.get(str(root or "").lower())
-                snap["resume_index"] = 0
-                snap["label"] = (
-                    f"Sub Agent {snap['n']}" if snap.get("n") else (snap.get("label") or "Sub Agent")
-                )
-                sub_sessions.append(snap)
-            # Parent session $ + each sub-agent tab $ (the number on that tab).
-            children_est = _sum_child_tab_estimates(sub_sessions)
-            est = parent_est + children_est
-            # Drop heavy nested estimate blobs from completed steps already priced
-            slim_rounds = list(rounds)
-            for ss in sub_sessions:
-                slim_rounds.extend(ss.get("rounds") or [])
-            for rr in slim_rounds:
-                for step in rr.get("model_steps") or []:
-                    if not isinstance(step, dict):
-                        continue
-                    est_s = step.get("estimate")
-                    if isinstance(est_s, dict):
-                        # keep fields the UI reads; drop verbose notes / duplicates
-                        for k in ("cache_note", "in_note", "method", "cost_usd"):
-                            est_s.pop(k, None)
+        ctx = self.live.get("context_tokens")
+        rounds_all = self.hierarchy.snapshot_rounds(include_open=True)
 
-            kind = None
-            if self.session_dir is not None:
-                kind = (read_session_summary(self.session_dir) or {}).get("session_kind")
-            payload = _slim_wire(
-                {
-                    "watching": self.bootstrapped and self.error is None,
-                    "error": self.error,
-                    "session_id": self.session_id,
-                    "session_kind": kind,
-                    "pinned_session_id": self.pinned_session_id,
-                    "follow_active": self.pinned_session_id is None,
-                    "sessions": sessions,
-                    "source": str(self.session_dir) if self.session_dir else None,
-                    "live": dict(self.live),
-                    "signals": _slim_signals(self.signals),
-                    "turns": list(self.turns),
-                    "rounds": rounds,
-                    "sub_sessions": sub_sessions,
-                    "context_series": list(self.context_series),
-                    "feed": list(self.feed),
-                    "totals": {
-                        "official_usd": round(official, 6),
-                        "estimate_usd": round(est, 6),
-                        "official_ticks": ticks_sum,
-                        "turns": len(self.turns),
-                        "parent_only_usd": round(parent_only, 6),
-                        "children_usd": round(children_official, 6),
-                        "parent_estimate_usd": round(parent_est, 6),
-                        "children_estimate_usd": round(children_est, 6),
-                        "combined_usd": round(official, 6),
-                        "subagent_count": len(sub_sessions),
-                        "gen_tokens_per_sec": _mean_round_tps(rounds_all),
-                    },
-                    "pricing": pricing_payload(
-                        model=getattr(self.hierarchy, "_pricing_model", None),
-                        models_raw=list(getattr(self.hierarchy, "_models_raw", None) or []),
-                        assumed=getattr(self.hierarchy, "_pricing_model", None) is None,
-                    ),
-                    "context_now_estimate_note": (
-                        "Context card uses signals.contextTokensUsed (TUI-aligned). "
-                        f"Current context {ctx} → tier {pick_tier(ctx or 0)['name']}."
-                        if ctx is not None
-                        else None
-                    ),
-                    "revision": rev,
-                }
+        # Session Cost estimate over *all* rounds (not the wire-truncated slice).
+        # R1 white UI total is peeled; session sum uses full API bill per turn
+        # so we never do peeled_rounds + System (double) or peeled-only (short).
+        parent_est = _sum_rounds_estimate(rounds_all)
+        _roots, _alias, latest_map = self._child_lineage()
+
+        # Only last N rounds over the wire (browser tree)
+        rounds_raw = rounds_all
+        if len(rounds_raw) > API_ROUNDS:
+            rounds_raw = rounds_raw[-API_ROUNDS:]
+        rounds = [self._enrich_round_usage(r) for r in rounds_raw]
+        ordmap = getattr(self.hierarchy, "_subagent_ordinal", None) or {}
+        sub_sessions = []
+        seen_tab: set[str] = set()
+        for w in self._children.values():
+            sid = str(w.session_id or "").lower()
+            root = str(getattr(w, "root_id", None) or sid).lower()
+            # One tab per agent: latest resume, else the original spawn.
+            pick = str((latest_map or {}).get(root) or root).lower()
+            if sid != pick:
+                continue
+            if root in seen_tab:
+                continue
+            seen_tab.add(root)
+            snap = w.snapshot(self._enrich_round_usage)
+            snap["root_session_id"] = root
+            snap["n"] = ordmap.get(root) or ordmap.get(str(root or "").lower())
+            snap["resume_index"] = 0
+            snap["label"] = (
+                f"Sub Agent {snap['n']}" if snap.get("n") else (snap.get("label") or "Sub Agent")
             )
-            body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
-                "utf-8"
-            )
-            self._snap_bytes = body
-            self._snap_etag = '"' + hashlib.sha1(body).hexdigest()[:16] + '"'
-            self._snap_rev = rev
-            self._snap_sig_key = sig_key
-            return body
+            sub_sessions.append(snap)
+        # Parent session $ + each sub-agent tab $ (the number on that tab).
+        children_est = _sum_child_tab_estimates(sub_sessions)
+        est = parent_est + children_est
+        # Drop heavy nested estimate blobs from completed steps already priced
+        slim_rounds = list(rounds)
+        for ss in sub_sessions:
+            slim_rounds.extend(ss.get("rounds") or [])
+        for rr in slim_rounds:
+            for step in rr.get("model_steps") or []:
+                if not isinstance(step, dict):
+                    continue
+                est_s = step.get("estimate")
+                if isinstance(est_s, dict):
+                    # keep fields the UI reads; drop verbose notes / duplicates
+                    for k in ("cache_note", "in_note", "method", "cost_usd"):
+                        est_s.pop(k, None)
+
+        kind = None
+        if self.session_dir is not None:
+            kind = (read_session_summary(self.session_dir) or {}).get("session_kind")
+        payload = _slim_wire(
+            {
+                "watching": self.bootstrapped and self.error is None,
+                "error": self.error,
+                "session_id": self.session_id,
+                "session_kind": kind,
+                "pinned_session_id": self.pinned_session_id,
+                "follow_active": self.pinned_session_id is None,
+                "sessions": sessions,
+                "source": str(self.session_dir) if self.session_dir else None,
+                "live": dict(self.live),
+                "signals": _slim_signals(self.signals),
+                "turns": list(self.turns),
+                "rounds": rounds,
+                "sub_sessions": sub_sessions,
+                "context_series": list(self.context_series),
+                "feed": list(self.feed),
+                "totals": {
+                    "official_usd": round(official, 6),
+                    "estimate_usd": round(est, 6),
+                    "official_ticks": ticks_sum,
+                    "turns": len(self.turns),
+                    "parent_only_usd": round(parent_only, 6),
+                    "children_usd": round(children_official, 6),
+                    "parent_estimate_usd": round(parent_est, 6),
+                    "children_estimate_usd": round(children_est, 6),
+                    "combined_usd": round(official, 6),
+                    "subagent_count": len(sub_sessions),
+                    "gen_tokens_per_sec": _mean_round_tps(rounds_all),
+                },
+                "pricing": pricing_payload(
+                    model=getattr(self.hierarchy, "_pricing_model", None),
+                    models_raw=list(getattr(self.hierarchy, "_models_raw", None) or []),
+                    assumed=getattr(self.hierarchy, "_pricing_model", None) is None,
+                ),
+                "context_now_estimate_note": (
+                    "Context card uses signals.contextTokensUsed (TUI-aligned). "
+                    f"Current context {ctx} → tier {pick_tier(ctx or 0)['name']}."
+                    if ctx is not None
+                    else None
+                ),
+                "revision": rev,
+            }
+        )
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        self._snap_bytes = body
+        self._snap_etag = '"' + hashlib.sha1(body).hexdigest()[:16] + '"'
+        self._snap_rev = rev
+        self._snap_sig_key = sig_key
+        return body
 
     def snapshot_etag(self) -> str:
-        """ETag for the last snapshot_bytes() payload (call after snapshot_bytes)."""
-        with self.lock:
-            if self._snap_etag:
-                return self._snap_etag
-            if self._snap_bytes is not None:
-                self._snap_etag = (
-                    '"' + hashlib.sha1(self._snap_bytes).hexdigest()[:16] + '"'
-                )
-                return self._snap_etag
-            return '"0"'
+        """ETag for the last published payload. Does not take the ingest lock."""
+        etag = self._snap_etag
+        if etag:
+            return etag
+        return '"0"'
 
 
 MONITOR = SessionMonitor()

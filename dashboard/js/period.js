@@ -260,11 +260,14 @@ function setAggProgress(done, total, meta) {
   const n = Math.max(0, Number(done) || 0);
   const t = Math.max(0, Number(total) || 0);
   const text = t > 0 ? `${n}/${t}` : "";
-  // Chart-option refetch: spinner only when at least one session rebuilds cache.
+  // Chart-option refetch: spinner only when a rollout is read from disk.
+  // A warm 0/N tick must not cancel the wait, or a later cold file is silent.
   if (_chartLoaderAwaitCold) {
-    _chartLoaderAwaitCold = false;
     const cold = meta && meta.cold != null ? Number(meta.cold) : 0;
-    if (cold > 0) beginChartLoad();
+    if (cold > 0) {
+      _chartLoaderAwaitCold = false;
+      beginChartLoad();
+    }
   }
   const lab = $("viewLoaderLab");
   // Only rewrite the full-page label once aggregate progress starts (keep
@@ -791,7 +794,12 @@ async function readAggregateSse(response, onProgress) {
       let obj;
       try { obj = JSON.parse(data); } catch { continue; }
       if (event === "progress" && onProgress) onProgress(obj.done, obj.total, obj);
-      else if (event === "result") result = obj;
+      else if (event === "result") {
+        // The result is the page. Do not wait for socket EOF — a keep-alive
+        // stream leaves fetchPeriod pending and the full-page loader up.
+        try { await reader.cancel(); } catch { /* ignore */ }
+        return obj;
+      }
       else if (event === "error") throw new Error(obj.error || "aggregate error");
     }
   }
@@ -841,23 +849,41 @@ export async function fetchPeriod() {
   if (_aggAbort) {
     try { _aggAbort.abort(); } catch { /* ignore */ }
   }
-  _aggAbort = new AbortController();
-  const signal = _aggAbort.signal;
+  const ctrl = new AbortController();
+  _aggAbort = ctrl;
+  const signal = ctrl.signal;
+  // No bytes for 3 minutes means this stream is dead. Progress resets it.
+  // Abort this controller only — a later period fetch has its own.
+  let silence = setTimeout(() => ctrl.abort("timeout"), 180000);
+  const bumpSilence = () => {
+    clearTimeout(silence);
+    silence = setTimeout(() => ctrl.abort("timeout"), 180000);
+  };
   // rate=1 when user is on tok/s (includes sub-agent points). Otherwise still
   // returns Parts/Tools cats + mains tps so stack switches stay local.
   const url = `/api/aggregate?period=${encodeURIComponent(_scope)}&offset=${_offset}&grain=${encodeURIComponent(_grain)}&stack=${encodeURIComponent(_stack)}&rate=${_rate ? "1" : "0"}&stream=1&_=${Date.now()}`;
   let agg = null;
   try {
+  try {
     const r = await fetch(url, { signal });
     if (!r.ok) throw new Error("HTTP " + r.status);
     const ctype = (r.headers.get("content-type") || "").toLowerCase();
     if (ctype.includes("text/event-stream")) {
-      agg = await readAggregateSse(r, setAggProgress);
+      agg = await readAggregateSse(r, (done, total, meta) => {
+        bumpSilence();
+        setAggProgress(done, total, meta);
+      });
     } else {
       agg = await r.json();
     }
   } catch (e) {
-    if (e && e.name === "AbortError") return;
+    if (e && e.name === "AbortError") {
+      if (signal.reason === "timeout") {
+        endAggLoaders();
+        throw new Error("aggregate timed out");
+      }
+      return;
+    }
     _chartLoaderAwaitCold = false;
     endAggLoaders();
     throw e;
@@ -885,6 +911,9 @@ export async function fetchPeriod() {
   // Hide chart-local overlay immediately; full-page spinner is cleared by poll().
   endChartLoad();
   // endViewLoad left to poll() so a superseded in-flight fetch does not hide the spinner.
+  } finally {
+    clearTimeout(silence);
+  }
 }
 
 export function redrawPeriod() {

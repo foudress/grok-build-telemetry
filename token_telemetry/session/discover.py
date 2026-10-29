@@ -37,14 +37,22 @@ def session_has_usage(session_dir: Path) -> bool:
 
 
 def _scan_updates_has_usage(path: Path) -> bool:
+    """Stop at the first billed turn. Do not slurp the whole log.
+
+    The session picker calls this while /api/state is being built. Reading
+    every updates.jsonl into one string made that response outlive the page.
+    """
     try:
-        raw = path.read_text(encoding="utf-8", errors="replace")
+        fh = path.open("r", encoding="utf-8", errors="replace")
     except OSError:
         return False
-    if "turn_completed" not in raw:
-        return False
-    for line in raw.splitlines():
-        if not line or line[0] not in "{[" or "turn_completed" not in line:
+    with fh:
+        return _usage_in_lines(fh)
+
+
+def _usage_in_lines(lines: Any) -> bool:
+    for line in lines:
+        if "turn_completed" not in line:
             continue
         try:
             o = json.loads(line)

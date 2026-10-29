@@ -28,7 +28,9 @@ import {
 } from './period.js';
 import { FEATURES, applyFeatureGates } from './features.js';
 
-const TIER_CLIFF = 200000;
+function tierCliff() {
+  return document.documentElement.dataset.source === "codex" ? 272000 : 200000;
+}
 const CTX_GRAPH_MIN_H = 180;
 const CTX_GRAPH_MAX_H = 720;
 let _taskTab = "main";
@@ -51,6 +53,7 @@ let _subTabClicksBound = false;
 
 function clearStateEtag() {
   _stateEtag = null;
+  _paintedEtag = null;
 }
 window.__clearStateEtag = clearStateEtag;
 
@@ -343,9 +346,11 @@ function paintPressure(ctx, win) {
   bar.hidden = false;
   const pct = Math.min(100, (ctx / win) * 100);
   fill.style.width = pct + "%";
-  bar.classList.toggle("is-tier", ctx >= TIER_CLIFF);
+  const cliff = tierCliff();
+  bar.title = `Context vs window · notch = ${cliff >= 272000 ? "272k" : "200k"} rate cliff`;
+  bar.classList.toggle("is-tier", ctx >= cliff);
   bar.classList.toggle("is-hot", win > 0 && ctx / win >= 0.8);
-  if (notch) notch.style.left = Math.min(100, (TIER_CLIFF / win) * 100) + "%";
+  if (notch) notch.style.left = Math.min(100, (cliff / win) * 100) + "%";
 }
 
 function paintKvChip(rounds) {
@@ -763,18 +768,30 @@ function bindCtxGraphResize() {
 }
 
 function render(state) {
-  if (isPeriodScope()) return;
+  if (isPeriodScope()) return false;
+  // An empty shell is not a session. Painting it put a dot in the picker
+  // and "idle" on the badge, and the etag then stuck the page there.
+  if (state && state.pending) {
+    const badge = $("liveBadge");
+    if (badge) {
+      badge.textContent = "connecting…";
+      badge.className = "badge";
+    }
+    return false;
+  }
   leavePeriodView();
   const tree = $("roundTree");
   if (tree) tree.classList.remove("sess-list");
   window.__lastState = state;
+  // Picker first. A later throw must not leave the native select on "loading…".
+  try { fillSessionSelect(state); } catch (e) { console.error(e); }
   if (!state || state.error) {
     $("liveBadge").textContent = "error";
     $("liveBadge").className = "badge warn";
     const err = state && state.error ? String(state.error) : "no state";
     if (state && state.error) $("sessionMeta").textContent = err;
     showBanner(err, "error");
-    return;
+    return true;
   }
   showBanner("");
 
@@ -809,7 +826,8 @@ function render(state) {
   const ctxProgress = ctxBar && ctxBar.parentElement;
   if (ctxBar) ctxBar.style.width = pct + "%";
   if (ctxProgress && ctxProgress.classList.contains("progress")) {
-    ctxProgress.classList.toggle("is-tier", ctx != null && ctx >= TIER_CLIFF);
+    const cliff = tierCliff();
+    ctxProgress.classList.toggle("is-tier", ctx != null && ctx >= cliff);
     ctxProgress.classList.toggle("is-hot", ctx != null && win > 0 && ctx / win >= 0.8);
   }
   const ctxSub = $("ctxSub");
@@ -817,7 +835,9 @@ function render(state) {
     if (ctx == null) {
       ctxSub.textContent = "";
     } else {
-      const tier = ctx >= TIER_CLIFF ? ">200k rates" : "≤200k rates";
+      const cliff = tierCliff();
+      const mark = cliff >= 272000 ? "272k" : "200k";
+      const tier = ctx >= cliff ? `>${mark} rates` : `≤${mark} rates`;
       ctxSub.textContent = `${pct.toFixed(1)}% of ${fmtTokens(win)} · ${tier}`;
     }
   }
@@ -911,100 +931,94 @@ function render(state) {
     revealRound(_pendingRevealRound);
     _pendingRevealRound = null;
   }
+  return true;
 }
 
 let _pollBusy = false;
 let _pollEpoch = 0;
 let _pollAgain = false;
-let _pendingRetryN = 0;
-let _pendingRetryTimer = null;
+/** ETag of a body this document has already drawn. Not sent before that. */
+let _paintedEtag = null;
 
-let _pollWaiters = [];
-
-function _schedulePendingRetry() {
-  // Never recurse poll() synchronously on sid mismatch — that froze
-  // switchSession's 40×50ms loop and left Round hierarchy empty.
-  if (_pendingRetryN >= 40) {
-    window.__pendingSid = null;
-    _pendingRetryN = 0;
-    endViewLoad();
-    poll();
-    return;
-  }
-  _pendingRetryN += 1;
-  if (_pendingRetryTimer) return;
-  _pendingRetryTimer = setTimeout(() => {
-    _pendingRetryTimer = null;
-    poll();
-  }, 50);
+function _pendingSid() {
+  return (typeof window.__pendingSid === "string" && window.__pendingSid)
+    ? String(window.__pendingSid)
+    : "";
 }
 
 async function poll() {
-  if (_pollBusy) {
-    // Queue one follow-up. For D/W/M, do not bump epoch on every 1s tick —
-    // that used to invalidate a long aggregate and retrigger the chart loader.
+  // Pin POST owns the first body. An interval poll during that POST used to
+  // take the only slot, then wait on the next poll before settling — the
+  // loader never cleared and the picker stayed on "loading…".
+  if (window.__sessionSwitching && !window.__allowPollDuringSwitch) {
     _pollAgain = true;
-    if (!isPeriodScope()) _pollEpoch += 1;
-    return new Promise((resolve) => { _pollWaiters.push(resolve); });
+    return;
+  }
+  if (_pollBusy) {
+    _pollAgain = true;
+    return;
   }
   _pollBusy = true;
   const epoch = _pollEpoch;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort("timeout"), 60000);
   try {
     if (isPeriodScope()) {
       dropGraphForPeriod();
       await fetchPeriod();
-      if (epoch !== _pollEpoch) return;
-      endViewLoad();
       return;
     }
-    const pendingPre = (typeof window.__pendingSid === "string" && window.__pendingSid)
-      ? String(window.__pendingSid)
-      : "";
-    const headers = {};
-    // A pin change can keep the same ETag body until catch-up; never 304 while pending.
-    if (_stateEtag && !pendingPre) headers["If-None-Match"] = _stateEtag;
+    const pendingPre = _pendingSid();
+    const headers = { "Cache-Control": "no-cache" };
+    // Custom header, not If-None-Match: browsers replay that validator and
+    // a fresh Grok/Codex document 304s before it has drawn anything.
+    if (_paintedEtag && !pendingPre) headers["X-Telemetry-Have"] = _paintedEtag;
     const r = await fetch("/api/state?_=" + Date.now(), {
       headers,
       cache: "no-store",
+      signal: ac.signal,
     });
+    if (epoch !== _pollEpoch) return;
     if (r.status === 304) {
-      if (pendingPre) {
+      // Unpainted 304: forget the validator. The 1s interval pulls a body.
+      // Do not schedule a 50ms retry — that loop never left "loading…".
+      if (!_paintedEtag || pendingPre) {
+        _paintedEtag = null;
         _stateEtag = null;
-        _schedulePendingRetry();
-        return;
       }
-      endViewLoad();
       return;
     }
     if (!r.ok) throw new Error("HTTP " + r.status);
     const et = r.headers.get("ETag");
-    if (et) _stateEtag = et;
     const state = await r.json();
     if (epoch !== _pollEpoch) return;
-    const pending = (typeof window.__pendingSid === "string" && window.__pendingSid)
-      ? String(window.__pendingSid)
-      : "";
-    if (pending && state.session_id
-      && String(state.session_id).toLowerCase() !== pending.toLowerCase()) {
-      // Still the previous session — do not paint KPIs or drop __pendingSid.
-      // Do populate the picker so startup pin does not stay on "loading…".
-      fillSessionSelect(state);
-      _schedulePendingRetry();
+    const pending = _pendingSid();
+    const sid = state && state.session_id ? String(state.session_id) : "";
+    if (pending && sid.toLowerCase() !== pending.toLowerCase()) {
+      // Wrong session for this pin. Show its name in the picker, keep the
+      // pending id, and do not remember the etag — the next body must be a 200.
+      try { fillSessionSelect(state); } catch (e) { console.error(e); }
       return;
     }
-    _pendingRetryN = 0;
-    if (pending && state.session_id
-      && String(state.session_id).toLowerCase() === pending.toLowerCase()) {
-      window.__pendingSid = null;
-    } else if (!pending) {
+    const painted = render(state);
+    // A shell with no session is not a painted view — the next poll must
+    // still be a 200 once ingest publishes the real body.
+    if (painted && et && state && state.session_id) {
+      _paintedEtag = et;
+      _stateEtag = et;
+    }
+    if (!pending || (sid && sid.toLowerCase() === pending.toLowerCase())) {
       window.__pendingSid = null;
     }
-    render(state);
-    endViewLoad();
   } catch (e) {
+    if (epoch !== _pollEpoch) return;
     console.error("dashboard poll/render failed:", e);
-    const msg = String(e && e.message ? e.message : e).slice(0, 160);
-    const net = /HTTP |Failed to fetch|NetworkError|Load failed/i.test(msg)
+    const raw = e && e.message ? String(e.message) : String(e || "");
+    // abort("timeout") rejects with the string itself, not an AbortError.
+    const timedOut = (e && (e.name === "AbortError" || e.name === "TimeoutError"))
+      || raw === "timeout";
+    const msg = timedOut ? "state timed out" : raw.slice(0, 160);
+    const net = timedOut || /HTTP |Failed to fetch|NetworkError|Load failed/i.test(msg)
       || (e && e.name === "TypeError");
     $("liveBadge").textContent = net ? "offline" : "error";
     $("liveBadge").className = "badge warn";
@@ -1016,16 +1030,16 @@ async function poll() {
         : "Dashboard render error: " + msg,
       "error",
     );
-    endViewLoad();
   } finally {
+    clearTimeout(timer);
     _pollBusy = false;
-    if (_pollAgain) {
+    if (epoch === _pollEpoch) endViewLoad();
+    // Schedule the follow-up. Do not await it: switchSession must settle
+    // when THIS body settles, even if the next /api/state is still running.
+    if (_pollAgain && epoch === _pollEpoch) {
       _pollAgain = false;
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      await poll();
+      setTimeout(poll, 50);
     }
-    const waiters = _pollWaiters.splice(0);
-    for (const w of waiters) w();
   }
 }
 
@@ -1034,7 +1048,9 @@ function restorePrefs() {
     const dens = localStorage.getItem("tt-tree-density");
     if (dens) setTreeDensity(dens);
     else setTreeDensity("standard");
-    const unit = localStorage.getItem("tt-cost-unit");
+    const codex = document.documentElement.dataset.source === "codex";
+    const unit = localStorage.getItem(codex ? "tt-cost-unit-codex" : "tt-cost-unit")
+      || (codex ? "tokens" : "");
     if (unit === "tokens" || unit === "usd") setCostUnit(unit);
     let stack = localStorage.getItem("tt-cost-stack");
     if (!stack && localStorage.getItem("tt-cost-detail") === "1") stack = "parts";
@@ -1146,12 +1162,10 @@ $("sessionSelect")?.addEventListener("change", (ev) => {
       openSessionFromPeriod(sid);
       return;
     }
-    beginViewLoad();
-    setScope("session", { poll: false });
+      setScope("session", { poll: false });
     switchSession(null);
     return;
   }
-  beginViewLoad();
   switchSession(sid);
 });
 
@@ -1234,12 +1248,10 @@ bindCtxGraphResize();
 // even if another Grok window is also "active".
 const bootSid = new URLSearchParams(location.search).get("session")
   || new URLSearchParams(location.search).get("session_id");
-if (bootSid) {
-  beginViewLoad();
-  switchSession(bootSid);
-} else {
-  poll();
-}
+// Paint whatever the server already has. Pinning must not cover the page
+// with the center spinner while a turn is still streaming.
+poll();
+if (bootSid) switchSession(bootSid);
 setInterval(poll, 1000);
 window.addEventListener("resize", () => {
   if (isPeriodScope()) {

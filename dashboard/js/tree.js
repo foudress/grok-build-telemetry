@@ -24,6 +24,18 @@ function eventMs(e) {
   return Number.isFinite(n) ? n : 0;
 }
 
+/** read_file rows show the file only, the same way Grok Build does. */
+function readFileLabel(c) {
+  const fromPath = shortPath(c && c.path);
+  if (fromPath) return fromPath;
+  const src = String((c && (c.title || c.command || c.preview)) || "");
+  const m = src.match(
+    /(?:get-content|gc|cat|head|tail|type)\s+(?:-\S+\s+)*(?:"([^"]+)"|'([^']+)'|(\S+))/i
+  );
+  const file = m ? (m[1] || m[2] || m[3] || "") : "";
+  return shortPath(file) || compressCwdText(src);
+}
+
 /** Present ledger number. 0 is valid; null / "" / NaN → missing. */
 function ledgerNum(v) {
   if (v == null || v === "") return null;
@@ -431,11 +443,15 @@ function renderChildNode(c, phaseKey) {
       gray = n > 0 ? `${mode} ${n} step${n === 1 ? "" : "s"}` : mode;
     } else {
       const nameBit = c.name ? c.name : "";
-      const shellish = /run_terminal|get_command|subagent|bash|shell|powershell/i.test(nameBit);
-      const pathBit = shellish
-        ? shellInteresting(c.path || c.title || c.command || "")
-        : (shortPath(c.path) || compressCwdText(c.title || ""));
-      gray = [nameBit, pathBit].filter(Boolean).join(" · ");
+      if (/^read_file$/i.test(nameBit)) {
+        gray = readFileLabel(c);
+      } else {
+        const shellish = /run_terminal|get_command|subagent|bash|shell|powershell/i.test(nameBit);
+        const pathBit = shellish
+          ? shellInteresting(c.path || c.title || c.command || "")
+          : (shortPath(c.path) || compressCwdText(c.title || ""));
+        gray = [nameBit, pathBit].filter(Boolean).join(" · ");
+      }
     }
     const outTok = m.to || c.estimate_output_tokens || c.tokens_out || 0;
     const tipReq = c.path || c.title || c.command || c.estimate_note || "";
@@ -485,10 +501,14 @@ function renderChildNode(c, phaseKey) {
       const shellish = /run_terminal|get_command|subagent|bash|shell|powershell/i.test(nameBit);
       const detailRaw = c.path || c.title || c.command || c.raw_input || "";
       tipFull = detailRaw || c.tool_call_id || "";
-      const detail = shellish
-        ? shellInteresting(detailRaw)
-        : (pathBit || compressCwdText(resume || detailRaw));
-      grayHtml = `${nameBit}${detail ? " · " + detail : ""}`;
+      if (/^read_file$/i.test(nameBit)) {
+        grayHtml = readFileLabel(c);
+      } else {
+        const detail = shellish
+          ? shellInteresting(detailRaw)
+          : (pathBit || compressCwdText(resume || detailRaw));
+        grayHtml = `${nameBit}${detail ? " · " + detail : ""}`;
+      }
     }
     // Prefer chat_history tokenizer stamps for harness result meta (exact ints)
     const tokZExact = Math.round(Number(
@@ -835,10 +855,15 @@ function renderRoundTree(rounds, opts) {
     // Keep User Cached even on round KV miss (unknown which prefix missed).
     // R1 User Cached is already 0 from server — do not invent it here.
     const isR1User = Number(r.index) === 1;
-    let upCache = isR1User
-      ? 0
-      : (Number(up.tokens_cached ?? up.cached_est ?? priorCache) || 0);
-    let upCacheUsd = isR1User ? 0 : (Number(up.cost_cached_usd) || 0);
+    // Trust a stamped cache, including round 1. Codex puts call 1's prefix here.
+    // Grok round 1 stamps 0; do not invent a cache when the field is absent.
+    const serverCache = up.tokens_cached != null && up.tokens_cached !== "";
+    let upCache = serverCache
+      ? (Number(up.tokens_cached) || 0)
+      : (isR1User ? 0 : (Number(up.cached_est ?? priorCache) || 0));
+    let upCacheUsd = serverCache
+      ? (Number(up.cost_cached_usd) || 0)
+      : (isR1User ? 0 : (Number(up.cost_cached_usd) || 0));
     // Answer continuity: peel from Cached display when not taken from user pool
     if (prevInTok > 0 && upCache >= prevInTok && !prevFromPool) {
       const fullC = Number(up.tokens_cached ?? up.cached_est ?? priorCache) || 1;
