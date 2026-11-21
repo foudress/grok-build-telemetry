@@ -3,6 +3,7 @@
 from token_telemetry.pricing import (
     estimate_cost_usd,
     estimate_from_usage,
+    model_label,
     normalize_model_id,
     pick_tier,
     pricing_model_scope,
@@ -15,8 +16,20 @@ def test_normalize_model_ids():
     assert normalize_model_id("grok-4.6-build") == "grok-4.6"
     assert normalize_model_id("grok-4.5-build") == "grok-4.5"
     assert normalize_model_id("Grok 4.5") == "grok-4.5"
-    assert normalize_model_id("grok-4.3") is None
+    assert normalize_model_id("grok-4.3") == "grok-4.3"
+    assert normalize_model_id("grok-4.20-0309-reasoning") == "grok-4.20"
+    assert normalize_model_id("grok-4.7") == "grok-4.7"
     assert normalize_model_id(None) is None
+    assert model_label("grok-4.7") == "Grok 4.7"
+    assert model_label(None) is None
+    assert model_label("gemini-4-hydrogen") == "gemini-4-hydrogen"
+
+
+def test_420_list_rates():
+    low = pick_tier(1_000, model="grok-4.20-0309-reasoning")
+    high = pick_tier(250_000, model="grok-4.20-0309-reasoning")
+    assert low["input"] == 1.25 and low["output"] == 2.50 and low["cached_input"] == 0.20
+    assert high["input"] == 2.50 and high["output"] == 5.00 and high["cached_input"] == 0.40
 
 
 def test_45_cache_unchanged():

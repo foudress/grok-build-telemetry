@@ -51,6 +51,55 @@ RATES_BY_FAMILY: dict[str, dict[str, Any]] = {
             "cached_input": 1.0,
         },
     },
+    # docs.x.ai — same card as grok-4.3 (Oct 2026)
+    "grok-4.20": {
+        "family": "grok-4.20",
+        "label": "Grok 4.20",
+        "low": {
+            "name": "≤200k",
+            "input": 1.25,
+            "output": 2.50,
+            "cached_input": 0.20,
+        },
+        "high": {
+            "name": ">200k",
+            "input": 2.50,
+            "output": 5.00,
+            "cached_input": 0.40,
+        },
+    },
+    "grok-4.3": {
+        "family": "grok-4.3",
+        "label": "Grok 4.3",
+        "low": {
+            "name": "≤200k",
+            "input": 1.25,
+            "output": 2.50,
+            "cached_input": 0.20,
+        },
+        "high": {
+            "name": ">200k",
+            "input": 2.50,
+            "output": 5.00,
+            "cached_input": 0.40,
+        },
+    },
+    "grok-4.7": {
+        "family": "grok-4.7",
+        "label": "Grok 4.7",
+        "low": {
+            "name": "≤200k",
+            "input": 2.0,
+            "output": 6.0,
+            "cached_input": 0.5,
+        },
+        "high": {
+            "name": ">200k",
+            "input": 4.0,
+            "output": 12.0,
+            "cached_input": 1.0,
+        },
+    },
 }
 
 # Back-compat aliases = grok-4.5 list (historical default)
@@ -62,6 +111,22 @@ _pricing_model: ContextVar[Optional[str]] = ContextVar(
 )
 
 
+def model_label(raw: Any) -> Optional[str]:
+    """Display name for a detected model. Unknown text stays as written.
+
+    Does not fall back to the default family. A missing id stays missing.
+    """
+    if raw is None:
+        return None
+    fam = normalize_model_id(raw)
+    if fam and fam in RATES_BY_FAMILY:
+        label = RATES_BY_FAMILY[fam].get("label")
+        if isinstance(label, str) and label.strip():
+            return label.strip()
+    text = str(raw).strip()
+    return text or None
+
+
 def normalize_model_id(raw: Any) -> Optional[str]:
     """Map API / TUI ids (``grok-4.6-build``) to a priced family, or None."""
     if raw is None:
@@ -69,10 +134,17 @@ def normalize_model_id(raw: Any) -> Optional[str]:
     s = str(raw).strip().lower().replace("_", "-").replace(" ", "-")
     if not s:
         return None
+    # Longest / most specific first so 4.20 does not fall through to 4.2 heuristics.
+    if "4.20" in s or "4-20" in s:
+        return "grok-4.20"
+    if "4.7" in s or "4-7" in s:
+        return "grok-4.7"
     if "4.6" in s or "4-6" in s:
         return "grok-4.6"
     if "4.5" in s or "4-5" in s:
         return "grok-4.5"
+    if "4.3" in s or "4-3" in s:
+        return "grok-4.3"
     return None
 
 
