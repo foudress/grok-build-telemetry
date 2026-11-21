@@ -114,9 +114,12 @@ class CodexFeed:
         grain: str,
         home: Optional[Path] = None,
         on_progress: Optional[Callable[..., None]] = None,
+        billing: bool = False,
     ) -> dict[str, Any]:
         snap = load_snapshot(home, on_progress=on_progress)
-        payload = build_period(snap, period=period, offset=offset, grain=grain)
+        payload = build_period(
+            snap, period=period, offset=offset, grain=grain, billing=billing
+        )
         with self._lock:
             bump = self._bump
         payload["cache_gen"] = int(snap.get("n_calls") or 0) ^ int(snap.get("scan_ms") or 0) ^ bump

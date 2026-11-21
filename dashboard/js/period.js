@@ -35,6 +35,8 @@ let _timeline = false;
 let _rate = false;
 let _ioStep = false;
 let _rateGrain = "session";
+/** Billing calendar (Thu reset / day-15) — Weekly & Monthly only. */
+let _billing = false;
 let _pollRef = null;
 let _lastAgg = null;
 let _ganttSel = new Set();
@@ -56,7 +58,11 @@ let _cacheGen = null;
 let _chartLoaderAwaitCold = false;
 
 function aggRequestKey() {
-  return [_scope, _offset, _grain, _stack, _rate ? 1 : 0].join("|");
+  return [_scope, _offset, _grain, _stack, _rate ? 1 : 0, _billing ? 1 : 0].join("|");
+}
+
+function billingAllowed(scope) {
+  return scope === "weekly" || scope === "monthly";
 }
 
 export function bindPeriodPoll(fn) {
@@ -82,6 +88,7 @@ function persist() {
     localStorage.setItem("tt-agg-rate", _rate ? "1" : "0");
     localStorage.setItem("tt-agg-io-step", _ioStep ? "1" : "0");
     localStorage.setItem("tt-agg-rate-grain", _rateGrain);
+    localStorage.setItem("tt-period-billing", _billing ? "1" : "0");
   } catch { /* ignore */ }
 }
 
@@ -103,6 +110,7 @@ export function restoreScope() {
     if (rg === "round" || rg === "session") _rateGrain = rg;
     const g = localStorage.getItem("tt-period-grain") || localStorage.getItem("tt-monthly-grain");
     if (g) _grain = normalizeGrain(_scope, g);
+    _billing = localStorage.getItem("tt-period-billing") === "1" && billingAllowed(_scope);
   } catch { /* ignore */ }
   applyScopeChrome();
 }
@@ -136,6 +144,19 @@ function applyScopeChrome() {
   if (tb) tb.hidden = !isPeriodScope();
   const nav = $("periodNav");
   if (nav) nav.hidden = !isPeriodScope();
+  if (!billingAllowed(_scope)) _billing = false;
+  const cal = $("periodCalendar");
+  if (cal) cal.hidden = !billingAllowed(_scope);
+  const calCivil = $("calCivil");
+  const calBill = $("calBilling");
+  if (calCivil) {
+    calCivil.classList.toggle("active", !_billing);
+    calCivil.setAttribute("aria-pressed", !_billing ? "true" : "false");
+  }
+  if (calBill) {
+    calBill.classList.toggle("active", !!_billing);
+    calBill.setAttribute("aria-pressed", _billing ? "true" : "false");
+  }
   _grain = normalizeGrain(_scope, _grain);
   const ganttOff = !!_timeline || !!_rate || !!_ioStep;
   const showTimeExtras = isPeriodScope() && !ganttOff && !_byLabel;
@@ -345,6 +366,7 @@ export function openSessionFromPeriod(sid) {
       mode: _mode,
       stack: _stack,
       byLabel: _byLabel,
+      billing: _billing,
     };
   }
   beginViewLoad();
@@ -395,6 +417,7 @@ export function restorePeriodReturn() {
   _mode = AGG_MODES.has(snap.mode) ? snap.mode : "timeframe";
   _stack = snap.stack || "io";
   _byLabel = !!snap.byLabel;
+  _billing = !!snap.billing && billingAllowed(_scope);
   _aggDirty = true;
   _aggKey = "";
   persist();
@@ -407,7 +430,8 @@ export function setScope(scope, opts = {}) {
   if (next !== _scope) {
     if (PERIODS.has(next)) {
       _periodReturn = null;
-      const nextKey = [next, _offset, _grain, _stack, _rate ? 1 : 0].join("|");
+      if (!billingAllowed(next)) _billing = false;
+      const nextKey = [next, _offset, _grain, _stack, _rate ? 1 : 0, _billing ? 1 : 0].join("|");
       if (nextKey !== _aggKey) {
         _aggDirty = true;
         _aggKey = "";
@@ -419,6 +443,7 @@ export function setScope(scope, opts = {}) {
     _scope = next;
     _offset = 0;
     _grain = normalizeGrain(_scope, _grain);
+    if (!billingAllowed(_scope)) _billing = false;
     hideAllChartTips();
     if (next === "session") _ganttSel = new Set();
     syncPeriodBack();
@@ -429,6 +454,16 @@ export function setScope(scope, opts = {}) {
   if (sel && sel.value !== _scope) sel.value = _scope;
   if (opts.poll === false) return;
   if (_pollRef) _pollRef();
+}
+
+function setBilling(on) {
+  const next = !!on && billingAllowed(_scope);
+  if (next === _billing) return;
+  _billing = next;
+  _offset = 0;
+  persist();
+  applyScopeChrome();
+  requestAggFetch();
 }
 
 function requestAggFetch({ mode } = {}) {
@@ -599,6 +634,7 @@ function paintSessionList(sessions) {
     ]);
     const sub = (isSubagentKind(s.session_kind) || Number(s.depth) > 0) ? " is-sub" : "";
     const name = s.label || (sub ? `Sub Agent ${s.child_n || s.n}` : `Session ${s.n}`);
+    const model = String(s.model || s.model_family || "").trim();
     const sid = String(s.session_id);
     const picked = _timeline && _ganttSel.size > 0 && _ganttSel.has(sid.toLowerCase()) ? " is-picked" : "";
     const tip = _timeline
@@ -607,6 +643,7 @@ function paintSessionList(sessions) {
     return `<div class="sess-row${sub}${picked}" data-sid="${esc(sid)}" title="${esc(tip)}">
       <span class="sess-n" title="${esc(tip)}">${esc(name)}</span>
       <span class="sess-title" title="${esc(s.title || sid)}">${esc(s.title || "")}</span>
+      <span class="sess-model" title="${esc(model)}">${esc(model)}</span>
       <span class="sess-ledger">${ledger}</span>
       <span class="sess-price">${totalPrice(
         s.estimate_usd != null
@@ -648,7 +685,10 @@ export function paintPeriod(agg) {
   const meta = $("sessionMeta");
   if (meta) meta.textContent = "";
   const lab = $("periodLabel");
-  if (lab) lab.textContent = agg.label || "—";
+  if (lab) {
+    lab.textContent = agg.label || "—";
+    lab.classList.toggle("is-billing", !!_billing);
+  }
   const next = $("periodNext");
   if (next) next.disabled = _offset >= 0;
   paintCards(agg.totals || {});
@@ -861,7 +901,7 @@ export async function fetchPeriod() {
   };
   // rate=1 when user is on tok/s (includes sub-agent points). Otherwise still
   // returns Parts/Tools cats + mains tps so stack switches stay local.
-  const url = `/api/aggregate?period=${encodeURIComponent(_scope)}&offset=${_offset}&grain=${encodeURIComponent(_grain)}&stack=${encodeURIComponent(_stack)}&rate=${_rate ? "1" : "0"}&stream=1&_=${Date.now()}`;
+  const url = `/api/aggregate?period=${encodeURIComponent(_scope)}&offset=${_offset}&grain=${encodeURIComponent(_grain)}&stack=${encodeURIComponent(_stack)}&rate=${_rate ? "1" : "0"}&billing=${_billing ? "1" : "0"}&stream=1&_=${Date.now()}`;
   let agg = null;
   try {
   try {
@@ -926,6 +966,8 @@ export function bindPeriodControls() {
   });
   $("periodPrev")?.addEventListener("click", () => setOffset(-1));
   $("periodNext")?.addEventListener("click", () => setOffset(1));
+  $("calCivil")?.addEventListener("click", () => setBilling(false));
+  $("calBilling")?.addEventListener("click", () => setBilling(true));
   $("periodGrain")?.addEventListener("click", (ev) => {
     const btn = ev.target.closest("[data-grain]");
     if (!btn || btn.disabled) return;

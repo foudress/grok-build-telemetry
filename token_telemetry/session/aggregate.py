@@ -60,6 +60,7 @@ def build_aggregate(
     now: Optional[datetime] = None,
     stack: str = "io",
     rate: bool = False,
+    billing: bool = False,
     on_progress: Optional[Callable[[int, int], None]] = None,
 ) -> dict[str, Any]:
     period = (period or "daily").strip().lower()
@@ -70,11 +71,12 @@ def build_aggregate(
         offset = int(offset)
     except (TypeError, ValueError):
         offset = 0
+    use_billing = bool(billing) and period in ("weekly", "monthly")
 
-    start, end, label = period_window(period, offset, now=now)
+    start, end, label = period_window(period, offset, now=now, billing=use_billing)
     start_e, end_e = start.timestamp(), end.timestamp()
     session_grain = grain == "session"
-    specs = _bucket_specs(period, start, end, grain)
+    specs = _bucket_specs(period, start, end, grain, billing=use_billing)
     buckets = (
         []
         if session_grain
@@ -573,6 +575,7 @@ def build_aggregate(
         "period": period,
         "offset": offset,
         "grain": grain,
+        "billing": use_billing,
         "label": label,
         "start": start.isoformat(),
         "end": end.isoformat(),

@@ -47,6 +47,77 @@ def test_period_window_daily_weekly_monthly():
     assert e.date().isoformat() == "2026-08-01"
 
 
+def test_billing_weekly_thursday_reset():
+    from zoneinfo import ZoneInfo
+
+    paris = ZoneInfo("Europe/Paris")
+    # Friday 2026-08-14 afternoon → week started Thu 13 Aug 20:59? Aug is CEST → 21:59
+    # Aug 13 2026 is Thursday.
+    now = datetime(2026, 8, 14, 15, 30, tzinfo=paris)
+    s, e, lab = period_window("weekly", 0, now=now, billing=True)
+    assert s.astimezone(paris).isoformat().startswith("2026-08-13T21:59")
+    assert e.astimezone(paris).isoformat().startswith("2026-08-20T21:59")
+    assert "21:59" in lab
+
+    # Just before Thursday reset → previous week
+    before = datetime(2026, 8, 13, 21, 58, tzinfo=paris)
+    s2, e2, _ = period_window("weekly", 0, now=before, billing=True)
+    assert s2.astimezone(paris).isoformat().startswith("2026-08-06T21:59")
+    assert e2.astimezone(paris).isoformat().startswith("2026-08-13T21:59")
+
+    # Winter: after DST — 20:59 Paris
+    winter = datetime(2026, 11, 16, 12, 0, tzinfo=paris)
+    s3, e3, lab3 = period_window("weekly", 0, now=winter, billing=True)
+    assert s3.astimezone(paris).isoformat().startswith("2026-11-12T20:59")
+    assert e3.astimezone(paris).isoformat().startswith("2026-11-19T20:59")
+    assert "20:59" in lab3
+
+
+def test_billing_monthly_day30_transition_day15():
+    from zoneinfo import ZoneInfo
+
+    paris = ZoneInfo("Europe/Paris")
+    # Mid August → Jul 30 21:59 → Aug 30 21:59
+    now = datetime(2026, 8, 14, 12, 0, tzinfo=paris)
+    s, e, _ = period_window("monthly", 0, now=now, billing=True)
+    assert s.astimezone(paris).isoformat().startswith("2026-07-30T21:59")
+    assert e.astimezone(paris).isoformat().startswith("2026-08-30T21:59")
+
+    # Transition stub: Oct 30 20:59 → Nov 15 23:50
+    mid = datetime(2026, 11, 1, 12, 0, tzinfo=paris)
+    s2, e2, lab2 = period_window("monthly", 0, now=mid, billing=True)
+    assert s2.astimezone(paris).isoformat().startswith("2026-10-30T20:59")
+    assert e2.astimezone(paris).isoformat().startswith("2026-11-15T23:50")
+    assert "23:50" in lab2
+
+    # After new plan: Nov 15 23:50 → Dec 15 23:50
+    after = datetime(2026, 11, 16, 0, 30, tzinfo=paris)
+    s3, e3, _ = period_window("monthly", 0, now=after, billing=True)
+    assert s3.astimezone(paris).isoformat().startswith("2026-11-15T23:50")
+    assert e3.astimezone(paris).isoformat().startswith("2026-12-15T23:50")
+
+    # Offset -1 from after → transition month
+    s4, e4, _ = period_window("monthly", -1, now=after, billing=True)
+    assert s4.astimezone(paris).isoformat().startswith("2026-10-30T20:59")
+    assert e4.astimezone(paris).isoformat().startswith("2026-11-15T23:50")
+
+
+def test_billing_monthly_day_buckets_cover_partial_end():
+    from zoneinfo import ZoneInfo
+
+    from token_telemetry.session.windows import _bucket_specs
+
+    paris = ZoneInfo("Europe/Paris")
+    start = datetime(2026, 10, 30, 20, 59, tzinfo=paris)
+    end = datetime(2026, 11, 15, 23, 50, tzinfo=paris)
+    specs = _bucket_specs("monthly", start, end, "day", billing=True)
+    keys = [s["key"] for s in specs]
+    assert keys[0] == "2026-10-30"
+    assert keys[-1] == "2026-11-15"
+    assert specs[0]["start_epoch"] == start.timestamp()
+    assert specs[-1]["end_epoch"] == end.timestamp()
+
+
 def _write_session(root: Path, sid: str, turns, *, kind=None, title="Hello", parent=None):
     d = root / sid
     d.mkdir(parents=True)
