@@ -51,7 +51,8 @@ Period I/O $/M).
 3. **Prefer pure functions** for pricing math; keep `HierarchyBuilder` orchestration thin. After `_merge_bootstrap_into_breakdown`, readers (monitor, tree.js, charts.js, period, subagent cards) **read** `breakdown.*` — they do not re-sum In.
 4. **Zero-build UI** — modular HTML/CSS/JS only (no React/npm build). Design tokens live in `dashboard/css/tokens.css`.
 5. **No personal paths or session dumps** in the repo (prompts, `updates.jsonl`, machine-specific cwd encodings). Local ledger goldens: `python scripts/freeze_ledger.py --check`.
-6. **Frozen quirks** (do not “fix” in a cleanup PR): window fallback 500000; `$/M` palier 190k vs 200k cliff; chart resize reads main `state.turns`; context chart User Y via `display_in`; reread detector flags ignored for miss tokens; `_is_first_round` if `system_prompt` present; double ToolDef inject; `API_ROUNDS` = 4000.
+6. **Private product connectors** stay outside this repo (entry points / `~/.grok-telemetry/connectors/` / `TOKEN_TELEMETRY_PLUGINS`). See `docs/plugins.md`.
+7. **Frozen quirks** (do not “fix” in a cleanup PR): window fallback 500000; `$/M` palier 190k vs 200k cliff; chart resize reads main `state.turns`; context chart User Y via `display_in`; reread detector flags ignored for miss tokens; `_is_first_round` if `system_prompt` present; double ToolDef inject; `API_ROUNDS` = 4000.
 
 ## Where to edit
 

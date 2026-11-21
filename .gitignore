@@ -41,6 +41,8 @@ out/_tmp*
 !/test/test_codex_adapt.py
 !/test/test_codex_store.py
 !/test/test_launch_source.py
+!/test/test_plugins.py
+!/test/test_antigravity_store.py
 !/test/fixtures/
 !/test/fixtures/**
 
