@@ -7,17 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-11-21
+
+Antigravity sessions in the same dashboard, on their own data path. Grok Official API, Tree In, and System R1 stay as they were. Package **1.3.0**. `CACHE_VER` stays 30.
+
 ### Added
 
--
+- Header switch **Grok Build / Codex / Antigravity** (`/?source=antigravity`). Antigravity calls `/api/antigravity/*` and does not use Grok hierarchy or reconstruct.
+- Reader for local Antigravity conversations (`token_telemetry/antigravity/`). One generation is one model call. A user-input step starts a round. Later calls in that round are harness re-entry. Tool results attach to the call that requested them.
+- Estimates use Gemini API standard list prices for the model on the call (Hydrogen, Neon, Argon, Carbon, Flash 3.8 / 3.6). Introductory rates follow the call timestamp. `official_usd` stays 0: the local logs store no API dollar amount. There is no long-context price notch.
+- The session picker, Main/Sub tabs, sub-agent cards, and period rows show the model for that session or sub-agent.
+- **Connector plugins** load extra sources without merging into Grok ledgers. See [`docs/plugins.md`](docs/plugins.md). `GET /api/sources` feeds the header switch.
+- List rates for **grok-4.20** / **grok-4.3** ($1.25 / $0.20 cached / $2.50, long ×2) and **grok-4.7** (same I/O as 4.6).
+- Weekly and monthly periods can follow the Grok billing clock (Thursday 19:59 UTC, then the day-15 handoff) as well as the civil calendar.
 
 ### Changed
 
--
-
-### Fixed
-
--
+- Launch follows the live source. Grok wins when a Grok log was written in the last 10 minutes. Otherwise the newer of Codex and Antigravity opens when that one is live.
+- Codex pricing accepts the call time so Antigravity can price through the same dollar fields. Codex rates ignore that timestamp.
 
 ## [1.2.0] — 2026-10-29
 

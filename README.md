@@ -2,7 +2,7 @@
 
 Live companion dashboard for **[Grok Build](https://x.ai)** sessions: exact token fields Grok already writes, cache vs uncached split, official `$` ticks, and list-price estimates — outside the TUI.
 
-> Package: `token-telemetry` **v1.2.0** (`pip install -e .` / `token-telemetry` CLI).
+> Package: `token-telemetry` **v1.3.0** (`pip install -e .` / `token-telemetry` CLI).
 
 ```
 ~/.grok/sessions/.../updates.jsonl  ──tail──►  live dashboard  ──►  http://127.0.0.1:8765/
@@ -94,7 +94,7 @@ python scripts/live_dashboard.py --port 8765 --session-id <uuid> --no-open
 
 Opens **http://127.0.0.1:8765/** (with `?session=` when pinned) — leave it beside Grok Build.
 
-The header switch **Grok Build / Codex** reloads `/?source=grok` or `/?source=codex`. The two sources do not share sessions or ledgers. On launch, a Grok log touched in the last 10 minutes wins; Codex opens only when it is the only live source.
+The header switch **Grok Build / Codex / Antigravity** (plus any installed [plugins](docs/plugins.md)) reloads `/?source=grok`, `/?source=codex`, `/?source=antigravity`, or `/?source=<plugin-id>`. Sources do not share sessions or ledgers. On launch, a Grok log touched in the last 10 minutes wins. Codex or Antigravity opens only when it is the live built-in source.
 
 ## Pricing estimates
 
@@ -102,10 +102,12 @@ List rates (docs.x.ai). Session model is read from `signals.modelsUsed` / `_meta
 
 | Model | Context | Input /1M | Output /1M | Cached input /1M |
 |-------|---------|-----------|------------|------------------|
+| grok-4.20 / 4.3 | ≤ 200k | $1.25 | $2.50 | $0.20 |
+| grok-4.20 / 4.3 | > 200k | $2.50 | $5.00 | $0.40 |
 | grok-4.5 | ≤ 200k | $2 | $6 | $0.30 |
 | grok-4.5 | > 200k | $4 | $12 | $0.60 |
-| grok-4.6 | ≤ 200k | $2 | $6 | $0.50 |
-| grok-4.6 | > 200k | $4 | $12 | $1.00 |
+| grok-4.6 / 4.7 | ≤ 200k | $2 | $6 | $0.50 |
+| grok-4.6 / 4.7 | > 200k | $4 | $12 | $1.00 |
 
 - `uncached = inputTokens − cachedReadTokens` (cache ⊆ input)
 - `$ ≈ uncached×input + cache×cache_rate + output×out`
@@ -117,6 +119,10 @@ List rates (docs.x.ai). Session model is read from `signals.modelsUsed` / `_meta
 ### Codex
 
 Codex has no dollar field in the logs. Estimates use OpenAI standard API list prices (short context ≤272k). `codex-auto-review` uses the gpt-5.6-luna row. Unknown model ids stay at $0. The Official line is hidden when that amount is 0. Token totals are the sum of each `token_usage_record.usage` (not the cumulative turn/thread counters).
+
+### Antigravity
+
+Antigravity reads local conversation databases. Cache read is not inside uncached input. Thinking is inside output. Estimates use Gemini API standard list prices for the model on the call. Introductory Argon, Carbon, and Flash rates follow the call timestamp. The logs store no API dollar amount, so Official stays $0. These models have no long-context surcharge.
 
 ## Data source
 
@@ -172,6 +178,7 @@ token_telemetry/                 # installable package
   session/                       # discovery, live tail, period aggregate
   graph/                         # agent animation graph (gated)
   codex/                         # Codex rollout connector (separate from Grok ledgers)
+  plugins.py                     # external connector discovery (entry points / drop-ins)
   server/                        # local HTTP API + static files
 bootstrap_install.py             # venv + pip install -e . + /telemetry skill
 install_skills.py                # copy skills/telemetry → ~/.grok/skills
