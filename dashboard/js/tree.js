@@ -246,11 +246,17 @@ function renderSubagentCard(sa, subs) {
     partCached(cacheTok, ccache),
     partOut(outTok, cout),
   ]);
-  const typeTip = sa.agent_name
-    ? `type ${sa.agent_name} (spawn role) · ${sid}`
-    : sid;
+  const model = String(
+    (sub && (sub.model || sub.model_family)) || sa.model || ""
+  ).trim();
+  const typeTip = [
+    model,
+    sa.agent_name ? `type ${sa.agent_name} (spawn role)` : "",
+    sid,
+  ].filter(Boolean).join(" · ");
   return `<div class="subagent-card" data-sub-tab="${esc(sid)}" data-sub-round="${esc(String(goRound))}" title="${esc(typeTip)}">
     <span class="tag subagent">${esc(tag)}</span>
+    ${model ? `<span class="model-name" title="${esc(model)}">${esc(model)}</span>` : ""}
     <span class="sum-gray">${esc(title)}</span>
     ${line}
     ${usd != null && usd !== "" ? totalPrice(usd) : ""}
@@ -929,6 +935,31 @@ function renderRoundTree(rounds, opts) {
         ${partIn(promptTokF, promptUsd)}
         ${eolTokenizerMeta({ tokenizer_tokens: promptTokZ }, promptTokF || null)}
       </div>`;
+    // WaifuOS: under User/Super Agent after prompt — tool Livre (Lead) then HARNESS.
+    const lc = up.livre_card || {};
+    const lcTok = Math.round(Number(lc.tokens_in) || 0);
+    const lcUsd = Number(lc.cost_in_usd) || 0;
+    const lcTokZ = Math.round(Number(lc.tokenizer_tokens || lcTok) || 0);
+    const livreCardLine = (lcTok > 0 || lcUsd > 0)
+      ? `<div class="node" title="${esc(lc.note || lc.title || "Livre page reinjected into Lead")}">
+          <span class="tag tool">tool</span>
+          <span class="sum-gray" title="livre">livre</span>
+          ${partIn(lcTok, lcUsd)}
+          ${eolTokenizerMeta({ tokenizer_tokens: lcTokZ }, lcTok > 0 ? lcTok : null)}
+        </div>`
+      : "";
+    const hc = up.harness_card || {};
+    const hcTok = Math.round(Number(hc.tokens_in) || 0);
+    const hcUsd = Number(hc.cost_in_usd) || 0;
+    const hcTokZ = Math.round(Number(hc.tokenizer_tokens || hcTok) || 0);
+    const harnessCardLine = (hcTok > 0 || hcUsd > 0)
+      ? `<div class="node" title="${esc(hc.note || hc.title || "HARNESS card (live uncached tail)")}">
+          <span class="tag tool">tool</span>
+          <span class="sum-gray" title="harness">harness</span>
+          ${partIn(hcTok, hcUsd)}
+          ${eolTokenizerMeta({ tokenizer_tokens: hcTokZ }, hcTok > 0 ? hcTok : null)}
+        </div>`
+      : "";
     // User-section hooks (user_prompt_submit + future user_prompt_*) after prompt
     const userHooks = (up.hooks || r.user_hooks || []).filter(Boolean);
     const userHookLines = userHooks.map(h => renderHookNode(h)).join("");
@@ -942,9 +973,10 @@ function renderRoundTree(rounds, opts) {
           ].filter(Boolean))}
           ${userHeadTot > 0 ? " " + totalPrice(userHeadTot) : ""}
         </summary>
-        ${prevAnsLine}
         ${compactOutLine}
         ${promptLine}
+        ${livreCardLine}
+        ${harnessCardLine}
         ${userHookLines}
       </details>`;
 
@@ -1090,10 +1122,17 @@ function renderRoundTree(rounds, opts) {
       const ctxA = s.display_context_start ?? s.context_start;
       const ctxB = s.display_context_end ?? s.context_end;
       let ctxGrowth = null;
-      if (!skipCtx) {
+      if (!skipCtx && ctxA != null && ctxB != null) {
+        const a = Math.round(Number(ctxA) || 0);
+        const b = Math.round(Number(ctxB) || 0);
+        ctxGrowth = b - a;
+      } else if (!skipCtx) {
         const gin = Math.round(Number(growthIn) || 0);
         if (gin > 0) ctxGrowth = gin;
       }
+      const ctxSpan = (!skipCtx && ctxA != null && ctxB != null)
+        ? `<span class="muted" title="Call ctx: (prompt − harness) → (+ Out [+ Lead Out on Livre])">ctx ${fmtTokens(ctxA)}${AR}${fmtTokens(ctxB)}</span>`
+        : "";
       const subCards = (s.subagents_after || []).map((sa) =>
         renderSubagentCard(sa, opts && opts.subSessions)
       ).join("");
@@ -1103,9 +1142,10 @@ function renderRoundTree(rounds, opts) {
       return `<details class="step" data-sid="${sid}"${sOpen}>
         <summary>
           <span class="tag">LLM call [${s.index}]</span>
-          ${callLine || (skipCtx ? "" : `<span class="muted">ctx ${fmtTokens(ctxA)}${AR}${fmtTokens(ctxB)}</span>`)}
+          ${callLine || ""}
+          ${callLine && ctxSpan ? " " : ""}${ctxSpan}
           ${apiCost != null ? " " + totalPrice(apiCost) : ""}
-          ${ctxGrowth != null ? `<span class="muted" title="Δctx = this call's estimated In (same figure as In on this line). Not API totalTokens Δ."> · Δctx ${fmtDelta(ctxGrowth)}</span>` : ""}
+          ${ctxGrowth != null ? `<span class="muted" title="Δctx = context_end − context_start"> · Δctx ${fmtDelta(ctxGrowth)}</span>` : ""}
         </summary>
         ${compBar(s.composition, se, s)}
         ${children || `<div class="node muted">—</div>`}

@@ -95,7 +95,7 @@ function fillSessionSelect(state) {
     return "d" + Math.floor(a / 86400);
   };
   const key =
-    sessions.map((s) => s.session_id + (s.active ? "A" : "") + ageBucket(s) + (s.label || "")).join("|") +
+    sessions.map((s) => s.session_id + (s.active ? "A" : "") + ageBucket(s) + (s.label || "") + (s.model || "")).join("|") +
     ">" + current + ">" + (pinned || "") + ">" + (follow ? "F" : "P");
   ensureSessionDd(sel);
   const btn = $("sessionDdBtn");
@@ -151,8 +151,11 @@ function fillSessionSelect(state) {
       const o = document.createElement("option");
       o.value = s.session_id;
       const title = (s.title || s.label || "").trim() || (s.session_id || "").slice(0, 8);
+      const model = String(s.model || s.model_family || "").trim();
       const age = s.age_label ? ` · ${s.age_label}` : "";
-      o.textContent = `${s.session_id === current ? "▸ " : ""}${title}${age}`;
+      const modelBit = model ? ` · ${model}` : "";
+      o.textContent = `${s.session_id === current ? "▸ " : ""}${title}${modelBit}${age}`;
+      o.title = model ? `${title} · ${model}` : title;
       og.appendChild(o);
     }
     frag.appendChild(og);
@@ -171,9 +174,12 @@ function fillSessionSelect(state) {
       bits.push(`<div class="session-dd-group">${name}</div>`);
       for (const s of list) {
         const title = (s.title || s.label || "").trim() || s.session_id.slice(0, 8);
+        const model = String(s.model || s.model_family || "").trim();
         const age = s.age_label ? ` · ${s.age_label}` : "";
         const on = s.session_id === current ? " is-on" : "";
-        bits.push(`<button type="button" class="session-dd-item${on}" data-sid="${escHtml(s.session_id)}" title="${escHtml(title)}">${escHtml(title)}${escHtml(age)}</button>`);
+        const tip = model ? `${title} · ${model}` : title;
+        const modelHtml = model ? `<span class="session-dd-model">${escHtml(model)}</span>` : "";
+        bits.push(`<button type="button" class="session-dd-item${on}" data-sid="${escHtml(s.session_id)}" title="${escHtml(tip)}">${escHtml(title)}${modelHtml}${escHtml(age)}</button>`);
       }
     };
     grp("Active", active);

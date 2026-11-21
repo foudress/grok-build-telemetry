@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from token_telemetry.pricing.rates import model_label
+
 
 SESSIONS_ROOT = Path.home() / ".grok" / "sessions"
 ACTIVE_SESSIONS = Path.home() / ".grok" / "active_sessions.json"
@@ -276,6 +278,7 @@ def list_sessions_for_ui(
             agent_name = None
         else:
             agent_name = agent_name.strip()
+        model = model_label(summary.get("current_model_id") or summary.get("model_id"))
 
         return {
             "session_id": sid,
@@ -292,6 +295,7 @@ def list_sessions_for_ui(
             "cwd": cwd,
             "session_kind": kind,
             "agent_name": agent_name,
+            "model": model,
         }
 
     # Active first, most-recent last_active first (file order is oldest→newest).

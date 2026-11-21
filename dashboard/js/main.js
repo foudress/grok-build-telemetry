@@ -29,7 +29,17 @@ import {
 import { FEATURES, applyFeatureGates } from './features.js';
 
 function tierCliff() {
+  const raw = document.documentElement.dataset.contextCliff;
+  if (raw != null && raw !== "") {
+    const cliff = Number(raw);
+    return cliff > 0 ? cliff : 0;
+  }
   return document.documentElement.dataset.source === "codex" ? 272000 : 200000;
+}
+
+function tierRateLabel(cliff) {
+  if (!(cliff > 0)) return "";
+  return cliff >= 272000 ? "272k" : "200k";
 }
 const CTX_GRAPH_MIN_H = 180;
 const CTX_GRAPH_MAX_H = 720;
@@ -265,14 +275,22 @@ function paintTaskTabs(state) {
     return;
   }
   el.hidden = false;
+  const pr = state.pricing || {};
+  const cur = (state.sessions || []).find((s) => s.session_id === state.session_id);
+  const parentModel = String(
+    (cur && (cur.model || cur.model_family))
+    || (!pr.assumed && (pr.model_label || pr.model))
+    || ""
+  ).trim();
   const bits = [
-    { id: "main", label: "Main" },
+    { id: "main", label: parentModel ? `Main · ${parentModel}` : "Main", tip: parentModel },
     ...subs.map((s, i) => {
       const n = s.n != null ? s.n : (i + 1);
+      const model = String(s.model || s.model_family || "").trim();
       return {
         id: s.session_id,
-        label: `Sub ${n}`,
-        tip: [s.title || s.label, s.agent_name ? `type ${s.agent_name}` : ""]
+        label: model ? `Sub ${n} · ${model}` : `Sub ${n}`,
+        tip: [model, s.title || s.label, s.agent_name ? `type ${s.agent_name}` : ""]
           .filter(Boolean).join(" · "),
       };
     }),
@@ -347,10 +365,16 @@ function paintPressure(ctx, win) {
   const pct = Math.min(100, (ctx / win) * 100);
   fill.style.width = pct + "%";
   const cliff = tierCliff();
-  bar.title = `Context vs window · notch = ${cliff >= 272000 ? "272k" : "200k"} rate cliff`;
-  bar.classList.toggle("is-tier", ctx >= cliff);
+  const mark = tierRateLabel(cliff);
+  bar.title = mark
+    ? `Context vs window · notch = ${mark} rate cliff`
+    : "Context vs window";
+  bar.classList.toggle("is-tier", cliff > 0 && ctx >= cliff);
   bar.classList.toggle("is-hot", win > 0 && ctx / win >= 0.8);
-  if (notch) notch.style.left = Math.min(100, (cliff / win) * 100) + "%";
+  if (notch) {
+    notch.hidden = !(cliff > 0);
+    if (cliff > 0) notch.style.left = Math.min(100, (cliff / win) * 100) + "%";
+  }
 }
 
 function paintKvChip(rounds) {
@@ -827,7 +851,7 @@ function render(state) {
   if (ctxBar) ctxBar.style.width = pct + "%";
   if (ctxProgress && ctxProgress.classList.contains("progress")) {
     const cliff = tierCliff();
-    ctxProgress.classList.toggle("is-tier", ctx != null && ctx >= cliff);
+    ctxProgress.classList.toggle("is-tier", cliff > 0 && ctx != null && ctx >= cliff);
     ctxProgress.classList.toggle("is-hot", ctx != null && win > 0 && ctx / win >= 0.8);
   }
   const ctxSub = $("ctxSub");
@@ -835,10 +859,13 @@ function render(state) {
     if (ctx == null) {
       ctxSub.textContent = "";
     } else {
-      const cliff = tierCliff();
-      const mark = cliff >= 272000 ? "272k" : "200k";
-      const tier = ctx >= cliff ? `>${mark} rates` : `≤${mark} rates`;
-      ctxSub.textContent = `${pct.toFixed(1)}% of ${fmtTokens(win)} · ${tier}`;
+      const mark = tierRateLabel(tierCliff());
+      const tier = mark
+        ? (ctx >= tierCliff() ? `>${mark} rates` : `≤${mark} rates`)
+        : "";
+      ctxSub.textContent = tier
+        ? `${pct.toFixed(1)}% of ${fmtTokens(win)} · ${tier}`
+        : `${pct.toFixed(1)}% of ${fmtTokens(win)}`;
     }
   }
   paintPressure(ctx, win);
@@ -885,7 +912,17 @@ function render(state) {
 
   const pr = state.pricing || {};
   const modelBadge = $("modelBadge");
-  if (modelBadge) {
+  const viewSub = view.kind === "sub"
+    ? (state.sub_sessions || []).find((s) => s.session_id === _taskTab)
+    : null;
+  const subModel = viewSub ? String(viewSub.model || viewSub.model_family || "").trim() : "";
+  if (modelBadge && subModel) {
+    modelBadge.hidden = false;
+    modelBadge.textContent = subModel;
+    modelBadge.title = [subModel, viewSub.agent_name ? `type ${viewSub.agent_name}` : ""]
+      .filter(Boolean).join(" · ");
+    modelBadge.className = "badge model";
+  } else if (modelBadge) {
     const mid = pr.model_ids && pr.model_ids[0] || live.model || pr.model;
     if (mid || pr.model_label) {
       modelBadge.hidden = false;
@@ -1048,9 +1085,10 @@ function restorePrefs() {
     const dens = localStorage.getItem("tt-tree-density");
     if (dens) setTreeDensity(dens);
     else setTreeDensity("standard");
-    const codex = document.documentElement.dataset.source === "codex";
-    const unit = localStorage.getItem(codex ? "tt-cost-unit-codex" : "tt-cost-unit")
-      || (codex ? "tokens" : "");
+    const source = document.documentElement.dataset.source || "grok";
+    const unitKey = source === "grok" ? "tt-cost-unit" : ("tt-cost-unit-" + source);
+    const unit = localStorage.getItem(unitKey)
+      || (source === "grok" ? "" : "tokens");
     if (unit === "tokens" || unit === "usd") setCostUnit(unit);
     let stack = localStorage.getItem("tt-cost-stack");
     if (!stack && localStorage.getItem("tt-cost-detail") === "1") stack = "parts";

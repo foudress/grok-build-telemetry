@@ -14,6 +14,7 @@ from token_telemetry.pricing import (
     estimate_from_usage,
     pick_tier,
     pricing_model_scope,
+    model_label,
     pricing_payload,
     ticks_to_usd,
 )
@@ -40,6 +41,23 @@ from token_telemetry.session.subagents import (
 from token_telemetry.session.enrich import _mean_round_tps, _sum_rounds_estimate
 
 API_ROUNDS = MAX_ROUNDS_RETAINED
+
+
+def _child_model(hierarchy: Any) -> Optional[str]:
+    """Models this sub-agent actually ran. No assumed default."""
+    seen: list[str] = []
+    for mid in getattr(hierarchy, "_models_raw", None) or []:
+        label = model_label(mid)
+        if label and label not in seen:
+            seen.append(label)
+    if not seen:
+        label = model_label(getattr(hierarchy, "_pricing_model", None))
+        if label:
+            seen.append(label)
+    if not seen:
+        return None
+    return " · ".join(seen)
+
 
 class _ChildWatch:
     """Incremental hierarchy for one sub-agent session under a parent."""
@@ -132,6 +150,7 @@ class _ChildWatch:
             "root_session_id": getattr(self, "root_id", None) or self.session_id,
             "session_kind": summary.get("session_kind") or "subagent",
             "agent_name": summary.get("agent_name"),
+            "model": _child_model(self.hierarchy),
             "title": title,
             "label": title,
             "official_usd": round(official, 6),

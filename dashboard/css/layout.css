@@ -276,6 +276,8 @@ body.scope-period #sessionMeta code {
 
 .session-dd-item.is-on { color: #7ec8ff; }
 
+.session-dd-item.is-on .session-dd-model { color: #7ec8ff; }
+
 .session-select-native {
   position: absolute !important;
   width: 1px !important;
