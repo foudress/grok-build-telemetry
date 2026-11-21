@@ -1,8 +1,10 @@
-"""HTTP dashboard server: static assets + API routes."""
+﻿"""HTTP dashboard server: static assets + API routes."""
 
 from __future__ import annotations
 
+import inspect
 import json
+import re
 import threading
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -10,12 +12,14 @@ from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
 from token_telemetry import features as feat
+from token_telemetry.antigravity.api import FEED as ANTIGRAVITY
+from token_telemetry.codex.api import FEED as CODEX
 from token_telemetry.graph import api as graph_api
+from token_telemetry.plugins import get_connector, sources_payload
 from token_telemetry.session.aggregate import build_aggregate
 from token_telemetry.session.calc_cache import cache_meta
 from token_telemetry.session.discover import list_sessions_for_ui
 from token_telemetry.session.history_watch import WATCHER
-from token_telemetry.codex.api import FEED as CODEX
 from token_telemetry.session.monitor import MONITOR
 
 
@@ -24,6 +28,33 @@ DASHBOARD_DIR = REPO_ROOT / "dashboard"
 DASHBOARD_HTML = DASHBOARD_DIR / "index.html"
 HISTORY_HTML = DASHBOARD_DIR / "history.html"
 GRAPH_HTML = DASHBOARD_DIR / "graph.html"
+
+_PLUGIN_API = re.compile(r"^/api/([a-z0-9][a-z0-9_-]*)(/.*)?$")
+
+
+def _connector_aggregate(
+    feed: Any,
+    period: str,
+    offset: int,
+    grain: str,
+    *,
+    billing: bool = False,
+    on_progress: Any = None,
+) -> Any:
+    """Call feed.aggregate with optional billing/on_progress when supported."""
+    fn = feed.aggregate
+    kwargs: dict[str, Any] = {}
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if on_progress is not None and "on_progress" in params:
+        kwargs["on_progress"] = on_progress
+    if billing and "billing" in params:
+        kwargs["billing"] = True
+    elif billing and any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        kwargs["billing"] = True
+    return fn(period, offset, grain, **kwargs)
 
 # Static dashboard assets (css/, js/, …) under DASHBOARD_DIR only
 _STATIC_MIME = {
@@ -40,6 +71,19 @@ _STATIC_MIME = {
     ".woff": "font/woff",
     ".woff2": "font/woff2",
 }
+
+
+def _inject_sources(html: bytes) -> bytes:
+    """Embed discovered sources so the first paint can rewrite /api before modules load."""
+    payload = json.dumps(sources_payload(), ensure_ascii=False, separators=(",", ":"))
+    snippet = f"<script>window.__TT_SOURCES__={payload};</script>\n".encode("utf-8")
+    marker = b"<head>"
+    lower = html.lower()
+    idx = lower.find(marker)
+    if idx < 0:
+        return snippet + html
+    at = idx + len(marker)
+    return html[:at] + b"\n" + snippet + html[at:]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -114,6 +158,7 @@ class Handler(BaseHTTPRequestHandler):
         *,
         stack: str,
         rate: bool,
+        billing: bool = False,
     ) -> None:
         """SSE: progress events ({done,total}) then a final result event."""
         try:
@@ -142,7 +187,13 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             payload = build_aggregate(
-                period, offset, grain, stack=stack, rate=rate, on_progress=on_progress
+                period,
+                offset,
+                grain,
+                stack=stack,
+                rate=rate,
+                billing=billing,
+                on_progress=on_progress,
             )
         except Exception as exc:  # noqa: BLE001
             if alive:
@@ -189,14 +240,34 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/codex", "/codex.html"):
             self._send(302, b"", "text/plain", extra={"Location": "/?source=codex"})
             return
-        if path.startswith("/api/codex/"):
-            self._codex_get(path)
+        if path in ("/antigravity", "/antigravity.html"):
+            self._send(302, b"", "text/plain", extra={"Location": "/?source=antigravity"})
             return
+        if path == "/api/sources":
+            body = json.dumps(sources_payload(), ensure_ascii=False).encode("utf-8")
+            self._send(200, body, "application/json; charset=utf-8")
+            return
+        if path.startswith("/api/codex/"):
+            self._connector_get(CODEX, "codex", path[len("/api/codex") :] or "/")
+            return
+        if path.startswith("/api/antigravity/"):
+            self._connector_get(
+                ANTIGRAVITY, "antigravity", path[len("/api/antigravity") :] or "/"
+            )
+            return
+        m = _PLUGIN_API.match(path)
+        if m:
+            cid = m.group(1)
+            if cid not in {"state", "sessions", "health", "aggregate", "history", "graph", "cache", "session", "sources"}:
+                conn = get_connector(cid)
+                if conn is not None:
+                    self._connector_get(conn.feed, cid, m.group(2) or "/")
+                    return
         if path in ("/", "/index.html"):
             if not DASHBOARD_HTML.is_file():
                 self._send(500, b"dashboard/index.html missing", "text/plain")
                 return
-            data = DASHBOARD_HTML.read_bytes()
+            data = _inject_sources(DASHBOARD_HTML.read_bytes())
             self._send(200, data, "text/html; charset=utf-8")
             return
         if path in ("/history", "/history.html"):
@@ -282,6 +353,8 @@ class Handler(BaseHTTPRequestHandler):
             stack = (qs.get("stack") or ["io"])[0]
             rate_raw = (qs.get("rate") or ["0"])[0]
             rate = str(rate_raw).strip().lower() in ("1", "true", "yes", "on")
+            bill_raw = (qs.get("billing") or ["0"])[0]
+            billing = str(bill_raw).strip().lower() in ("1", "true", "yes", "on")
             stream_raw = (qs.get("stream") or ["0"])[0]
             stream = str(stream_raw).strip().lower() in ("1", "true", "yes", "on")
             try:
@@ -289,10 +362,14 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 offset = 0
             if stream:
-                self._stream_aggregate(period, offset, grain, stack=stack, rate=rate)
+                self._stream_aggregate(
+                    period, offset, grain, stack=stack, rate=rate, billing=billing
+                )
                 return
             try:
-                payload = build_aggregate(period, offset, grain, stack=stack, rate=rate)
+                payload = build_aggregate(
+                    period, offset, grain, stack=stack, rate=rate, billing=billing
+                )
                 if isinstance(payload, dict):
                     payload = {**payload, **cache_meta()}
             except Exception as exc:  # noqa: BLE001
@@ -348,22 +425,21 @@ class Handler(BaseHTTPRequestHandler):
                 return
         self._send(404, b"not found", "text/plain")
 
-    def _codex_get(self, path: str) -> None:
-        tail = path[len("/api/codex"):] or "/"
+    def _connector_get(self, feed: Any, source: str, tail: str) -> None:
         try:
             if tail == "/state":
-                body, etag = CODEX.state_bytes()
+                body, etag = feed.state_bytes()
                 if self._client_has_body(etag):
                     self._send(304, b"", "application/json; charset=utf-8", extra={"ETag": etag})
                     return
                 self._send(200, body, "application/json; charset=utf-8", extra={"ETag": etag})
                 return
             if tail == "/sessions":
-                body = json.dumps(CODEX.sessions(), ensure_ascii=False).encode("utf-8")
+                body = json.dumps(feed.sessions(), ensure_ascii=False).encode("utf-8")
                 self._send(200, body, "application/json; charset=utf-8")
                 return
             if tail == "/health":
-                body = json.dumps(CODEX.health(), ensure_ascii=False).encode("utf-8")
+                body = json.dumps(feed.health(), ensure_ascii=False).encode("utf-8")
                 self._send(200, body, "application/json; charset=utf-8")
                 return
             if tail == "/aggregate":
@@ -374,30 +450,40 @@ class Handler(BaseHTTPRequestHandler):
                     offset = int((qs.get("offset") or ["0"])[0])
                 except ValueError:
                     offset = 0
+                bill_raw = (qs.get("billing") or ["0"])[0]
+                billing = str(bill_raw).strip().lower() in ("1", "true", "yes", "on")
                 stream_raw = (qs.get("stream") or ["0"])[0]
                 stream = str(stream_raw).strip().lower() in ("1", "true", "yes", "on")
                 if stream:
-                    self._stream_codex_aggregate(period, offset, grain)
+                    self._stream_connector_aggregate(
+                        feed, period, offset, grain, billing=billing
+                    )
                     return
-                payload = CODEX.aggregate(period, offset, grain)
+                payload = _connector_aggregate(
+                    feed, period, offset, grain, billing=billing
+                )
                 body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 self._send(200, body, "application/json; charset=utf-8")
                 return
         except Exception as exc:  # noqa: BLE001
             err = json.dumps(
-                {"ok": False, "source": "codex", "error": f"{type(exc).__name__}: {exc}"},
+                {"ok": False, "source": source, "error": f"{type(exc).__name__}: {exc}"},
                 ensure_ascii=False,
             ).encode("utf-8")
             self._send(500, err, "application/json; charset=utf-8")
             return
         self._send(404, b"not found", "text/plain")
 
-    def _stream_codex_aggregate(self, period: str, offset: int, grain: str) -> None:
-        """SSE progress while rollouts are read, then the period result.
-
-        The counter is what the page paints as n/n. Sending it only after the
-        scan finished left Daily/Weekly/Monthly on "Loading…" the whole time.
-        """
+    def _stream_connector_aggregate(
+        self,
+        feed: Any,
+        period: str,
+        offset: int,
+        grain: str,
+        *,
+        billing: bool = False,
+    ) -> None:
+        """SSE progress while a connector builds a period view, then the result."""
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -421,7 +507,14 @@ class Handler(BaseHTTPRequestHandler):
             )
 
         try:
-            payload = CODEX.aggregate(period, offset, grain, on_progress=on_progress)
+            payload = _connector_aggregate(
+                feed,
+                period,
+                offset,
+                grain,
+                billing=billing,
+                on_progress=on_progress,
+            )
         except Exception as exc:  # noqa: BLE001
             if alive:
                 self._sse_write("error", {"error": f"{type(exc).__name__}: {exc}"})
@@ -444,23 +537,32 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         if path == "/api/codex/session":
-            data = self._read_json_body()
-            if data is None:
-                self._send(400, b'{"ok":false,"error":"invalid json"}', "application/json")
-                return
-            sid = data.get("session_id")
-            if sid is not None and not isinstance(sid, str):
-                sid = str(sid)
-            if sid is not None and sid.strip() == "":
-                sid = None
-            result = CODEX.select(sid)
-            body = json.dumps(result, ensure_ascii=False).encode("utf-8")
-            self._send(200 if result.get("ok") else 400, body, "application/json; charset=utf-8")
+            self._connector_session_post(CODEX)
             return
         if path == "/api/codex/cache/reset":
             body = json.dumps(CODEX.reset(), ensure_ascii=False).encode("utf-8")
             self._send(200, body, "application/json; charset=utf-8")
             return
+        if path == "/api/antigravity/session":
+            self._connector_session_post(ANTIGRAVITY)
+            return
+        if path == "/api/antigravity/cache/reset":
+            body = json.dumps(ANTIGRAVITY.reset(), ensure_ascii=False).encode("utf-8")
+            self._send(200, body, "application/json; charset=utf-8")
+            return
+        m = _PLUGIN_API.match(path)
+        if m:
+            cid = m.group(1)
+            tail = m.group(2) or "/"
+            conn = get_connector(cid)
+            if conn is not None:
+                if tail == "/session":
+                    self._connector_session_post(conn.feed)
+                    return
+                if tail == "/cache/reset":
+                    body = json.dumps(conn.feed.reset(), ensure_ascii=False).encode("utf-8")
+                    self._send(200, body, "application/json; charset=utf-8")
+                    return
         if path == "/api/session":
             try:
                 n = int(self.headers.get("Content-Length") or 0)
@@ -516,6 +618,20 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send(404, b"not found", "text/plain")
 
+    def _connector_session_post(self, feed: Any) -> None:
+        data = self._read_json_body()
+        if data is None:
+            self._send(400, b'{"ok":false,"error":"invalid json"}', "application/json")
+            return
+        sid = data.get("session_id")
+        if sid is not None and not isinstance(sid, str):
+            sid = str(sid)
+        if sid is not None and sid.strip() == "":
+            sid = None
+        result = feed.select(sid)
+        body = json.dumps(result, ensure_ascii=False).encode("utf-8")
+        self._send(200 if result.get("ok") else 400, body, "application/json; charset=utf-8")
+
 
 def background_poller(stop: threading.Event, interval: float = 0.5) -> None:
     while not stop.is_set():
@@ -532,4 +648,3 @@ def background_poller(stop: threading.Event, interval: float = 0.5) -> None:
             except Exception:
                 pass
         stop.wait(interval)
-

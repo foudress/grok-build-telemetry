@@ -6,21 +6,50 @@
   <title>Grok Build Telemetry</title>
   <script>
     (function () {
+      var fallback = [
+        { id: "grok", label: "Grok Build", title: "Grok Build Telemetry", api_prefix: "/api", builtin: true, context_cliff: 200000 },
+        { id: "codex", label: "Codex", title: "Codex Telemetry", api_prefix: "/api/codex", builtin: true, context_cliff: 272000 },
+        { id: "antigravity", label: "Antigravity", title: "Antigravity Telemetry", api_prefix: "/api/antigravity", builtin: true, context_cliff: 0 }
+      ];
+      var payload = window.__TT_SOURCES__ || {};
+      var sources = Array.isArray(payload.sources) && payload.sources.length ? payload.sources : fallback;
+      window.__TT_SOURCES__ = { sources: sources, errors: payload.errors || [] };
+      var byId = {};
+      sources.forEach(function (s) { if (s && s.id) byId[s.id] = s; });
       var q = new URLSearchParams(location.search).get("source");
       var stored = "";
       try { stored = localStorage.getItem("tt-source") || ""; } catch (e) {}
-      var source = q === "codex" || q === "grok" ? q : (stored === "codex" ? "codex" : "grok");
+      var source = byId[q] ? q : (byId[stored] ? stored : "grok");
       try { localStorage.setItem("tt-source", source); } catch (e) {}
+      var meta = byId[source] || byId.grok || fallback[0];
       document.documentElement.dataset.source = source;
-      if (source === "codex") document.title = "Codex Telemetry";
-      if (source !== "codex") return;
+      if (meta.context_cliff != null) document.documentElement.dataset.contextCliff = String(meta.context_cliff);
+      if (meta.title) document.title = meta.title;
+      function paintNav() {
+        var el = document.querySelector(".src-switch");
+        if (!el) return;
+        el.innerHTML = sources.map(function (s) {
+          return '<a href="/?source=' + encodeURIComponent(s.id) + '" data-source="' + s.id + '">' +
+            String(s.label || s.id).replace(/</g, "&lt;") + "</a>";
+        }).join("");
+      }
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", paintNav);
+      } else {
+        paintNav();
+      }
+      if (source === "grok") return;
+      var prefix = (meta.api_prefix || ("/api/" + source)).replace(/\/$/, "");
       var orig = window.fetch.bind(window);
       window.fetch = function (input, init) {
-        if (typeof input === "string" && input.indexOf("/api/") === 0 && input.indexOf("/api/codex/") !== 0) {
-          var i = input.indexOf("?");
-          var path = i < 0 ? input : input.slice(0, i);
-          var query = i < 0 ? "" : input.slice(i);
-          input = "/api/codex" + path.slice(4) + query;
+        if (typeof input === "string" && input.indexOf("/api/") === 0) {
+          if (input.indexOf("/api/sources") === 0) return orig(input, init);
+          if (input.indexOf(prefix + "/") !== 0 && input !== prefix) {
+            var i = input.indexOf("?");
+            var path = i < 0 ? input : input.slice(0, i);
+            var query = i < 0 ? "" : input.slice(i);
+            input = prefix + path.slice(4) + query;
+          }
         }
         return orig(input, init);
       };
@@ -37,6 +66,7 @@
     <nav class="src-switch" aria-label="Telemetry source">
       <a href="/?source=grok" data-source="grok">Grok Build</a>
       <a href="/?source=codex" data-source="codex">Codex</a>
+      <a href="/?source=antigravity" data-source="antigravity">Antigravity</a>
     </nav>
     <button type="button" id="periodBack" class="ghost-btn period-back" hidden title="Back to period view">← Back</button>
     <h1>Grok Build Telemetry</h1>
@@ -151,6 +181,10 @@
           <button type="button" id="periodPrev" class="ghost-btn" title="Previous period">←</button>
           <span id="periodLabel" class="mode-pill">—</span>
           <button type="button" id="periodNext" class="ghost-btn" title="Next period">→</button>
+          <span class="unit-toggle" id="periodCalendar" hidden title="Period calendar" role="group" aria-label="Period calendar">
+            <button type="button" id="calCivil" class="unit-btn active" aria-pressed="true" title="Monday weeks · calendar months">Calendar</button>
+            <button type="button" id="calBilling" class="unit-btn" aria-pressed="false" title="Grok billing: Thu 21:59/20:59 · day-15 23:50">Billing</button>
+          </span>
         </div>
       </div>
       <div id="taskTabs" class="task-tabs" hidden></div>

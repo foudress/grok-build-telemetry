@@ -9,7 +9,7 @@ Line tokens are a split of that call's ``usage``, not a second ledger.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from token_telemetry.codex.prices import price_usage, priced_model
 from token_telemetry.session.windows import (
@@ -146,7 +146,11 @@ def _ev_chars(ev: Any) -> int:
         return 0
 
 
-def _annotate(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _annotate(
+    calls: list[dict[str, Any]],
+    *,
+    price: Callable[..., dict[str, Any]] = price_usage,
+) -> list[dict[str, Any]]:
     """Split each call's official usage onto miss / user / harness / output lines."""
     notes: list[dict[str, Any]] = []
     prev_prompt = 0
@@ -161,13 +165,14 @@ def _annotate(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
             miss = min(unc, prev_prompt - cached)
         else:
             miss = 0
-        bill = price_usage(
+        bill = price(
             call.get("model"),
             uncached=unc,
             cached=cached,
             output=out,
             cache_write=write,
             prompt=prompt,
+            when=call.get("t"),
         )
         notes.append({
             "miss": miss,
@@ -633,9 +638,13 @@ def _turn_from_round(rnd: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _view(thread: dict[str, Any]) -> dict[str, Any]:
+def _view(
+    thread: dict[str, Any],
+    *,
+    price: Callable[..., dict[str, Any]] = price_usage,
+) -> dict[str, Any]:
     calls = _calls(thread)
-    notes = _annotate(calls)
+    notes = _annotate(calls, price=price)
     rounds_all = []
     prev = None
     order: list[str] = []
@@ -688,6 +697,25 @@ def _view(thread: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _model_label(thread: dict[str, Any], calls: Optional[list[dict[str, Any]]] = None) -> Optional[str]:
+    """Models on this thread, in first-seen order. Empty stays empty."""
+    seen: list[str] = []
+    source = calls if calls is not None else thread.get("calls")
+    if isinstance(source, list):
+        for call in source:
+            if not isinstance(call, dict):
+                continue
+            name = str(call.get("model") or "").strip()
+            if name and name not in seen:
+                seen.append(name)
+    last = str(thread.get("model") or "").strip()
+    if last and last not in seen:
+        seen.append(last)
+    if not seen:
+        return None
+    return " · ".join(seen)
+
+
 def _session_row(
     thread: dict[str, Any],
     *,
@@ -711,6 +739,7 @@ def _session_row(
         "cwd": thread.get("cwd") or "",
         "session_kind": "main",
         "agent_name": None,
+        "model": _model_label(thread),
     }
 
 
@@ -737,8 +766,13 @@ def sessions_for_ui(
     return rows
 
 
-def _sub_snapshot(thread: dict[str, Any], n: int) -> dict[str, Any]:
-    view = _view(thread)
+def _sub_snapshot(
+    thread: dict[str, Any],
+    n: int,
+    *,
+    price: Callable[..., dict[str, Any]] = price_usage,
+) -> dict[str, Any]:
+    view = _view(thread, price=price)
     title = str(thread.get("title") or thread.get("source") or thread["id"])
     return {
         "session_id": str(thread["id"]),
@@ -749,6 +783,7 @@ def _sub_snapshot(thread: dict[str, Any], n: int) -> dict[str, Any]:
         "label": f"Sub Agent {n}",
         "title": title,
         "agent_name": thread.get("source") or None,
+        "model": _model_label(thread),
         "rounds": view["rounds"],
         "turns": view["turns"],
         "live": view["live"],
@@ -763,6 +798,8 @@ def state_for(
     *,
     pinned: Optional[str],
     now: Optional[float] = None,
+    price: Callable[..., dict[str, Any]] = price_usage,
+    name_of: Callable[[Any], Optional[str]] = priced_model,
 ) -> dict[str, Any]:
     threads = _threads(snapshot)
     index = _by_id(threads)
@@ -782,9 +819,9 @@ def state_for(
             "sub_sessions": [],
             "source": "codex",
         }
-    view = _view(thread)
+    view = _view(thread, price=price)
     subs = [
-        _sub_snapshot(child, i)
+        _sub_snapshot(child, i, price=price)
         for i, child in enumerate(kids.get(str(thread["id"]), []), start=1)
     ]
     child_calls = sum(len(s["turns"]) for s in subs)
@@ -801,7 +838,7 @@ def state_for(
         for sub in subs
         for t in (sub.get("turns") or [])
     )
-    priced = [priced_model(m) for m in models]
+    priced = [name_of(m) for m in models]
     priced = [m for m in priced if m]
     return {
         "watching": True,
@@ -877,7 +914,12 @@ def _acc() -> dict[str, float]:
     }
 
 
-def _add_call(acc: dict[str, float], call: dict[str, Any]) -> None:
+def _add_call(
+    acc: dict[str, float],
+    call: dict[str, Any],
+    *,
+    price: Callable[..., dict[str, Any]] = price_usage,
+) -> None:
     unc = _int(call.get("uncached_input_tokens"))
     cached = _int(call.get("cached_input_tokens"))
     out = _int(call.get("output_tokens"))
@@ -888,13 +930,14 @@ def _add_call(acc: dict[str, float], call: dict[str, Any]) -> None:
     acc["tokens_reason"] += reason
     acc["turns"] += 1
     prompt = _int(call.get("input_tokens")) or (unc + cached)
-    bill = price_usage(
+    bill = price(
         call.get("model"),
         uncached=unc,
         cached=cached,
         output=out,
         cache_write=_int(call.get("cache_write_input_tokens")),
         prompt=prompt,
+        when=call.get("t"),
     )
     acc["cost_in_usd"] += bill["in"]
     acc["cost_cached_usd"] += bill["cached"]
@@ -959,6 +1002,8 @@ def build_period(
     offset: int = 0,
     grain: str = "hour",
     now: Optional[datetime] = None,
+    billing: bool = False,
+    price: Callable[..., dict[str, Any]] = price_usage,
 ) -> dict[str, Any]:
     period = (period or "daily").strip().lower()
     if period not in ("daily", "weekly", "monthly"):
@@ -968,9 +1013,10 @@ def build_period(
         offset = int(offset)
     except (TypeError, ValueError):
         offset = 0
-    start, end, label = period_window(period, offset, now=now)
+    use_billing = bool(billing) and period in ("weekly", "monthly")
+    start, end, label = period_window(period, offset, now=now, billing=use_billing)
     start_e, end_e = start.timestamp(), end.timestamp()
-    specs = _bucket_specs(period, start, end, grain)
+    specs = _bucket_specs(period, start, end, grain, billing=use_billing)
     session_grain = grain == "session"
     buckets = [{**s, **_acc(), "_parts": _acc(), "_tools": _acc()} for s in specs]
 
@@ -1000,9 +1046,11 @@ def build_period(
         if not root_calls and not child_rows:
             continue
         n_parent += 1
-        sessions.append(_period_session(root, root_calls, n=n_parent, depth=0, child_n=None))
+        sessions.append(_period_session(
+            root, root_calls, n=n_parent, depth=0, child_n=None, price=price,
+        ))
         for acc_calls in (root_calls,):
-            _fold_calls(acc_calls, totals, buckets, session_grain)
+            _fold_calls(acc_calls, totals, buckets, session_grain, price=price)
         for i, (child, cc) in enumerate(child_rows, start=1):
             sessions.append(
                 _period_session(
@@ -1012,9 +1060,10 @@ def build_period(
                     depth=1,
                     child_n=i,
                     parent_id=str(root["id"]),
+                    price=price,
                 )
             )
-            _fold_calls(cc, totals, buckets, session_grain)
+            _fold_calls(cc, totals, buckets, session_grain, price=price)
 
     if session_grain:
         buckets_out = []
@@ -1054,6 +1103,7 @@ def build_period(
         "period": period,
         "offset": offset,
         "grain": grain,
+        "billing": use_billing,
         "label": label,
         "start": start.isoformat(),
         "end": end.isoformat(),
@@ -1078,9 +1128,11 @@ def _fold_calls(
     totals: dict[str, float],
     buckets: list[dict[str, Any]],
     session_grain: bool,
+    *,
+    price: Callable[..., dict[str, Any]] = price_usage,
 ) -> None:
     for call in calls:
-        _add_call(totals, call)
+        _add_call(totals, call, price=price)
         if session_grain:
             continue
         ep = _epoch(call.get("t"))
@@ -1088,9 +1140,9 @@ def _fold_calls(
             continue
         for bucket in buckets:
             if bucket["start_epoch"] <= ep < bucket["end_epoch"]:
-                _add_call(bucket, call)
-                _add_call(bucket["_parts"], call)
-                _add_call(bucket["_tools"], call)
+                _add_call(bucket, call, price=price)
+                _add_call(bucket["_parts"], call, price=price)
+                _add_call(bucket["_tools"], call, price=price)
                 break
 
 
@@ -1102,12 +1154,13 @@ def _period_session(
     depth: int,
     child_n: Optional[int],
     parent_id: Optional[str] = None,
+    price: Callable[..., dict[str, Any]] = price_usage,
 ) -> dict[str, Any]:
     acc = _acc()
     first = None
     last = None
     for call in calls:
-        _add_call(acc, call)
+        _add_call(acc, call, price=price)
         ep = _epoch(call.get("t"))
         if ep is None:
             continue
@@ -1124,6 +1177,7 @@ def _period_session(
         "label": label,
         "session_kind": kind,
         "agent_name": thread.get("source") or None,
+        "model": _model_label(thread, calls),
         "parent_id": parent_id,
         "n": n,
         "child_n": child_n,

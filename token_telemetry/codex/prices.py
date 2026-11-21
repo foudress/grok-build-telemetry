@@ -65,6 +65,7 @@ def price_usage(
     output: int,
     cache_write: int = 0,
     prompt: int = 0,
+    when: Any = None,
 ) -> dict[str, Any]:
     """One API call. Uncached excludes cached. Cache-write is priced on its own row."""
     name = priced_model(model)

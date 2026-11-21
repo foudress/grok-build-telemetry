@@ -25,11 +25,32 @@ from pathlib import Path
 _ACTIVE_S = 10 * 60
 
 
-def choose_source(*, grok_active: bool, codex_active: bool) -> str:
-    """Grok wins when both are in progress. Codex only when it is the one running."""
-    if grok_active or not codex_active:
+def choose_source(
+    *,
+    grok_active: bool,
+    codex_active: bool,
+    antigravity_active: bool = False,
+    prefer: str = "",
+) -> str:
+    """Grok wins when it is in progress.
+
+    A single other live source opens that view. When Codex and Antigravity
+    are both live, ``prefer`` is the one touched more recently.
+    """
+    if grok_active:
         return "grok"
-    return "codex"
+    live = []
+    if codex_active:
+        live.append("codex")
+    if antigravity_active:
+        live.append("antigravity")
+    if not live:
+        return "grok"
+    if len(live) == 1:
+        return live[0]
+    if prefer in live:
+        return prefer
+    return live[0]
 
 
 def _mtime(path: Path) -> float:
@@ -52,6 +73,21 @@ def _grok_updates(sessions_root: Path, session_id: str) -> float:
     newest = 0.0
     for child in children:
         newest = max(newest, _mtime(child / session_id / "updates.jsonl"))
+    return newest
+
+
+def _antigravity_newest(home: Path) -> float:
+    """Newest conversation database. Enough to see a live cascade."""
+    folder = home / "conversations"
+    if not folder.is_dir():
+        return 0.0
+    newest = 0.0
+    try:
+        for path in folder.iterdir():
+            if path.is_file() and path.suffix == ".db":
+                newest = max(newest, _mtime(path))
+    except OSError:
+        return 0.0
     return newest
 
 
@@ -146,18 +182,25 @@ def launch_choice(
     active_ids: list[str] | None = None,
     sessions_root: Path | None = None,
     codex_home: Path | None = None,
+    antigravity_home: Path | None = None,
     active_file: Path | None = None,
     now: float | None = None,
 ) -> tuple[str, str]:
     """(source, grok session to open).
 
     Active means a log written in the last 10 minutes. A stale id list is
-    not a running session. Both running → grok, and the URL pins that live
-    Grok session. Only Codex running → codex.
+    not a running session. Grok wins when it is live. Codex or Antigravity
+    opens only when it is the live source. If both of those are live, the
+    newer log wins.
     """
     now_s = time.time() if now is None else now
     root = sessions_root if sessions_root is not None else Path.home() / ".grok" / "sessions"
     home = codex_home if codex_home is not None else Path.home() / ".codex"
+    agy = (
+        antigravity_home
+        if antigravity_home is not None
+        else Path.home() / ".gemini" / "antigravity"
+    )
     if active_ids is None:
         listing = active_file if active_file is not None else Path.home() / ".grok" / "active_sessions.json"
         ids = _read_active_ids(listing)
@@ -171,12 +214,20 @@ def launch_choice(
         if mt >= grok_mtime:
             grok_mtime, grok_sid = mt, sid
     codex_mtime = _codex_newest(home)
+    agy_mtime = _antigravity_newest(agy)
     # An explicit Grok session is the one the user just launched from.
     grok_active = bool(session_id) or (
         grok_mtime > 0 and now_s - grok_mtime <= _ACTIVE_S
     )
     codex_active = codex_mtime > 0 and now_s - codex_mtime <= _ACTIVE_S
-    source = choose_source(grok_active=grok_active, codex_active=codex_active)
+    agy_active = agy_mtime > 0 and now_s - agy_mtime <= _ACTIVE_S
+    prefer = "antigravity" if agy_mtime > codex_mtime else "codex"
+    source = choose_source(
+        grok_active=grok_active,
+        codex_active=codex_active,
+        antigravity_active=agy_active,
+        prefer=prefer,
+    )
     if source != "grok":
         return source, ""
     return source, session_id or grok_sid
@@ -188,15 +239,17 @@ def launch_source(
     active_ids: list[str] | None = None,
     sessions_root: Path | None = None,
     codex_home: Path | None = None,
+    antigravity_home: Path | None = None,
     active_file: Path | None = None,
     now: float | None = None,
 ) -> str:
-    """Which dashboard to open. Both active → grok. Only Codex running → codex."""
+    """Which dashboard to open. Grok wins when it is live."""
     source, _sid = launch_choice(
         session_id=session_id,
         active_ids=active_ids,
         sessions_root=sessions_root,
         codex_home=codex_home,
+        antigravity_home=antigravity_home,
         active_file=active_file,
         now=now,
     )
@@ -205,8 +258,8 @@ def launch_source(
 
 def dashboard_url(port: int, source: str, session_id: str = "") -> str:
     base = f"http://127.0.0.1:{port}/"
-    if source == "codex":
-        return base + "?source=codex"
+    if source in ("codex", "antigravity"):
+        return base + "?source=" + source
     if session_id:
         return base + "?source=grok&session=" + session_id
     return base + "?source=grok"

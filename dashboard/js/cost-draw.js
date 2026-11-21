@@ -445,7 +445,13 @@ export function drawLineChart(canvas, series, color, rounds) {
   }
   ctx.textAlign = "left";
 
-  const tierCliff = document.documentElement.dataset.source === "codex" ? 272000 : 200000;
+  const cliffAttr = document.documentElement.dataset.contextCliff;
+  const cliffRaw = cliffAttr != null && cliffAttr !== "" ? Number(cliffAttr) : NaN;
+  const tierCliff = cliffRaw > 0
+    ? cliffRaw
+    : (cliffRaw === 0
+      ? 0
+      : (document.documentElement.dataset.source === "codex" ? 272000 : 200000));
   if (tierCliff > min && tierCliff < max) {
     const yCliff = yOf(tierCliff);
     ctx.save();
@@ -1819,9 +1825,8 @@ export function renderCostLegend(legendItems, hidden) {
 
 export function setCostUnit(unit) {
   window.__costChart.unit = unit === "tokens" ? "tokens" : "usd";
-  const unitKey = document.documentElement.dataset.source === "codex"
-    ? "tt-cost-unit-codex"
-    : "tt-cost-unit";
+  const source = document.documentElement.dataset.source || "grok";
+  const unitKey = source === "grok" ? "tt-cost-unit" : ("tt-cost-unit-" + source);
   try { localStorage.setItem(unitKey, window.__costChart.unit); } catch { /* ignore */ }
   const usdBtn = $("costUnitUsd");
   const tokBtn = $("costUnitTok");

@@ -99,6 +99,8 @@ def test_state_matches_dashboard_rounds() -> None:
     assert state["turns"][0]["uncached_input_tokens"] == 18
     assert state["sub_sessions"][0]["turns"][0]["uncached_input_tokens"] == 7
     assert state["sub_sessions"][0]["session_kind"] == "subagent"
+    assert state["sub_sessions"][0]["model"] == "gpt-5-codex"
+    assert sessions_for_ui(snap)[0]["model"] == "gpt-5-codex"
     assert state["live"]["context_tokens"] == 64
     assert state["signals"]["contextWindowTokens"] == 258400
     assert state["context_series"][-1]["v"] == 64

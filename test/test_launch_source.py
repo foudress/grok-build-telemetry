@@ -11,6 +11,11 @@ def test_both_active_prefers_grok() -> None:
     assert choose_source(grok_active=True, codex_active=False) == "grok"
     assert choose_source(grok_active=False, codex_active=True) == "codex"
     assert choose_source(grok_active=False, codex_active=False) == "grok"
+    assert choose_source(grok_active=False, codex_active=False, antigravity_active=True) == "antigravity"
+    assert choose_source(grok_active=True, codex_active=False, antigravity_active=True) == "grok"
+    assert choose_source(
+        grok_active=False, codex_active=True, antigravity_active=True, prefer="antigravity"
+    ) == "antigravity"
 
 
 def test_only_a_live_codex_rollout_opens_codex(tmp_path: Path) -> None:
@@ -22,6 +27,7 @@ def test_only_a_live_codex_rollout_opens_codex(tmp_path: Path) -> None:
     source = launch_source(
         sessions_root=tmp_path / "grok",
         codex_home=tmp_path / "codex",
+        antigravity_home=tmp_path / "no-agy",
         active_ids=[],
         now=now,
     )
@@ -44,6 +50,7 @@ def test_listed_grok_session_wins_over_a_live_codex(tmp_path: Path) -> None:
     source = launch_source(
         sessions_root=tmp_path / "grok",
         codex_home=tmp_path / "codex",
+        antigravity_home=tmp_path / "no-agy",
         active_file=active,
         now=now,
     )
@@ -70,6 +77,7 @@ def test_stale_grok_list_does_not_beat_a_live_codex(tmp_path: Path) -> None:
     source, sid = launch_choice(
         sessions_root=tmp_path / "grok",
         codex_home=tmp_path / "codex",
+        antigravity_home=tmp_path / "no-agy",
         active_ids=["sid-old"],
         now=now,
     )
@@ -89,8 +97,26 @@ def test_live_grok_file_wins_even_if_it_is_not_listed(tmp_path: Path) -> None:
     source, sid = launch_choice(
         sessions_root=tmp_path / "grok",
         codex_home=tmp_path / "codex",
+        antigravity_home=tmp_path / "no-agy",
         active_ids=[],
         now=now,
     )
     assert source == "grok"
     assert sid == "sid-live"
+
+
+def test_only_a_live_antigravity_db_opens_antigravity(tmp_path: Path) -> None:
+    folder = tmp_path / "agy" / "conversations"
+    folder.mkdir(parents=True)
+    db = folder / "cascade.db"
+    db.write_bytes(b"x")
+    now = db.stat().st_mtime + 5
+    source = launch_source(
+        sessions_root=tmp_path / "grok",
+        codex_home=tmp_path / "no-codex",
+        antigravity_home=tmp_path / "agy",
+        active_ids=[],
+        now=now,
+    )
+    assert source == "antigravity"
+    assert dashboard_url(8765, source) == "http://127.0.0.1:8765/?source=antigravity"

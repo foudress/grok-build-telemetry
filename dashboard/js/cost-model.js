@@ -553,6 +553,33 @@ function userToolsSegs(up, roundIndex) {
       color: COST_COLORS.prompt,
     });
   }
+  // Optional Livre card, then the harness row under User.
+  const lc = up.livre_card || {};
+  const lcT = Number(lc.tokens_in) || 0;
+  const lcU = Number(lc.cost_in_usd) || 0;
+  if (lcT > 0 || lcU > 0) {
+    out.push({
+      k: "tool",
+      label: "livre",
+      legendKey: "tool:livre",
+      v: lcU || 0,
+      tok: lcT || 0,
+      color: COST_COLORS.tool || COST_COLORS.harness,
+    });
+  }
+  const hc = up.harness_card || {};
+  const hcT = Number(hc.tokens_in) || 0;
+  const hcU = Number(hc.cost_in_usd) || 0;
+  if (hcT > 0 || hcU > 0) {
+    out.push({
+      k: "tool",
+      label: "harness",
+      legendKey: "tool:harness",
+      v: hcU || 0,
+      tok: hcT || 0,
+      color: COST_COLORS.tool || COST_COLORS.harness,
+    });
+  }
   if (ansT > 0 || ansU > 0) {
     const rn = Number(prev.round_index) || Math.max(0, Number(roundIndex || 1) - 1);
     out.push({

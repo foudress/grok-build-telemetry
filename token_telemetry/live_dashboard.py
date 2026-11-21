@@ -108,6 +108,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     url = f"http://{args.host}:{args.port}/"
     print(f"dashboard: {url}")
     print(f"codex:     {url}?source=codex")
+    print(f"antigravity: {url}?source=antigravity")
     print(f"history:   {url}history")
     print("Ctrl+C to stop")
     if not args.no_open:
