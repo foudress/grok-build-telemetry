@@ -3,3 +3,4 @@
 transformers>=4.40
 huggingface_hub>=0.20
 zstandard>=0.22
+tzdata>=2024.1
