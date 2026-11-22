@@ -35,6 +35,7 @@ Zero is present (v1.5). Do not replace a real 0 with another ledger.
 - User Cached in the tree is the stamp. Continuity peels cache miss off tokens, not off `tokens_cached`.
 - A present Call In of 0 stays 0. The harness sum is the fallback only when `tokens_in` is absent. Call In is still the harness figure when the step was stamped from harness; the clamp does not rewrite the step.
 - Codex cache-write rate 0.0 bills 0, not the input rate.
+- The >200k list rate follows each LLM call's `context_start`. Round `context_end` does not reprice the other calls. Header Cached tokens stay the official sum. Header Cached $ is each call's share at that call's tier, including the omitted last prefix.
 
 ## Canonical round fields
 

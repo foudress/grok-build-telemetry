@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.1] — 2026-11-22
+
+The >200k list rate applies to the LLM call that crossed it. A round that ends above 200k no longer reprices the other calls. `CACHE_VER` is 32.
+
+### Fixed
+
+- Header Cached dollars split the official cache across calls by each call's own prefix, priced at that call's `context_start`. The hidden last prefix uses the last call's tier. Cache miss, User In, and Compact Out use the same per-call tier.
+
 ## [1.5.0] — 2026-11-22
 
 A measured zero stays a zero. The session Official dollar is still the tick sum. `CACHE_VER` is 31. Splitting the large accounting and paint files stays for a later pass.

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "token-telemetry"
-version = "1.5.0"
+version = "1.5.1"
 description = "Live companion dashboard for Grok Build, Codex, and Antigravity token usage, cache, and cost"
 readme = "README.md"
 license = { text = "MIT" }

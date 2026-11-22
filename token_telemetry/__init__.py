@@ -1,3 +1,3 @@
 """Grok Build token telemetry — live cost/context companion dashboard."""
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"

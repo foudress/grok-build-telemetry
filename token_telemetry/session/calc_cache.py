@@ -18,7 +18,7 @@ import threading
 from pathlib import Path
 from typing import Any, Optional
 
-CACHE_VER = 31
+CACHE_VER = 32
 CACHE_DIR = Path.home() / ".grok" / "token-telemetry" / "calc-cache"
 STAMP_NAME = "_stamp.json"
 

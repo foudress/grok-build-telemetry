@@ -52,6 +52,49 @@ _HARNESS_IN_KINDS = frozenset(
 )
 
 
+def _call_tier(step: dict[str, Any]) -> int:
+    """≤/>200k tier for this call. Stream start, never the round end."""
+    try:
+        raw = int(step.get("tier_context_tokens") or 0)
+    except (TypeError, ValueError):
+        raw = 0
+    if raw > 0:
+        return raw
+    return max(1, int(step_tier_ctx(step, fallback=1)))
+
+
+def _usd_for_call_shares(
+    tokens: int,
+    steps: list[dict[str, Any]],
+    weights: list[float],
+    price_fn,
+) -> float:
+    """Price a token pool by each call's own tier.
+
+    A round that ends above 200k does not reprice the calls that started
+    under it. Shares follow ``weights``; a call with no weight takes nothing.
+    """
+    n = max(0, int(tokens or 0))
+    if n <= 0 or not steps:
+        return 0.0
+    ws: list[float] = []
+    tiers: list[int] = []
+    for i, step in enumerate(steps):
+        w = weights[i] if i < len(weights) else 0.0
+        try:
+            w = float(w)
+        except (TypeError, ValueError):
+            w = 0.0
+        ws.append(max(0.0, w))
+        tiers.append(_call_tier(step) if isinstance(step, dict) else 1)
+    if sum(ws) <= 0:
+        return float(price_fn(n, tiers[0]))
+    shares = _scale_ints(ws, n)
+    return float(
+        sum(price_fn(int(share), int(tier)) for share, tier in zip(shares, tiers))
+    )
+
+
 def reconstruct_model_step_usage(
     steps: list[dict[str, Any]],
     *,
@@ -1339,31 +1382,41 @@ def reconstruct_model_step_usage(
     )
     caused_unc_sum = int(tot_harness_in)
     api_in_usd = float(tot_cost_in)
-    miss_tier = 1
-    if context_end_tokens is not None:
-        try:
-            miss_tier = max(1, int(context_end_tokens))
-        except (TypeError, ValueError):
-            miss_tier = 1
-    elif stream_ends:
-        miss_tier = max(1, max(int(e or 0) for e in stream_ends))
-    elif prior_i:
-        miss_tier = max(1, int(prior_i))
-    header_cache_usd = float(call_cache_usd)
-    if off_cache is not None:
-        header_cache_usd = float(_price_cache(int(off_cache), miss_tier))
+    # Header Cached tokens stay the official sum. The dollars follow each
+    # call's tier, including the last prefix hidden from the call line.
+    cache_weights = [
+        float(max(0, int(s.get("tokens_cached") or 0))) for s in annotated
+    ]
+    if cache_weights and last_cache_omitted > 0:
+        cache_weights[-1] += float(last_cache_omitted)
+    if off_cache is not None and annotated:
+        header_cache_usd = _usd_for_call_shares(
+            int(off_cache), annotated, cache_weights, _price_cache
+        )
+    else:
+        header_cache_usd = float(call_cache_usd)
+    in_weights = [
+        float(max(0, int(s.get("tokens_in") or 0))) for s in annotated
+    ]
     cache_miss_usd = (
-        float(_price_in(int(cache_miss_tok), miss_tier)) if cache_miss_tok else 0.0
+        _usd_for_call_shares(int(cache_miss_tok), annotated, in_weights, _price_in)
+        if cache_miss_tok
+        else 0.0
     )
-    user_in_usd = float(_price_in(int(user_i), miss_tier)) if user_i else 0.0
+    user_tier = _call_tier(annotated[0]) if annotated else 1
+    user_in_usd = float(_price_in(int(user_i), user_tier)) if user_i else 0.0
     tree_tok = int(user_i) + int(tot_harness_in) + int(cache_miss_tok)
     tree_usd = float(user_in_usd) + float(tot_harness_in_usd) + float(cache_miss_usd)
-    compact_sum = int(sum(int(x) for x in compact_per)) if compact_per else 0
+    compact_usd = 0.0
+    for step, ctok in zip(annotated, compact_per):
+        if not ctok:
+            continue
+        compact_usd += float(_price_in(int(ctok), _call_tier(step)))
     tools_usd = max(
         0.0,
         float(tot_harness_in_usd)
         - float(tot_out_to_harness_in_usd)
-        - (float(_price_in(compact_sum, miss_tier)) if compact_sum else 0.0),
+        - compact_usd,
     )
     breakdown = {
         "uncached_in_tokens": paid_unc_sum,
@@ -1441,7 +1494,8 @@ def reconstruct_model_step_usage(
             f"Tokenizer={tokenizer_mode()}. "
             "Reasoning=Thought+ToolReq+Enc residual; pure Out→messages only. "
             "Cached display=rolling prefix (last keeps it). "
-            "Round header Cached tokens/$ = official cachedRead. "
+            "Round header Cached tokens = official cachedRead. "
+            "Cached $ uses each call's tier (context_start), not the round end. "
             "Round KV miss is leftover official uncached."
         ),
         "prior_context_tokens": prior_context_tokens,

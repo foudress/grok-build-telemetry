@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from token_telemetry.pricing.rates import _price_cache, _price_in, _scale_ints
 from token_telemetry.pricing.reconstruct import reconstruct_model_step_usage
 from token_telemetry.pricing.reconstruct.in_cache import _fit_tools_to_delta_ctx
 
@@ -321,3 +322,75 @@ def test_r1_system_remainder_is_not_round_miss():
     # Header Cached $ is official off_c (0); last call has no display prefix.
     assert float(bd.get("cached_usd") or 0) == 0.0
     assert float(recon["totals"].get("cost_cached_usd") or 0) == 0.0
+
+
+def _header_cache_usd(recon: dict, off_cache: int) -> float:
+    steps = recon["steps"]
+    weights = [float(int(s.get("tokens_cached") or 0)) for s in steps]
+    omitted = int(recon["breakdown"].get("last_cache_omitted_tokens") or 0)
+    if weights and omitted > 0:
+        weights[-1] += float(omitted)
+    shares = _scale_ints(weights, int(off_cache))
+    return sum(
+        _price_cache(int(share), int(s.get("tier_context_tokens") or 1))
+        for s, share in zip(steps, shares)
+    )
+
+
+def test_round_end_over_200k_does_not_reprice_low_calls():
+    """A round end above 200k leaves calls that started under it on the low card."""
+    off_cache = 400_000
+    recon = reconstruct_model_step_usage(
+        [
+            _step(80_000),
+            _step(120_000),
+            _step(
+                150_000,
+                compacts_after=[
+                    {
+                        "kind": "compaction",
+                        "placement": "mid_round",
+                        "tokens_before": 160_000,
+                        "tokens_after": 20_000,
+                    }
+                ],
+            ),
+            _step(20_000),
+            _step(40_000),
+        ],
+        official_usage=_usage(500_000, off_cache, 100),
+        context_end_tokens=260_000,
+        user_uncached_tokens=50,
+    )
+    bd = recon["breakdown"]
+    assert recon["steps"]
+    assert all(int(s.get("tier_context_tokens") or 0) <= 200_000 for s in recon["steps"])
+    low = _price_cache(off_cache, 1)
+    high = _price_cache(off_cache, 260_000)
+    assert abs(float(bd["cached_usd"]) - low) < 1e-9
+    assert float(bd["cached_usd"]) < high - 1e-6
+    miss = int(bd.get("cache_miss_in_tokens") or 0)
+    if miss:
+        assert abs(float(bd["cache_miss_in_usd"]) - _price_in(miss, 1)) < 1e-9
+
+
+def test_only_calls_over_200k_pay_the_high_cache_rate():
+    off_cache = 300_000
+    recon = reconstruct_model_step_usage(
+        [_step(50_000), _step(210_000), _step(220_000)],
+        official_usage=_usage(400_000, off_cache, 20),
+        context_end_tokens=260_000,
+    )
+    steps = recon["steps"]
+    assert int(steps[0]["tier_context_tokens"]) <= 200_000
+    assert int(steps[1]["tier_context_tokens"]) > 200_000
+    assert int(steps[0]["tokens_cached"]) > 0
+    assert int(steps[1]["tokens_cached"]) > 0
+    expected = _header_cache_usd(recon, off_cache)
+    assert abs(float(recon["breakdown"]["cached_usd"]) - expected) < 1e-9
+    assert float(recon["breakdown"]["cached_usd"]) < _price_cache(off_cache, 260_000) - 1e-6
+    hi = steps[1]
+    assert abs(
+        float(hi["cost_cached_usd"])
+        - _price_cache(int(hi["tokens_cached"]), int(hi["tier_context_tokens"]))
+    ) < 1e-9
