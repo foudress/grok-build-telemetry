@@ -408,11 +408,53 @@ def _compacts_to_fill(r: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def _step_cached(step: dict[str, Any]) -> int:
+    try:
+        return max(0, int(step.get("tokens_cached") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _cached_walking_back(steps: list[dict[str, Any]], start: int) -> Optional[int]:
+    """Latest positive call-cache stamp at or before ``start``.
+
+    The round's last call stores Cached = 0 (ledger identity). That zero is
+    not a measured miss, so walk back to the previous stamp.
+    """
+    for i in range(min(start, len(steps) - 1), -1, -1):
+        n = _step_cached(steps[i])
+        if n > 0:
+            return n
+    return None
+
+
+def _compact_anchor_cached(
+    compact: dict[str, Any],
+    r: dict[str, Any],
+    prev: Optional[dict[str, Any]],
+) -> Optional[int]:
+    """Cache stamp of the call that held the window compact re-read.
+
+    A previous round's ``cache_miss`` / ``session_restart`` chip is a residual
+    (off_unc − user − harness). It does not mean this window was uncached.
+    """
+    steps = [s for s in (r.get("model_steps") or []) if isinstance(s, dict)]
+    for i, step in enumerate(steps):
+        if any(c is compact for c in (step.get("compacts_after") or [])):
+            return _cached_walking_back(steps, i)
+    if r.get("compact_before") is compact and isinstance(prev, dict):
+        pst = [s for s in (prev.get("model_steps") or []) if isinstance(s, dict)]
+        if pst:
+            return _cached_walking_back(pst, len(pst) - 1)
+    return None
+
+
 def _fill_compact_cost(hb: Any, r: dict[str, Any]) -> None:
     """
     Compact bill:
 
-      1) pre-read of FULL context: Cached on hit, In on miss (never both)
+      1) pre-read of tokens_before, split by the anchor call's cache stamp
+         (Cached + In tail). No stamp → warm window, all Cached.
       2) Out = compressed history (tokens_after)
 
     Compact Out re-entry + post-compact tools stay on the next harness
@@ -451,29 +493,18 @@ def _fill_compact_cost(hb: Any, r: dict[str, Any]) -> None:
         cc = float(e["cost_usd"]["cached_input"])
         return cu, cc, cu + cc
 
-    miss = False
-    if isinstance(prev, dict):
-        up = prev.get("user_prompt") if isinstance(prev.get("user_prompt"), dict) else {}
-        bd_prev = prev.get("breakdown") if isinstance(prev.get("breakdown"), dict) else {}
-        miss = bool(
-            prev.get("session_restart")
-            or prev.get("cache_miss")
-            or prev.get("context_reread")
-            or up.get("session_restart")
-            or up.get("cache_miss")
-            or up.get("context_reread")
-            or bd_prev.get("context_reread")
-        )
-
     for compact in compacts:
         before_i = _as_int(compact.get("tokens_before"))
         after_i = _as_int(compact.get("tokens_after"))
         pre_tok = max(0, before_i or 0)
+        anchor = _compact_anchor_cached(compact, r, prev if isinstance(prev, dict) else None)
         if pre_tok > 0:
-            if miss:
-                pre_unc, pre_cache = pre_tok, 0
+            if isinstance(anchor, int) and anchor > 0:
+                pre_cache = min(pre_tok, anchor)
+                pre_unc = pre_tok - pre_cache
             else:
                 pre_unc, pre_cache = 0, pre_tok
+            miss = pre_cache == 0 and pre_unc > 0
             u_usd, c_usd, pre_usd = _price(pre_unc, pre_cache, pre_tok)
             compact["pre_read_tokens"] = pre_tok
             compact["pre_read_uncached_tokens"] = pre_unc
@@ -482,15 +513,23 @@ def _fill_compact_cost(hb: Any, r: dict[str, Any]) -> None:
             compact["pre_read_cached_usd"] = round(c_usd, 8)
             compact["pre_read_usd"] = round(pre_usd, 8)
             compact["pre_read_cache_miss"] = bool(miss)
-            compact["pre_read_note"] = (
-                "Cache miss: full tokens_before billed as In."
-                if miss
-                else "Cache hit: full tokens_before billed as Cached."
-            )
+            if pre_unc > 0 and pre_cache > 0:
+                compact["pre_read_note"] = (
+                    "Anchor call cache stamp: cached prefix + uncached tail. "
+                    "Not the previous round's miss chip."
+                )
+            elif miss:
+                compact["pre_read_note"] = (
+                    "No cached prefix on the anchor call: tokens_before as In."
+                )
+            else:
+                compact["pre_read_note"] = (
+                    "No call-level miss: tokens_before billed as Cached."
+                )
         else:
             compact["pre_read_tokens"] = 0
             compact["pre_read_usd"] = 0.0
-            compact["pre_read_cache_miss"] = bool(miss)
+            compact["pre_read_cache_miss"] = False
 
         # Compact Out stays on this row; next harness owns re-entry.
         compact["deferred_reload_tokens"] = None
@@ -524,6 +563,6 @@ def _fill_compact_cost(hb: Any, r: dict[str, Any]) -> None:
         out_usd = float(compact.get("out_usd") or 0)
         compact["cost_usd"] = round(pre_usd + out_usd, 8)
         compact["cost_note"] = (
-            "Compact $ = (Cached hit | In miss) of tokens_before + Out "
+            "Compact $ = cached prefix + uncached tail of tokens_before + Out "
             "(compressed history). Reload tools/system is next-call In."
         )

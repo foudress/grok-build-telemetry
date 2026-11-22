@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Token Telemetry</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #0b0f14;
+      color: #8b9cb3;
+      font: 13px/1.4 "Segoe UI", system-ui, sans-serif;
+    }
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    main { text-align: center; max-width: 280px; padding: 24px; }
+    h1 {
+      margin: 0 0 8px;
+      color: #e6edf3;
+      font-size: 16px;
+      font-weight: 600;
+    }
+    p { margin: 0; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Token Telemetry</h1>
+    <p id="status">Starting the local dashboard…</p>
+  </main>
+  <script>
+    function setStatus(text) {
+      var el = document.getElementById("status");
+      if (el) el.textContent = text;
+    }
+  </script>
+</body>
+</html>

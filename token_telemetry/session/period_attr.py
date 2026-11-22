@@ -291,18 +291,32 @@ def _recap_parts_segs(c: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _compact_io_segs(c: dict[str, Any]) -> list[dict[str, Any]]:
-    miss = bool(c.get("pre_read_cache_miss"))
-    pre_unc_u = _f(c.get("pre_read_uncached_usd") or c.get("pre_read_usd"))
-    pre_c_u = _f(c.get("pre_read_cached_usd") or c.get("pre_read_usd"))
-    pre_unc_t = _f(c.get("pre_read_uncached_tokens") or c.get("pre_read_tokens") or c.get("tokens_before"))
-    pre_c_t = _f(c.get("pre_read_cached_tokens") or c.get("pre_read_tokens") or c.get("tokens_before"))
+    """Pre-read may be Cached, In, or both. ``0`` is a real stamp."""
+    has_unc = "pre_read_uncached_tokens" in c and c.get("pre_read_uncached_tokens") is not None
+    has_cache = "pre_read_cached_tokens" in c and c.get("pre_read_cached_tokens") is not None
     out: list[dict[str, Any]] = []
-    if miss or (pre_unc_t > 0 and not (pre_c_t > 0)):
-        s = _seg("in", "In", pre_unc_u, pre_unc_t)
+    if has_unc or has_cache:
+        pre_unc_t = _f(c.get("pre_read_uncached_tokens")) if has_unc else 0.0
+        pre_c_t = _f(c.get("pre_read_cached_tokens")) if has_cache else 0.0
+        pre_unc_u = _f(c.get("pre_read_uncached_usd"))
+        pre_c_u = _f(c.get("pre_read_cached_usd"))
+        if pre_unc_t > 0:
+            s = _seg("in", "In", pre_unc_u, pre_unc_t)
+            if s:
+                out.append(s)
+        if pre_c_t > 0:
+            s = _seg("cached", "Cached", pre_c_u, pre_c_t)
+            if s:
+                out.append(s)
     else:
-        s = _seg("cached", "Cached", pre_c_u, pre_c_t)
-    if s:
-        out.append(s)
+        miss = bool(c.get("pre_read_cache_miss"))
+        pre_tok = _f(c.get("pre_read_tokens") or c.get("tokens_before"))
+        pre_usd = _f(c.get("pre_read_usd"))
+        key = "in" if miss else "cached"
+        lab = "In" if miss else "Cached"
+        s = _seg(key, lab, pre_usd, pre_tok)
+        if s:
+            out.append(s)
     s2 = _seg("out", "Out", _f(c.get("out_usd")), _f(c.get("out_tokens")))
     if s2:
         out.append(s2)

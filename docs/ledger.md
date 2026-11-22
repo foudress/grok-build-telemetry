@@ -19,7 +19,7 @@ tree_in              = user_in + harness_in + miss
 miss                 = max(0, paid_unc − [System si R1] − user − harness)
 R1: System + tree_in = paid_unc          # bill
 R1 ctx line          = 0 → context_end   # window
-Compact Out          ∈ User In, XOR Cached+Out on Compact card
+Compact Out          ∈ User In. Compact pre-read = anchor call cache + In tail (else warm Cached) + Out. A round miss chip does not flip the window to In.
 Last call Cached     = 0
 R1 User Cached       = 0
 Call In              = harness

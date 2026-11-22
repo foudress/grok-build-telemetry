@@ -1398,8 +1398,10 @@ export function eventMs(e) {
 export function compactCostBar(c, compactIndex, { detail } = {}) {
   if (!c || c.kind !== "compaction") return null;
   const segs = [];
-  // In XOR Cached (miss vs hit) + Out (compressed history). Never both.
+  // Cached prefix and uncached tail both count when both are stamped.
   const miss = !!c.pre_read_cache_miss;
+  const hasUnc = c.pre_read_uncached_tokens != null && c.pre_read_uncached_tokens !== "";
+  const hasCache = c.pre_read_cached_tokens != null && c.pre_read_cached_tokens !== "";
   const preTok = Number(c.pre_read_tokens) || Number(c.tokens_before) || 0;
   const preUnc = Number(c.pre_read_uncached_usd) || 0;
   const preCache = Number(c.pre_read_cached_usd) || 0;
@@ -1408,12 +1410,21 @@ export function compactCostBar(c, compactIndex, { detail } = {}) {
   const outU = Number(c.out_usd) || 0;
   const outT = Number(c.out_tokens) || 0;
   let inU = 0, inT = 0, cacheU = 0, cacheT = 0;
-  if (miss || (preUncT > 0 && !(preCacheT > 0))) {
-    inU = preUnc || Number(c.pre_read_usd) || 0;
-    inT = preUncT || preTok;
+  if (hasUnc || hasCache) {
+    if (preUncT > 0) {
+      inU = preUnc;
+      inT = preUncT;
+    }
+    if (preCacheT > 0) {
+      cacheU = preCache;
+      cacheT = preCacheT;
+    }
+  } else if (miss) {
+    inU = Number(c.pre_read_usd) || 0;
+    inT = preTok;
   } else {
-    cacheU = preCache || Number(c.pre_read_usd) || 0;
-    cacheT = preCacheT || preTok;
+    cacheU = Number(c.pre_read_usd) || 0;
+    cacheT = preTok;
   }
   if (detail) {
     const u = (inU || 0) + (cacheU || 0) + (outU || 0);

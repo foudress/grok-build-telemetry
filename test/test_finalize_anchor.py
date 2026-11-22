@@ -210,7 +210,8 @@ def test_compact_warm_is_cached_xor_plus_out():
     assert (compact.get("out_usd") or 0) > 0
 
 
-def test_compact_after_miss_is_in_not_cached():
+def test_round_miss_chip_does_not_flip_compact_to_in():
+    """A residual round miss is not the compact window's cache state."""
     compact = {
         "kind": "compaction",
         "tokens_before": 100000,
@@ -219,15 +220,39 @@ def test_compact_after_miss_is_in_not_cached():
     prev = {
         "index": 1,
         "cache_miss": True,
+        "session_restart": True,
         "context_reread": True,
         "model_steps": [],
     }
     nxt = {"index": 2, "compact_before": compact, "model_steps": []}
     _fill_compact_cost(_HB([prev, nxt]), nxt)
-    assert compact["pre_read_uncached_tokens"] == 100000
-    assert compact["pre_read_cached_tokens"] == 0
-    assert compact["pre_read_cache_miss"] is True
+    assert compact["pre_read_uncached_tokens"] == 0
+    assert compact["pre_read_cached_tokens"] == 100000
+    assert compact["pre_read_cache_miss"] is False
     assert int(compact.get("out_tokens") or 0) > 0
+
+
+def test_compact_pre_read_splits_on_anchor_cache():
+    compact = {
+        "kind": "compaction",
+        "tokens_before": 168804,
+        "tokens_after": 13976,
+    }
+    prev = {
+        "index": 1,
+        "cache_miss": True,
+        "session_restart": True,
+        "model_steps": [
+            {"index": 8, "tokens_cached": 167002},
+            {"index": 9, "tokens_cached": 0},
+        ],
+    }
+    nxt = {"index": 2, "compact_before": compact, "model_steps": []}
+    _fill_compact_cost(_HB([prev, nxt]), nxt)
+    assert compact["pre_read_cached_tokens"] == 167002
+    assert compact["pre_read_uncached_tokens"] == 1802
+    assert compact["pre_read_cache_miss"] is False
+    assert compact["pre_read_cached_tokens"] + compact["pre_read_uncached_tokens"] == 168804
 
 
 class _EnrichHB:

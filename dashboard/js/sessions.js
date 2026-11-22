@@ -31,6 +31,30 @@ function clipTitle(s, n) {
   return t.slice(0, n - 1) + "…";
 }
 
+function appShell() {
+  return document.documentElement.dataset.shell === "app";
+}
+
+function paintSessionBtn(btn, follow, title) {
+  if (!btn) return;
+  btn.classList.toggle("is-follow", !!follow);
+  btn.title = title || "";
+  if (appShell()) {
+    btn.textContent = clipTitle(title || "Session", follow ? 48 : 52);
+    return;
+  }
+  btn.textContent = follow
+    ? `● ${clipTitle(title, 48)}`
+    : clipTitle(title || "Session", 52);
+}
+
+function closeScopeMenu() {
+  const menu = $("scopeDdMenu");
+  const btn = $("scopeDdBtn");
+  if (menu) menu.hidden = true;
+  if (btn) btn.classList.remove("is-open");
+}
+
 function ensureSessionDd(sel) {
   let wrap = $("sessionDd");
   if (wrap) return wrap;
@@ -45,7 +69,9 @@ function ensureSessionDd(sel) {
   const menu = $("sessionDdMenu");
   btn.addEventListener("click", (ev) => {
     ev.stopPropagation();
+    closeScopeMenu();
     menu.hidden = !menu.hidden;
+    btn.classList.toggle("is-open", !menu.hidden);
     if (!menu.hidden) {
       const br = wrap.getBoundingClientRect();
       menu.style.left = "0";
@@ -73,7 +99,10 @@ function ensureSessionDd(sel) {
     }
   });
   document.addEventListener("click", (ev) => {
-    if (!wrap.contains(ev.target)) menu.hidden = true;
+    if (!wrap.contains(ev.target)) {
+      menu.hidden = true;
+      btn.classList.remove("is-open");
+    }
   });
   return wrap;
 }
@@ -102,6 +131,7 @@ function fillSessionSelect(state) {
   const menu = $("sessionDdMenu");
   if (!current && !sessions.length) {
     if (btn) {
+      btn.classList.remove("is-follow", "is-open");
       btn.textContent = "loading…";
       btn.title = "";
     }
@@ -109,12 +139,7 @@ function fillSessionSelect(state) {
   }
   const curRow = sessions.find((s) => s.session_id === current);
   const curTitle = (curRow && (curRow.title || curRow.label)) || current.slice(0, 8);
-  if (btn) {
-    btn.textContent = follow
-      ? `● ${clipTitle(curTitle, 48)}`
-      : clipTitle((curRow && (curRow.title || curRow.label)) || "Session", 52);
-    btn.title = curTitle;
-  }
+  paintSessionBtn(btn, follow, curTitle);
   const optsHasCurrent = !current || [...sel.options].some((o) => o.value === current);
   if (key === _lastSessionOptsKey && sel.options.length > 1 && optsHasCurrent) {
     if (sel.value !== current) sel.value = current || "";
@@ -167,19 +192,32 @@ function fillSessionSelect(state) {
   sel.value = current || "";
 
   if (menu) {
+    const shell = appShell();
     const bits = [];
-    bits.push(`<button type="button" class="session-dd-item${follow ? " is-on" : ""}" data-sid="">${follow ? "●" : "○"} Follow active (most recent)</button>`);
+    if (shell) {
+      bits.push(`<button type="button" class="session-dd-item is-follow${follow ? " is-on" : ""}" data-sid=""><span class="session-dd-title">Follow active</span></button>`);
+    } else {
+      bits.push(`<button type="button" class="session-dd-item${follow ? " is-on" : ""}" data-sid="">${follow ? "●" : "○"} Follow active (most recent)</button>`);
+    }
     const grp = (name, list) => {
       if (!list.length) return;
       bits.push(`<div class="session-dd-group">${name}</div>`);
       for (const s of list) {
         const title = (s.title || s.label || "").trim() || s.session_id.slice(0, 8);
         const model = String(s.model || s.model_family || "").trim();
-        const age = s.age_label ? ` · ${s.age_label}` : "";
+        const ageLabel = s.age_label ? String(s.age_label) : "";
         const on = s.session_id === current ? " is-on" : "";
         const tip = model ? `${title} · ${model}` : title;
-        const modelHtml = model ? `<span class="session-dd-model">${escHtml(model)}</span>` : "";
-        bits.push(`<button type="button" class="session-dd-item${on}" data-sid="${escHtml(s.session_id)}" title="${escHtml(tip)}">${escHtml(title)}${modelHtml}${escHtml(age)}</button>`);
+        const sidAttr = escHtml(s.session_id);
+        if (!shell) {
+          const modelHtml = model ? `<span class="session-dd-model">${escHtml(model)}</span>` : "";
+          const age = ageLabel ? ` · ${escHtml(ageLabel)}` : "";
+          bits.push(`<button type="button" class="session-dd-item${on}" data-sid="${sidAttr}" title="${escHtml(tip)}">${escHtml(title)}${modelHtml}${age}</button>`);
+        } else {
+          const modelHtml = `<span class="session-dd-model">${escHtml(model)}</span>`;
+          const ageHtml = `<span class="session-dd-age">${escHtml(ageLabel)}</span>`;
+          bits.push(`<button type="button" class="session-dd-item${on}" data-sid="${sidAttr}" title="${escHtml(tip)}"><span class="session-dd-title">${escHtml(title)}</span>${modelHtml}${ageHtml}</button>`);
+        }
       }
     };
     grp("Active", active);
@@ -189,6 +227,7 @@ function fillSessionSelect(state) {
       el.addEventListener("click", () => {
         const sid = el.getAttribute("data-sid") || "";
         menu.hidden = true;
+        if (btn) btn.classList.remove("is-open");
         sel.value = sid;
         sel.dispatchEvent(new Event("change", { bubbles: true }));
       });
@@ -217,12 +256,10 @@ function _optimisticPicker(sessionId) {
     sel.value = sid;
   }
   const btn = $("sessionDdBtn");
-  if (!btn) return;
   const sessions = (_lastStateRef && _lastStateRef.sessions) || [];
   const row = sessions.find((s) => String(s.session_id) === sid);
   const title = (row && (row.title || row.label)) || (sid ? sid.slice(0, 8) : "Follow active");
-  btn.textContent = sid ? clipTitle(title, 52) : `● ${clipTitle(title, 48)}`;
-  btn.title = title;
+  paintSessionBtn(btn, !sid, title);
 }
 
 async function switchSession(sessionId) {

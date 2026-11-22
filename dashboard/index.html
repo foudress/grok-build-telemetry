@@ -16,7 +16,10 @@
       window.__TT_SOURCES__ = { sources: sources, errors: payload.errors || [] };
       var byId = {};
       sources.forEach(function (s) { if (s && s.id) byId[s.id] = s; });
-      var q = new URLSearchParams(location.search).get("source");
+      var params = new URLSearchParams(location.search);
+      var shell = params.get("shell") === "app";
+      if (shell) document.documentElement.dataset.shell = "app";
+      var q = params.get("source");
       var stored = "";
       try { stored = localStorage.getItem("tt-source") || ""; } catch (e) {}
       var source = byId[q] ? q : (byId[stored] ? stored : "grok");
@@ -29,7 +32,8 @@
         var el = document.querySelector(".src-switch");
         if (!el) return;
         el.innerHTML = sources.map(function (s) {
-          return '<a href="/?source=' + encodeURIComponent(s.id) + '" data-source="' + s.id + '">' +
+          var href = "/?source=" + encodeURIComponent(s.id) + (shell ? "&shell=app" : "");
+          return '<a href="' + href + '" data-source="' + s.id + '">' +
             String(s.label || s.id).replace(/</g, "&lt;") + "</a>";
         }).join("");
       }
@@ -60,6 +64,7 @@
   <link rel="stylesheet" href="css/components.css" />
   <link rel="stylesheet" href="css/charts.css" />
   <link rel="stylesheet" href="css/graph.css" />
+  <link rel="stylesheet" href="css/app-shell.css" />
 </head>
 <body>
   <header>

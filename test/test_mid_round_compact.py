@@ -518,6 +518,29 @@ def test_stale_prior_compact_collapse_is_not_miss():
     assert _detect_context_reread(hb, r) is None
 
 
+def test_mid_round_split_ignores_previous_round_miss():
+    compact = {
+        "kind": "compaction",
+        "tokens_before": 205966,
+        "tokens_after": 18262,
+    }
+    step = {"index": 22, "tokens_cached": 204583, "compacts_after": [compact]}
+    nxt = {"index": 2, "model_steps": [step]}
+    prev = {
+        "index": 1,
+        "cache_miss": True,
+        "session_restart": True,
+        "model_steps": [{"index": 1, "tokens_cached": 1}],
+    }
+    hb = _HB()
+    hb.rounds = [prev, nxt]
+    _fill_compact_cost(hb, nxt)
+    assert compact["pre_read_cached_tokens"] == 204583
+    assert compact["pre_read_uncached_tokens"] == 1383
+    assert compact["pre_read_cache_miss"] is False
+    assert compact["out_tokens"] == 18262
+
+
 def test_mid_round_xor_cached_plus_out():
     compact = {
         "kind": "compaction",

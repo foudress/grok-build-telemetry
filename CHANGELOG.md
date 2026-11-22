@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-11-22
+
+Windows desktop shell, and a compact pre-read that follows the call cache. Official `$` stays the sum of parent `turn_completed` ticks. `CACHE_VER` stays 30.
+
+### Added
+
+- Windows app (`desktop/`, Tauri + WebView2) that loads the live local dashboard. Default frame is 9:16 on the portrait monitor, with a dark title bar. `?shell=app` is the only layout that changes; the browser dashboard stays as it was.
+
+### Fixed
+
+- Compact pre-read no longer books `tokens_before` entirely as In when the previous round has a cache-miss chip. The card uses that call's cache stamp: cached prefix plus the uncached tail. A window with no stamp stays Cached.
+- Compact and auto-compact forks do not publish `costUsdTicks`. They are not added to official session cost.
+
 ## [1.3.0] — 2026-11-21
 
 Antigravity sessions in the same dashboard, on their own data path. Grok Official API, Tree In, and System R1 stay as they were. Package **1.3.0**. `CACHE_VER` stays 30.

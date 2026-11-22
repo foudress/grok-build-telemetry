@@ -69,6 +69,10 @@ ENV/
 !test/fixtures/graph_pkg/venv/
 !test/fixtures/graph_pkg/venv/**
 
+# Windows desktop shell (Tauri). The exe on the desktop is a build product.
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+
 # Editors / OS
 .idea/
 .vscode/

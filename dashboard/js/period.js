@@ -140,6 +140,7 @@ function applyScopeChrome() {
   document.body.classList.toggle("scope-period", isPeriodScope());
   const sel = $("scopeSelect");
   if (sel && sel.value !== _scope) sel.value = _scope;
+  paintScopeFace();
   const tb = $("periodToolbar");
   if (tb) tb.hidden = !isPeriodScope();
   const nav = $("periodNav");
@@ -960,7 +961,67 @@ export function redrawPeriod() {
   if (_lastAgg) paintPeriod(_lastAgg);
 }
 
+function paintScopeFace() {
+  const sel = $("scopeSelect");
+  const btn = $("scopeDdBtn");
+  const menu = $("scopeDdMenu");
+  if (!sel || !btn) return;
+  const cur = sel.value;
+  const opt = [...sel.options].find((o) => o.value === cur);
+  btn.textContent = opt ? opt.textContent : "Session";
+  if (!menu) return;
+  menu.querySelectorAll("[data-value]").forEach((el) => {
+    el.classList.toggle("is-on", el.getAttribute("data-value") === cur);
+  });
+}
+
+function ensureScopeFace() {
+  if (document.documentElement.dataset.shell !== "app") return;
+  const sel = $("scopeSelect");
+  if (!sel || $("scopeDd")) return;
+  const wrap = document.createElement("div");
+  wrap.id = "scopeDd";
+  wrap.className = "scope-dd";
+  const options = [...sel.options].map((o) => ({ value: o.value, label: o.textContent || o.value }));
+  wrap.innerHTML = `<button type="button" id="scopeDdBtn" class="scope-dd-btn" aria-haspopup="listbox" aria-label="View"></button>
+    <div id="scopeDdMenu" class="scope-dd-menu" hidden role="listbox"></div>`;
+  sel.classList.add("session-select-native");
+  sel.tabIndex = -1;
+  sel.setAttribute("aria-hidden", "true");
+  sel.insertAdjacentElement("afterend", wrap);
+  const btn = $("scopeDdBtn");
+  const menu = $("scopeDdMenu");
+  menu.innerHTML = options.map((o) =>
+    `<button type="button" class="scope-dd-item" data-value="${o.value}" role="option">${o.label}</button>`
+  ).join("");
+  btn.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    const sessionMenu = $("sessionDdMenu");
+    const sessionBtn = $("sessionDdBtn");
+    if (sessionMenu) sessionMenu.hidden = true;
+    if (sessionBtn) sessionBtn.classList.remove("is-open");
+    menu.hidden = !menu.hidden;
+    btn.classList.toggle("is-open", !menu.hidden);
+  });
+  menu.addEventListener("click", (ev) => {
+    const item = ev.target.closest("[data-value]");
+    if (!item) return;
+    menu.hidden = true;
+    btn.classList.remove("is-open");
+    sel.value = item.getAttribute("data-value") || "session";
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  document.addEventListener("click", (ev) => {
+    if (!wrap.contains(ev.target)) {
+      menu.hidden = true;
+      btn.classList.remove("is-open");
+    }
+  });
+  paintScopeFace();
+}
+
 export function bindPeriodControls() {
+  ensureScopeFace();
   $("scopeSelect")?.addEventListener("change", (ev) => {
     setScope(ev.target.value || "session");
   });

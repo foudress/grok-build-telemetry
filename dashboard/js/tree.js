@@ -651,8 +651,10 @@ function renderRoundTree(rounds, opts) {
       ? c.tokens_removed
       : (typeof before === "number" && typeof after === "number" ? Math.max(0, before - after) : null);
 
-    // In XOR Cached (miss vs hit) + Out (compressed history). Never both.
+    // Cached prefix and uncached tail are both real when both are stamped.
     const miss = !!c.pre_read_cache_miss;
+    const hasUnc = c.pre_read_uncached_tokens != null && c.pre_read_uncached_tokens !== "";
+    const hasCache = c.pre_read_cached_tokens != null && c.pre_read_cached_tokens !== "";
     const preTok = Number(c.pre_read_tokens ?? before) || 0;
     const preCache = Number(c.pre_read_cached_tokens) || 0;
     const preUnc = Number(c.pre_read_uncached_tokens) || 0;
@@ -661,12 +663,21 @@ function renderRoundTree(rounds, opts) {
     const outTok = Number(c.out_tokens) || 0;
     const outUsd = Number(c.out_usd) || 0;
     let inTok = 0, inUsd = 0, cacheTok = 0, cacheUsd = 0;
-    if (miss || (preUnc > 0 && !(preCache > 0))) {
-      inTok = preUnc || preTok;
-      inUsd = preUncUsd || Number(c.pre_read_usd) || 0;
+    if (hasUnc || hasCache) {
+      if (preUnc > 0) {
+        inTok = preUnc;
+        inUsd = preUncUsd;
+      }
+      if (preCache > 0) {
+        cacheTok = preCache;
+        cacheUsd = preCacheUsd;
+      }
+    } else if (miss) {
+      inTok = preTok;
+      inUsd = Number(c.pre_read_usd) || 0;
     } else {
-      cacheTok = preCache || preTok;
-      cacheUsd = preCacheUsd || Number(c.pre_read_usd) || 0;
+      cacheTok = preTok;
+      cacheUsd = Number(c.pre_read_usd) || 0;
     }
     const totalUsd = c.cost_usd != null
       ? c.cost_usd
