@@ -434,6 +434,9 @@ def test_price_child_usage_uses_avg_prompt_not_lifetime_sum():
     assert priced["cost_in_usd"] != high_in
     assert priced["official_usd"] is None
     assert priced["estimate_usd"] == float((low.get("cost_usd") or {}).get("total") or 0)
+    zero_ticks = dict(usage)
+    zero_ticks["costUsdTicks"] = 0
+    assert price_child_usage(zero_ticks)["official_usd"] == 0.0
 
 
 def test_sum_rounds_estimate_uses_api_total_not_ticks():

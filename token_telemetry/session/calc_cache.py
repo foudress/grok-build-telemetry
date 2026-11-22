@@ -18,7 +18,7 @@ import threading
 from pathlib import Path
 from typing import Any, Optional
 
-CACHE_VER = 30
+CACHE_VER = 31
 CACHE_DIR = Path.home() / ".grok" / "token-telemetry" / "calc-cache"
 STAMP_NAME = "_stamp.json"
 
@@ -39,11 +39,13 @@ _CODE_FILES = (
     "hierarchy/step_tree.py",
     "hierarchy/thoughts_enc.py",
     "hierarchy/breakdown.py",
+    "hierarchy/compact_out.py",
     "hierarchy/attach_price.py",
     "hierarchy/cache_miss.py",
     "hierarchy/user_continuity.py",
     "hierarchy/reread.py",
     "hierarchy/recap_compact.py",
+    "pricing/rates.py",
     "pricing/reconstruct/__init__.py",
     "pricing/reconstruct/orchestrate.py",
     "pricing/reconstruct/in_cache.py",

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-11-22
+
+A measured zero stays a zero. The session Official dollar is still the tick sum. `CACHE_VER` is 31. Splitting the large accounting and paint files stays for a later pass.
+
+### Fixed
+
+- A fully cached turn (`paid_unc` 0) clamps Tree In the same way a positive uncached bill does. Compact Out stays in User In. A round with no usage is not clamped. Call `tokens_in` is not rewritten.
+- An open call with no official Out and no TokZ bills Out 0. A completed `outputTokens` of 0 stays 0. A weight that rounds away to 0 still floors at 1.
+- Period Official keeps a summed 0. It no longer becomes the In + Cached + Out list price. A child with `costUsdTicks` 0 is official $0. A missing tick field stays unset.
+- Official $/M for grok-4.20, grok-4.3, and grok-4.7 uses those models' cards. grok-4.5 and grok-4.6 stay on their own cards.
+- Tree User Cached shows the server stamp. It does not subtract the miss-continuity peel.
+- A call line with `tokens_in` 0 stays 0. The harness sum fills Call In only when the field is absent.
+- A Codex cache-write rate of 0.0 bills $0. A non-zero write rate is unchanged.
+- A failed period-attribute extract is not saved as an empty event list.
+
 ## [1.4.0] — 2026-11-22
 
 Windows desktop shell, and a compact pre-read that follows the call cache. Official `$` stays the sum of parent `turn_completed` ticks. `CACHE_VER` stays 30.

@@ -27,6 +27,15 @@ Agent line parent    = child *round* I/O, never System, never lifetime
 TokZ                 = meta (eol chip), never billed In/Out (TokF)
 ```
 
+Zero is present (v1.5). Do not replace a real 0 with another ledger.
+
+- Measured `paid_unc` 0 clamps Tree In. Compact Out is not eaten. No usage and no paid key: do not clamp. The clamp does not write `model_steps[].tokens_in`.
+- Live Out with no TokZ and no official Out is 0. A weight that rounds away to 0 still floors at 1.
+- Period `official_usd` is the tick sum, including 0. Estimate stays on `estimate_usd`.
+- User Cached in the tree is the stamp. Continuity peels cache miss off tokens, not off `tokens_cached`.
+- A present Call In of 0 stays 0. The harness sum is the fallback only when `tokens_in` is absent. Call In is still the harness figure when the step was stamped from harness; the clamp does not rewrite the step.
+- Codex cache-write rate 0.0 bills 0, not the input rate.
+
 ## Canonical round fields
 
 ```

@@ -28,9 +28,14 @@ function fmtUsdPerM(n) {
 
 /**
  * Published xAI $/M cards (Official snap check).
+ * Grok 4.20 / 4.3: $1.25/$0.20/$2.50. High tier doubles.
  * Grok 4.5: $2/$0.30/$6 or $2/$0.60/$6 (repricing ambiguous) — not $0.50.
- * Grok 4.6: $2/$0.50/$6 only. High tier doubles.
+ * Grok 4.6 and 4.7: $2/$0.50/$6 only. High tier doubles.
  */
+const RATE_CARD_420 = [
+  { in: 1.25, cached: 0.2, out: 2.5 },
+  { in: 2.5, cached: 0.4, out: 5 },
+];
 const RATE_CARD_45 = [
   { in: 2, cached: 0.3, out: 6 },
   { in: 2, cached: 0.6, out: 6 },
@@ -41,6 +46,10 @@ const RATE_CARD_46 = [
   { in: 2, cached: 0.5, out: 6 },
   { in: 4, cached: 1.0, out: 12 },
 ];
+const RATE_CARD_47 = [
+  { in: 2, cached: 0.5, out: 6 },
+  { in: 4, cached: 1.0, out: 12 },
+];
 const RATE_CARD_ALL = [...RATE_CARD_45, ...RATE_CARD_46];
 /** Component $/M and absolute $ session match — do not force-snap beyond this. */
 const RATE_SNAP_EPS = 0.02;
@@ -48,14 +57,19 @@ const RATE_SNAP_EPS = 0.02;
 function normalizeModelFamily(raw) {
   const s = String(raw || "").toLowerCase().replace(/_/g, "-");
   if (!s) return null;
+  if (s.includes("4.20") || s.includes("4-20")) return "grok-4.20";
+  if (s.includes("4.7") || s.includes("4-7")) return "grok-4.7";
   if (s.includes("4.6") || s.includes("4-6")) return "grok-4.6";
   if (s.includes("4.5") || s.includes("4-5")) return "grok-4.5";
+  if (s.includes("4.3") || s.includes("4-3")) return "grok-4.3";
   return null;
 }
 
 /** Cards to try for a model (4.5 tries $0.30 and $0.60 cache). */
 function rateCardsForModel(model) {
   const fam = normalizeModelFamily(model);
+  if (fam === "grok-4.20" || fam === "grok-4.3") return RATE_CARD_420;
+  if (fam === "grok-4.7") return RATE_CARD_47;
   if (fam === "grok-4.6") return RATE_CARD_46;
   if (fam === "grok-4.5") return RATE_CARD_45;
   return RATE_CARD_ALL;

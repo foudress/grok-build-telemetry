@@ -353,3 +353,77 @@ def test_agent_line_is_round_io_not_system():
     assert agent["tokens_in"] != sys_tok
     # Agent In + Sys In is not 2× System (System must not be billed twice).
     assert agent["tokens_in"] + sys_card["tokens_in"] != 2 * sys_tok
+
+
+def test_measured_zero_uncached_clamps_tree_in_and_leaves_call_in():
+    """A fully cached bill clamps Round In. Call In on the step stays put."""
+    r = _merge_round(
+        user_prompt={"kind": "user_prompt", "tokens_in": 50, "cost_in_usd": 0.001},
+        model_steps=[{"tokens_in": 3940, "cost_in_usd": 0.01}],
+        usage_raw={
+            "inputTokens": 5000,
+            "cachedReadTokens": 5000,
+            "outputTokens": 10,
+        },
+        breakdown={"cache_miss_in_tokens": 0},
+    )
+    bd = r["breakdown"]
+    assert bd["uncached_in_tokens"] == 0
+    assert bd["tree_in_tokens"] == 0
+    assert bd["harness_in_tokens"] == 0
+    assert bd["user_in_tokens"] == 0
+    assert r["model_steps"][0]["tokens_in"] == 3940
+
+
+def test_absent_usage_does_not_clamp_tree_in():
+    r = _merge_round(
+        user_prompt={"kind": "user_prompt", "tokens_in": 50, "cost_in_usd": 0.001},
+        model_steps=[{"tokens_in": 3940, "cost_in_usd": 0.01}],
+        breakdown={"cache_miss_in_tokens": 0, "harness_in_tokens": 1},
+    )
+    bd = r["breakdown"]
+    assert bd["tree_in_tokens"] == 50 + 3940
+
+
+def test_measured_zero_keeps_compact_out_floor():
+    r = _merge_round(
+        user_prompt={
+            "kind": "user_prompt",
+            "tokens_in": 40,
+            "cost_in_usd": 0.001,
+            "compact_out": {"tokens_in": 6300, "cost_in_usd": 0.02},
+        },
+        model_steps=[{"tokens_in": 400, "cost_in_usd": 0.01}],
+        usage_raw={"inputTokens": 8000, "cachedReadTokens": 8000, "outputTokens": 1},
+        breakdown={"cache_miss_in_tokens": 0},
+    )
+    bd = r["breakdown"]
+    assert bd["uncached_in_tokens"] == 0
+    assert bd["user_in_tokens"] == 6300
+    assert bd["harness_in_tokens"] == 0
+    assert bd["tree_in_tokens"] == 6300
+
+
+def test_open_call_with_no_tokz_bills_out_zero():
+    from token_telemetry.pricing.reconstruct.output_enc import _reconstruct_output
+
+    out = _reconstruct_output(1, [0], [0], [0], [0], None, None)
+    assert out["total_out_sum"] == 0
+    assert out["outputs"] == [0]
+    assert out["out_reasoning"] == [0]
+
+
+def test_completed_zero_output_stays_zero():
+    from token_telemetry.pricing.reconstruct.output_enc import _reconstruct_output
+
+    out = _reconstruct_output(1, [0], [0], [0], [0], 0, 0)
+    assert out["total_out_sum"] == 0
+    assert out["outputs"] == [0]
+    assert out["out_reasoning"] == [0]
+
+
+def test_weight_that_rounds_away_keeps_out_floor_of_one():
+    from token_telemetry.pricing.reconstruct.output_enc import _reconstruct_output
+
+    out = _reconstruct_output(1, [0.4], [0], [0], [0], None, None)
+    assert out["total_out_sum"] == 1

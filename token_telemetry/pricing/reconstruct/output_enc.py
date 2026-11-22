@@ -71,11 +71,13 @@ def _reconstruct_output(
     if off_out is not None:
         total_out_sum = max(0, int(off_out))
     else:
-        total_out_sum = max(
-            fixed_sum + max(0, int(round(sum(enc_w)))),
-            fixed_sum,
-            1,
-        )
+        enc_sum = max(0, int(round(sum(enc_w))))
+        total_out_sum = max(fixed_sum + enc_sum, fixed_sum)
+        raw_mass = sum(th_w_list) + sum(em_w_list) + sum(msg_w_list) + sum(enc_w)
+        # A live call with no TokZ and no official Out is 0. A weight that
+        # rounds away still keeps the old floor of 1.
+        if total_out_sum == 0 and raw_mass > 0:
+            total_out_sum = 1
 
     if off_reason is not None:
         target_r_official = min(max(0, int(off_reason)), total_out_sum)

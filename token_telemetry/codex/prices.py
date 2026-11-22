@@ -85,7 +85,7 @@ def price_usage(
     write = max(0, int(cache_write))
     fresh = max(0, int(uncached) - write)
     usd_in = fresh / 1_000_000 * inn
-    usd_write = write / 1_000_000 * (write_r or inn)
+    usd_write = write / 1_000_000 * float(write_r)
     usd_cached = max(0, int(cached)) / 1_000_000 * cache_r
     usd_out = max(0, int(output)) / 1_000_000 * out_r
     total = usd_in + usd_write + usd_cached + usd_out

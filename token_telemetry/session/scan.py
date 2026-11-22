@@ -172,7 +172,10 @@ def _round_acc(acc: dict[str, float]) -> dict[str, Any]:
     cc = float(acc.get("cost_cached_usd") or 0)
     co = float(acc.get("cost_out_usd") or 0)
     cr = float(acc.get("cost_reason_usd") or 0)
-    off = float(acc.get("official_usd") or 0) or (ci + cc + co)
+    if "official_usd" in acc and acc["official_usd"] is not None:
+        off = float(acc["official_usd"])
+    else:
+        off = ci + cc + co
     est = float(acc.get("estimate_usd") or 0) or (ci + cc + co)
     return {
         "tokens_in": tin,

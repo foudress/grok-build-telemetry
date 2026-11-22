@@ -121,22 +121,30 @@ def _merge_bootstrap_into_breakdown(hb: Any, r: dict[str, Any]) -> None:
     # tree In should be paid − System. Miss = leftover billed uncached after
     # User In (prompt + prev answer + Compact Out) and harness — not ToolDef
     # (already on System). Compact Out is in user_in; do not add it again.
-    try:
-        paid_unc = int(bd.get("uncached_in_tokens") or bd.get("paid_uncached_tokens") or 0)
-    except (TypeError, ValueError):
-        paid_unc = 0
-    if paid_unc <= 0:
+    paid_unc: Optional[int] = None
+    for key in ("uncached_in_tokens", "paid_uncached_tokens"):
+        raw_paid = bd.get(key)
+        if raw_paid is None:
+            continue
+        try:
+            paid_unc = int(raw_paid)
+        except (TypeError, ValueError):
+            paid_unc = None
+        else:
+            break
+    # A measured 0 (fully cached turn) is a bill. Absent usage is not.
+    if paid_unc is None or paid_unc <= 0:
         off_in = _official_input_tokens(r)
         usage = r.get("usage_raw") if isinstance(r.get("usage_raw"), dict) else {}
         try:
             off_cache = int(usage.get("cachedReadTokens") or usage.get("cached_read_tokens") or 0)
         except (TypeError, ValueError):
             off_cache = 0
-        if isinstance(off_in, int) and off_in > 0:
+        if isinstance(off_in, int):
             paid_unc = max(0, int(off_in) - min(int(off_cache), int(off_in)))
             bd["uncached_in_tokens"] = int(paid_unc)
             bd["paid_uncached_tokens"] = int(paid_unc)
-    if paid_unc > 0:
+    if paid_unc is not None:
         cap = max(0, int(paid_unc) - (int(sys_tok) if cold else 0))
         caused = int(user_tok) + int(harness_tok)
         if caused < cap:

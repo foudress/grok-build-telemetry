@@ -847,7 +847,6 @@ function renderRoundTree(rounds, opts) {
     const prevInTokRaw = Math.round(Number(prevAns.tokens_in) || 0) || 0;
     const prevInTok = prevAbsorbed ? 0 : prevInTokRaw;
     const prevOutInUsd = prevAbsorbed ? 0 : (Number(prevAns.cost_in_usd) || 0);
-    const prevFromPool = !prevAbsorbed && !!prevAns.from_user_pool;
     const prevRoundN = prevAns.round_index || Math.max(0, (r.index || 1) - 1);
     // Prompt residual (never includes answer mass or Compact Out)
     const coTokEarly = Math.round(Number((up.compact_out || {}).tokens_in) || 0);
@@ -875,19 +874,13 @@ function renderRoundTree(rounds, opts) {
     // Trust a stamped cache, including round 1. Codex puts call 1's prefix here.
     // Grok round 1 stamps 0; do not invent a cache when the field is absent.
     const serverCache = up.tokens_cached != null && up.tokens_cached !== "";
-    let upCache = serverCache
+    const upCache = serverCache
       ? (Number(up.tokens_cached) || 0)
       : (isR1User ? 0 : (Number(up.cached_est ?? priorCache) || 0));
-    let upCacheUsd = serverCache
+    const upCacheUsd = serverCache
       ? (Number(up.cost_cached_usd) || 0)
       : (isR1User ? 0 : (Number(up.cost_cached_usd) || 0));
-    // Answer continuity: peel from Cached display when not taken from user pool
-    if (prevInTok > 0 && upCache >= prevInTok && !prevFromPool) {
-      const fullC = Number(up.tokens_cached ?? up.cached_est ?? priorCache) || 1;
-      upCache = Math.max(0, upCache - prevInTok);
-      if (upCacheUsd > 0 && fullC > 0)
-        upCacheUsd = upCacheUsd * (upCache / fullC);
-    }
+    // User Cached is the server stamp. The continuity peel already left cache miss.
     const ud = up.user_detail || {};
     // Full text only in title; short ellipsis in-row so hierarchy width stays stable
     const promptFull = String(up.preview || r.user_preview || "");
@@ -1091,7 +1084,8 @@ function renderRoundTree(rounds, opts) {
       const harnessIn = (s.children || [])
         .filter(ch => ch && ch.kind === "phase_harness")
         .reduce((a, ch) => a + (Number(ch.tokens_in) || 0), 0);
-      if ((!growthIn || growthIn <= 0) && harnessIn > 0) {
+      const callInStamped = s.tokens_in != null && s.tokens_in !== "";
+      if (!callInStamped && (!growthIn || growthIn <= 0) && harnessIn > 0) {
         growthIn = harnessIn;
         growthInUsd = (s.children || [])
           .filter(ch => ch && ch.kind === "phase_harness")

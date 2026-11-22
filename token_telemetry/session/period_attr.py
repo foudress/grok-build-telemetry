@@ -486,7 +486,7 @@ def cached_attr_events(session_dir: Path) -> list[dict[str, Any]]:
     try:
         events = extract_session_events(session_dir)
     except Exception:
-        events = []
+        return []
     save_calc(session_dir, events=events)
     with _lock:
         _attr_cache[key] = {

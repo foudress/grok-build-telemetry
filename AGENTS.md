@@ -22,7 +22,7 @@ Else read `state.md` once, then `goal?`.
 - **Three In ledgers — do not unify** unless the user unfreezes in the same session: Official API · Tree In (`user+harness+miss`) · System R1 (hist+ToolDef jump).
 - Window identity: `System + R1 In = context_end`. Bill: `System + tree_in = paid_unc`.
 - Compact glue: match phrases only in **head[:800]**.
-- `CACHE_VER` in `session/calc_cache.py` (30). New accounting `.py` must be listed in `_CODE_FILES`.
+- `CACHE_VER` in `session/calc_cache.py` (31). New accounting `.py` must be listed in `_CODE_FILES`.
 - Feature gates: `token_telemetry/features.py` **and** `dashboard/js/features.js` stay in sync (History/Gantt/tok/s/Graph/Period I/O $/M off).
 - Verify: `pytest test`. Reconstruct order is frozen.
 - Never use WindowsApps `python`; prefer repo `.venv` / `py -3.12`.

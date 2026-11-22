@@ -191,7 +191,8 @@ function callHierarchyMetrics(s) {
   const harnessIn = (s.children || [])
     .filter((ch) => ch && ch.kind === "phase_harness")
     .reduce((a, ch) => a + (Number(ch.tokens_in) || 0), 0);
-  if ((!tokIn || tokIn <= 0) && harnessIn > 0) {
+  const callInStamped = s.tokens_in != null && s.tokens_in !== "";
+  if (!callInStamped && (!tokIn || tokIn <= 0) && harnessIn > 0) {
     tokIn = harnessIn;
     usdIn = (s.children || [])
       .filter((ch) => ch && ch.kind === "phase_harness")
@@ -269,13 +270,8 @@ export function buildCtxPoints(rounds) {
     const userHeadUsd = Number(up.display_in_usd)
       || (Number(up.prompt_cost_in_usd ?? up.cost_in_usd) || 0)
       || 0;
-    let upCache = isR1 ? 0 : (Number(up.tokens_cached ?? up.cached_est ?? priorCache) || 0);
-    let upCacheUsd = isR1 ? 0 : (Number(up.cost_cached_usd) || 0);
-    if (prevInTok > 0 && upCache >= prevInTok && !prevAns.from_user_pool) {
-      const fullC = Number(up.tokens_cached ?? up.cached_est ?? priorCache) || 1;
-      upCache = Math.max(0, upCache - prevInTok);
-      if (upCacheUsd > 0 && fullC > 0) upCacheUsd = upCacheUsd * (upCache / fullC);
-    }
+    const upCache = isR1 ? 0 : (Number(up.tokens_cached ?? up.cached_est ?? priorCache) || 0);
+    const upCacheUsd = isR1 ? 0 : (Number(up.cost_cached_usd) || 0);
     // Absolute context after User In (baseline = hierarchy round.context_start).
     let userV = null;
     if (hasRoundA) userV = roundCtxA + userHeadIn;

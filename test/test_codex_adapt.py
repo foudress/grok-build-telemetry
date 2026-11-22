@@ -233,6 +233,15 @@ def test_cache_miss_line_price_and_mid_turn_compact() -> None:
     assert step["context_plot_tokens"] == 5000
     assert paid["context_plot_tokens"] == 5500
     assert rnd["context_start"] + rnd["user_prompt"]["tokens_in"] == 5000
+    write_zero = price_usage(
+        "gpt-5.4", uncached=1_000_000, cached=0, output=0, cache_write=1_000_000,
+    )
+    assert write_zero["write"] == 0.0
+    assert write_zero["in"] == 0.0
+    write_kept = price_usage(
+        "gpt-6-luna", uncached=100_000, cached=0, output=0, cache_write=100_000,
+    )
+    assert abs(write_kept["write"] - 0.0125) < 1e-12
     luna = price_usage("gpt-6-luna", uncached=100_000, cached=100_000, output=100_000, prompt=200_000)
     assert abs(luna["in"] - 0.01) < 1e-12
     assert abs(luna["cached"] - 0.001) < 1e-12

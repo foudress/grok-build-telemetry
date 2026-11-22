@@ -57,8 +57,10 @@ def price_child_usage(usage: Optional[dict[str, Any]]) -> dict[str, Any]:
     if cache > inn:
         cache = inn
     unc = max(0, inn - cache)
-    ticks = _int(u.get("costUsdTicks") or u.get("cost_usd_ticks"))
-    official = ticks_to_usd(ticks) if ticks else None
+    raw_ticks = u.get("costUsdTicks")
+    if raw_ticks is None:
+        raw_ticks = u.get("cost_usd_ticks")
+    official = None if raw_ticks is None else ticks_to_usd(raw_ticks)
     # inputTokens / totalTokens are API SUMs — do not use them as peak.
     tier_ctx = child_tier_context_tokens(u)
     est = estimate_from_usage(u, peak_context_tokens=tier_ctx or None)

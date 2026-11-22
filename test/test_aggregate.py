@@ -12,7 +12,7 @@ from token_telemetry.session.aggregate import (
     week_monday,
     _priced_from_io_segs,
 )
-from token_telemetry.session.scan import _file_cache
+from token_telemetry.session.scan import _empty_acc, _file_cache, _round_acc
 from token_telemetry.session import aggregate as agg_mod
 
 
@@ -568,6 +568,17 @@ def test_priced_from_io_segs_maps_in_cached_out():
     assert abs(p["cost_out_usd"] - 0.03) < 1e-9
     assert abs(p["estimate_usd"] - 0.06) < 1e-9
     assert p["official_usd"] == 0.0
+
+
+def test_round_acc_keeps_a_present_official_zero():
+    acc = _empty_acc()
+    acc["tokens_in"] = 1_000_000
+    acc["cost_in_usd"] = 2.0
+    acc["estimate_usd"] = 2.0
+    acc["official_usd"] = 0.0
+    out = _round_acc(acc)
+    assert out["official_usd"] == 0.0
+    assert out["estimate_usd"] == 2.0
 
 
 def test_period_io_includes_recap_side_not_in_turns(tmp_path, monkeypatch):
