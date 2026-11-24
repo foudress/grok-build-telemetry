@@ -56,20 +56,9 @@ export const CHART_AXIS = {
   label: "#b6c2d1",
   labelDim: "#8b9cb3",
   empty: "#6b7c92",
-  placeholder: "#4a5568",
 };
 
 const DPR_CAP = 2;
-let _measureCtx = null;
-
-/** Reuse one offscreen 2d context for label measurement (avoid detached canvases each paint). */
-export function measureCtx() {
-  if (!_measureCtx) {
-    _measureCtx = document.createElement("canvas").getContext("2d");
-  }
-  return _measureCtx;
-}
-
 /**
  * Size a canvas backing store only when CSS px / DPR change.
  * Reassigning width/height every poll reallocates bitmaps and drives browser RSS up.
@@ -109,7 +98,7 @@ export function placeCostTip(ev, tipEl, html) {
   tipEl.style.maxHeight = "";
   tipEl.style.overflowY = "";
   const margin = 6;
-  const maxH = Math.max(96, window.innerHeight - margin * 2);
+  const maxH = Math.max(1, window.innerHeight - margin * 2);
   tipEl.style.maxHeight = maxH + "px";
   const measured = measureChartTip(tipEl, html);
   const th = Math.min(measured.th, maxH);
@@ -370,9 +359,10 @@ export function buildCtxPoints(rounds) {
 }
 
 /** Context Y: step 50k, nice floor/ceil */
-function niceCtxYRange(vals) {
-  const STEP = 50_000;
+function niceCtxYRange(vals, plotH) {
   const rawMax = Math.max(...vals, 0);
+  const intervals = Math.max(1, Math.floor(plotH / 34));
+  const STEP = 50_000 * Math.max(1, Math.ceil(rawMax / (50_000 * intervals)));
   const rawMin = Math.min(...vals, 0);
   let min = Math.floor(rawMin / STEP) * STEP;
   let max = Math.ceil(rawMax / STEP) * STEP;
@@ -396,21 +386,11 @@ export function drawLineChart(canvas, series, color, rounds) {
   }
 
   const left = 48, right = 10, top = 22;
+  const bottom = X_AXIS_HEIGHT;
   const baseH = storedCtxChartH();
-  const wGuess = canvas.clientWidth || 600;
-  const plotWGuess = Math.max(1, wGuess - left - right);
-  const avgPxGuess = pts.length > 1 ? plotWGuess / (pts.length - 1) : plotWGuess;
-  // Same X-label planner as Cost / tok/s — rotate + grow bottom pad when cramped.
-  const xPlan = planXLabels(
-    measureCtx(),
-    (pts || []).map((p) => p.label || ""),
-    avgPxGuess,
-    { temporal: false }
-  );
-  const bottom = Math.max(28, xPlan.padB || 28);
-  canvas.style.height = (baseH + Math.max(0, bottom - 28)) + "px";
+  canvas.style.height = baseH + "px";
 
-  const w = canvas.clientWidth || wGuess;
+  const w = canvas.clientWidth || 600;
   const h = canvas.clientHeight || baseH;
   const { ctx } = fitCanvas(canvas, w, h);
   ctx.clearRect(0, 0, w, h);
@@ -426,11 +406,11 @@ export function drawLineChart(canvas, series, color, rounds) {
   }
 
   const vals = pts.map(p => p.v).filter(v => v != null && !Number.isNaN(v));
-  const { min, max, step } = niceCtxYRange(vals);
+  const { min, max, step } = niceCtxYRange(vals, plotH);
   const yOf = (v) => top + plotH - ((v - min) / (max - min || 1)) * plotH;
   const xOf = (i) => left + (pts.length === 1 ? plotW / 2 : (i / (pts.length - 1)) * plotW);
 
-  // Grid + Y labels at 50k steps
+  // Keep at least 34 CSS pixels between Y labels.
   ctx.strokeStyle = CHART_AXIS.grid;
   ctx.lineWidth = 1;
   ctx.fillStyle = CHART_AXIS.label;
@@ -464,7 +444,7 @@ export function drawLineChart(canvas, series, color, rounds) {
     ctx.fillStyle = "#f0b429";
     ctx.font = "9px system-ui, Segoe UI, sans-serif";
     ctx.textAlign = "left";
-    ctx.fillText(tierCliff >= 272000 ? "272k" : "200k", left + 4, yCliff - 4);
+    ctx.fillText(fmtTokens(tierCliff), left + 5, yCliff - 4);
     ctx.restore();
   }
 
@@ -480,46 +460,34 @@ export function drawLineChart(canvas, series, color, rounds) {
   ctx.lineTo(xOf(pts.length - 1), top + plotH);
   ctx.lineTo(xOf(0), top + plotH);
   ctx.closePath();
-  ctx.fillStyle = color + "22";
+  const area = ctx.createLinearGradient(0, top, 0, top + plotH);
+  area.addColorStop(0, color + "42");
+  area.addColorStop(1, color + "04");
+  ctx.fillStyle = area;
   ctx.fill();
 
-  // X label density: always R{n} under User point; thin call nums via planXLabels.every + stride
-  const avgPx = pts.length > 1 ? plotW / (pts.length - 1) : plotW;
-  const callStride = avgPx >= 22 ? 1 : (avgPx >= 14 ? 2 : 5);
-  const every = Math.max(1, xPlan.every || 1, callStride);
-  let callInRound = 0;
-  pts.forEach((p, i) => {
-    const isUser = p.kind === "user";
-    const isRoundAnchor = p.kind === "round_end" || p.kind === "round_start";
-    if (isUser || isRoundAnchor) callInRound = 0;
-    else callInRound += 1;
-    // Round-end has no X label (R{n} is on the User point).
-    p._showX = !!(p.label) && !isRoundAnchor && (isUser
-      || (callInRound % every === 0) || i === pts.length - 1);
-  });
-
-  // Points + X labels — y sits in bottom pad (same as Cost / tok/s: h - padB + 6)
-  // Round End = same dot as calls (no larger stroked "anchor" ball). User keeps a ring.
-  const labelY = h - bottom + 6;
+  // Preserve round starts when choosing labels for dense call sequences.
+  const pointGap = plotW / Math.max(1, pts.length - 1);
+  const dotRadius = Math.max(1, Math.min(3.2, pointGap * 0.28));
   pts.forEach((p, i) => {
     const x = xOf(i), y = yOf(p.v);
     p._x = x; p._y = y;
     const isUser = p.kind === "user";
-    const isRoundAnchor = p.kind === "round_end" || p.kind === "round_start";
     ctx.fillStyle = isUser ? COST_COLORS.user : color;
     ctx.beginPath();
-    ctx.arc(x, y, isUser ? 4 : 3.2, 0, Math.PI * 2);
+    ctx.arc(x, y, isUser ? dotRadius + 0.8 : dotRadius, 0, Math.PI * 2);
     ctx.fill();
     if (isUser) {
       ctx.strokeStyle = "#e6edf3";
       ctx.lineWidth = 1;
       ctx.stroke();
     }
-    if (p.label && p._showX) {
-      // User / R{n} must tilt too — excluding them caused collisions while call nums tilted alone.
-      drawXLabel(ctx, p.label, x, labelY, !!xPlan.rotate);
-    }
   });
+  drawXAxis(ctx, pts.map((p) => ({
+    x: p._x,
+    label: p.label,
+    priority: p.kind === "user",
+  })), left, w - 24, h - bottom + 5);
 
   // Hit targets for tooltips
   canvas._ctxPts = pts;
@@ -643,9 +611,8 @@ export function drawLineChart(canvas, series, color, rounds) {
 
 export const COST_Y_LEFT = 56;
 export const PLOT_PAD_L = 6;
-export const COST_CHART_H = 240;
+export const COST_CHART_H = 260;
 export const CTX_CHART_H = 260;
-const TREE_FLOOR_PX = 120;
 const COST_MIN_SLOT = 36;
 export const COST_MAX_SLOT = 420;
 export const MIN_COST_SLOTS = 8;
@@ -655,55 +622,30 @@ export const GANTT_MAX_H = 920;
 export const GANTT_MIN_H = 160;
 export const X_AXIS_BAND = 40;
 
-/** Max chart height so cards + charts + Sessions/tree still fit in one viewport. */
-function viewportChartCap(resizingPanelId) {
-  const main = document.querySelector("main");
-  if (!main) return GANTT_MAX_H;
-  const mainH = main.clientHeight || (window.innerHeight - 64);
-  let used = 0;
-  let visible = 0;
-  for (const el of main.children) {
-    if (!el || el.id === resizingPanelId) continue;
-    if (el.classList && el.classList.contains("tree-panel")) continue;
-    const st = window.getComputedStyle(el);
-    if (st.display === "none" || el.hidden) continue;
-    used += el.offsetHeight || 0;
-    visible += 1;
-  }
-  const gap = parseFloat(window.getComputedStyle(main).rowGap || main.style.gap) || 12;
-  // +1 gap for the resized panel itself among visible rows
-  used += gap * Math.max(0, visible);
-  const headSlop = 72; // panel head + toolbar/legend approx inside resized panel
-  return Math.max(GANTT_MIN_H, Math.floor(mainH - used - TREE_FLOOR_PX - headSlop));
-}
-
-function clampChartH(h, fallback, resizingPanelId) {
-  const n = Number(h);
-  const base = Number.isFinite(n) ? n : fallback;
-  const cap = Math.min(GANTT_MAX_H, viewportChartCap(resizingPanelId));
-  return Math.min(cap, Math.max(GANTT_MIN_H, base));
+function clampChartH(h, fallback) {
+  const base = Number.isFinite(h) ? h : fallback;
+  return Math.min(GANTT_MAX_H, Math.max(GANTT_MIN_H, base));
 }
 
 export function storedCostChartH() {
   try {
     const n = parseInt(localStorage.getItem("tt-cost-chart-h") || "", 10);
-    if (Number.isFinite(n)) return clampChartH(n, COST_CHART_H, "costPanel");
+    if (Number.isFinite(n)) return clampChartH(n, COST_CHART_H);
   } catch { /* ignore */ }
-  return clampChartH(COST_CHART_H, COST_CHART_H, "costPanel");
+  return clampChartH(COST_CHART_H, COST_CHART_H);
 }
 
 export function storedCtxChartH() {
   try {
     const n = parseInt(localStorage.getItem("tt-ctx-chart-h") || "", 10);
-    if (Number.isFinite(n)) return clampChartH(n, CTX_CHART_H, "ctxPanel");
+    if (Number.isFinite(n)) return clampChartH(n, CTX_CHART_H);
   } catch { /* ignore */ }
-  return clampChartH(CTX_CHART_H, CTX_CHART_H, "ctxPanel");
+  return clampChartH(CTX_CHART_H, CTX_CHART_H);
 }
 
 export function ensureCostChartH(store) {
   const st = store || zoomStore() || (window.__costChart = window.__costChart || {});
-  if (!st._chartH) st._chartH = storedCostChartH();
-  else st._chartH = clampChartH(st._chartH, COST_CHART_H, "costPanel");
+  st._chartH = clampChartH(st._chartH ?? storedCostChartH(), COST_CHART_H);
   return st._chartH;
 }
 
@@ -725,66 +667,74 @@ export function chartViewKey() {
   return ["s", st.stack || "io", st.byLabel ? 1 : 0, st.drillTurn == null ? "-" : String(st.drillTurn)].join(":");
 }
 
-export function planXLabels(ctx, labels, groupW, { temporal } = {}) {
-  ctx.font = "10px system-ui, Segoe UI, sans-serif";
-  let maxW = 0;
-  for (const lab of labels || []) {
-    const w = ctx.measureText(String(lab || "")).width;
-    if (w > maxW) maxW = w;
+export const X_AXIS_HEIGHT = 36;
+const AXIS_FONT = "11px system-ui, Segoe UI, sans-serif";
+const X_LABEL_GAP = 10;
+
+function fitLabel(label, maxWidth, measure) {
+  if (measure(label) <= maxWidth) return label;
+  if (measure("…") > maxWidth) return "";
+  const chars = Array.from(label);
+  let lo = 0;
+  let hi = chars.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (measure(chars.slice(0, mid).join("") + "…") <= maxWidth) lo = mid;
+    else hi = mid - 1;
   }
-  // Center-aligned labels collide when half-widths overlap.
-  // Require a little slack so we do not tilt on near-miss spacing.
-  const collide = maxW > Math.max(4, groupW + 2);
-  if (temporal) {
-    let every = 1;
-    if (groupW < 8) every = 8;
-    else if (groupW < 14) every = 4;
-    else if (groupW < 22) every = 2;
-    if (collide && groupW > 0)
-      every = Math.max(every, Math.ceil((maxW + 8) / groupW));
-    return { rotate: false, every, padB: 28 };
-  }
-  if (collide) {
-    const padB = Math.max(44, Math.ceil(16 + Math.sin(0.65) * maxW));
-    return { rotate: true, every: 1, padB };
-  }
-  return { rotate: false, every: 1, padB: 28 };
+  return chars.slice(0, lo).join("").trimEnd() + "…";
 }
 
-export function drawXLabel(ctx, text, x, y, rotate) {
-  const s = String(text || "");
-  if (!s) return;
+/** Place labels from left to right using their measured bounds. Marks are in X order. */
+export function layoutXLabels(marks, left, right, measure) {
+  const maxWidth = Math.min(120, right - left);
+  const candidates = [];
+  const widths = new Map();
+  for (const mark of marks) {
+    const raw = String(mark.label ?? "");
+    if (!raw) continue;
+    if (!widths.has(raw)) {
+      const label = fitLabel(raw, maxWidth, measure);
+      widths.set(raw, { label, width: measure(label) });
+    }
+    const { label, width } = widths.get(raw);
+    if (!label) continue;
+    const start = Math.min(right - width, Math.max(left, mark.x - width / 2));
+    candidates.push({ ...mark, label, start, end: start + width });
+  }
+
+  // Reserve room for anchors (round starts or dates) before filling the gaps.
+  const anchors = [];
+  let boundary = -Infinity;
+  for (const item of candidates) {
+    if (!item.priority || item.start < boundary) continue;
+    anchors.push(item);
+    boundary = item.end + X_LABEL_GAP;
+  }
+
+  const placed = [];
+  let anchorIndex = 0;
+  boundary = -Infinity;
+  for (const item of candidates) {
+    const anchor = anchors[anchorIndex];
+    if (item === anchor) anchorIndex++;
+    else if (item.priority || item.start < boundary || (anchor && item.end + X_LABEL_GAP > anchor.start)) continue;
+    placed.push(item);
+    boundary = item.end + X_LABEL_GAP;
+  }
+  return placed;
+}
+
+export function drawXAxis(ctx, marks, left, right, y) {
   ctx.save();
-  ctx.fillStyle = CHART_AXIS.label;
-  ctx.font = "10px system-ui, Segoe UI, sans-serif";
-  if (rotate) {
-    ctx.translate(x, y);
-    ctx.rotate(-0.65);
-    ctx.textAlign = "right";
-    ctx.textBaseline = "middle";
-    ctx.fillText(s, 0, 0);
-  } else {
-    ctx.textAlign = "center";
-    ctx.textBaseline = "top";
-    ctx.fillText(s, x, y);
+  ctx.font = AXIS_FONT;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  for (const item of layoutXLabels(marks, left, right, (label) => ctx.measureText(label).width)) {
+    ctx.fillStyle = item.priority ? CHART_AXIS.label : CHART_AXIS.labelDim;
+    ctx.fillText(item.label, item.start, y);
   }
   ctx.restore();
-}
-
-export function guessXPlan(labels, barCount, temporal) {
-  const scroller = $("costChartScroll");
-  const viewW = (scroller && scroller.clientWidth) || 600;
-  const nSlots = Math.max(barCount || 1, temporal ? MIN_COST_SLOTS : 1);
-  const groupW = Math.max(1, (viewW - PLOT_PAD_L - 12) / nSlots);
-  return planXLabels(measureCtx(), labels, groupW, { temporal });
-}
-
-export function applyXPadHeight(canvas, padB) {
-  if (!canvas) return;
-  const store = zoomStore() || {};
-  const base = ensureCostChartH(store);
-  const extra = Math.max(0, (padB || 28) - 28);
-  canvas.style.height = (base + extra) + "px";
 }
 
 export function pointerInXAxis(ev, wrap) {
@@ -954,7 +904,7 @@ export function bindChartResize() {
     const d = btn._rd;
     if (!d) return;
     const store = zoomStore() || window.__costChart || (window.__costChart = {});
-    const next = clampChartH(d.h0 + (ev.clientY - d.y0), COST_CHART_H, "costPanel");
+    const next = clampChartH(d.h0 + (ev.clientY - d.y0), COST_CHART_H);
     store._chartH = next;
     if (window.__aggChart) window.__aggChart._chartH = next;
     if (window.__costChart) window.__costChart._chartH = next;
@@ -993,7 +943,7 @@ export function bindCtxChartResize(redrawFn) {
   btn.addEventListener("pointermove", (ev) => {
     const d = btn._rd;
     if (!d) return;
-    const next = clampChartH(d.h0 + (ev.clientY - d.y0), CTX_CHART_H, "ctxPanel");
+    const next = clampChartH(d.h0 + (ev.clientY - d.y0), CTX_CHART_H);
     try { localStorage.setItem("tt-ctx-chart-h", String(Math.round(next))); } catch { /* ignore */ }
     const canvas = $("ctxChart");
     if (canvas) canvas.style.height = next + "px";
@@ -1211,31 +1161,21 @@ function drawCostYOverlay({ min, max, step, unit, top, bottom, h }) {
   ctx.font = "11px system-ui, Segoe UI, sans-serif";
   ctx.textAlign = "right";
   ctx.textBaseline = "middle";
-  eachCostYTick(min, max, step, unit, (v) => {
+  eachCostYTick(min, max, step, plotH, (v) => {
     ctx.fillText(fmtCostAxis(v, unit), w - 8, yOf(v));
   });
 }
 
-function eachCostYTick(yMin, max, step, unit, fn) {
+function eachCostYTick(yMin, max, step, plotH, fn) {
   if (!(step > 0) || !Number.isFinite(step) || !Number.isFinite(max)) {
     fn(0);
     return;
   }
-  const span = Math.max(0, max - yMin);
-  const n = Math.max(1, Math.round(span / step));
-  const count = Math.min(8, n);
-  const seen = new Set();
-  for (let i = 0; i <= count; i++) {
-    let v = yMin + (span * i) / count;
-    v = Math.round(v / step) * step;
-    if (v < yMin - step * 0.01 || v > max + step * 0.01) continue;
-    if (unit === "tokens") v = Math.round(v);
-    const key = unit === "tokens" ? String(v) : v.toFixed(6);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    fn(v);
-  }
-  if (!seen.size) fn(yMin);
+  const maxIntervals = Math.max(1, Math.floor(plotH / 28));
+  const tickStep = step * Math.max(1, Math.ceil((max - yMin) / step / maxIntervals - 1e-9));
+  const first = Math.ceil(yMin / step - 1e-9) * step;
+  const count = Math.floor((max - first) / tickStep + 1e-9);
+  for (let i = 0; i <= count; i++) fn(first + i * tickStep);
 }
 
 /** Official line only when the bill is non-zero. Codex list-price estimate stays. */
@@ -1406,11 +1346,6 @@ export function drawBars(canvas, turns, rounds, opts) {
       bars = bars.slice().sort((a, b) => metric(a) - metric(b));
     }
   }
-  applyXPadHeight(canvas, guessXPlan(
-    bars.map((p) => p.label || String(p.index)),
-    bars.length,
-    false
-  ).padB);
 
   if (!bars.length) {
     resetCostCanvasFit(canvas);
@@ -1461,18 +1396,10 @@ export function drawBars(canvas, turns, rounds, opts) {
   const { min: yMin, max, step: yStep } = niceCostYMaxForUnit(rawMax, unit);
 
   const left = PLOT_PAD_L, right = 12, top = 12;
-  const nSlots0 = Math.max(bars.length, MIN_COST_SLOTS);
-  const groupW0 = Math.max(1, (w - left - right) / nSlots0);
-  const xPlan = planXLabels(
-    ctx,
-    bars.map((p) => p.label || String(p.index)),
-    groupW0,
-    { temporal: false }
-  );
-  const bottom = xPlan.padB;
+  const bottom = X_AXIS_HEIGHT;
   const plotW = w - left - right;
   const plotH = h - top - bottom;
-  const nSlots = nSlots0;
+  const nSlots = Math.max(bars.length, MIN_COST_SLOTS);
   const groupW = plotW / nSlots;
   const bw = Math.max(1, Math.min(44, groupW * (groupW < 8 ? 0.9 : groupW < 18 ? 0.72 : 0.58)));
   const yOf = (v) => top + plotH - ((v - yMin) / (max - yMin)) * plotH;
@@ -1482,7 +1409,7 @@ export function drawBars(canvas, turns, rounds, opts) {
   ctx.fillStyle = CHART_AXIS.label;
   ctx.font = "10px system-ui, Segoe UI, sans-serif";
   ctx.textAlign = "right";
-  eachCostYTick(yMin, max, yStep, unit, (v) => {
+  eachCostYTick(yMin, max, yStep, plotH, (v) => {
     const y = yOf(v);
     ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w - right, y); ctx.stroke();
   });
@@ -1491,15 +1418,6 @@ export function drawBars(canvas, turns, rounds, opts) {
 
   const hit = [];
   const legendMap = new Map();
-  // Draw empty X placeholders first (no bars)
-  for (let i = bars.length; i < nSlots; i++) {
-    const x0 = left + i * groupW + (groupW - bw) / 2;
-    ctx.fillStyle = CHART_AXIS.placeholder;
-    ctx.font = "10px system-ui, Segoe UI, sans-serif";
-    ctx.textAlign = "center";
-    ctx.fillText("—", x0 + bw / 2, h - 8);
-    ctx.textAlign = "left";
-  }
   bars.forEach((p, i) => {
     const x0 = left + i * groupW + (groupW - bw) / 2;
     let yBase = top + plotH;
@@ -1538,8 +1456,6 @@ export function drawBars(canvas, turns, rounds, opts) {
       ctx.lineWidth = 1.5;
       ctx.strokeRect(x0 + 0.5, yBase + 0.5, bw - 1, (top + plotH) - yBase - 1);
     }
-    if (i % xPlan.every === 0)
-      drawXLabel(ctx, p.label || String(p.index), x0 + bw / 2, h - bottom + 6, xPlan.rotate);
     // attach visible segs for tooltip
     const visTot = stack.reduce((a, s) => a + costSegMetric(s, unit), 0);
     hit.push({
@@ -1548,6 +1464,11 @@ export function drawBars(canvas, turns, rounds, opts) {
       segs: segHits,
     });
   });
+
+  drawXAxis(ctx, bars.map((p, i) => ({
+    x: left + (i + 0.5) * groupW,
+    label: p.label || String(p.index),
+  })), left, w - 24, h - bottom + 5);
 
   // HTML chip legend — all categories present in this view only
   // (no stale hidden tools from previous mode)
@@ -1952,11 +1873,6 @@ export function drawAggBars(canvas, buckets, opts) {
   };
 
   const tip = $("costTip");
-  applyXPadHeight(canvas, guessXPlan(
-    src.map((b) => b.label || ""),
-    Math.max(src.length, 1),
-    !byLabel
-  ).padB);
 
   const laid = layoutCostCanvas(canvas, Math.max(src.length, 1), {
     forceFit: !prev._costUserZoom,
@@ -1965,14 +1881,7 @@ export function drawAggBars(canvas, buckets, opts) {
   const padL = PLOT_PAD_L;
   const padR = 12;
   const padT = 16;
-  const groupW0 = Math.max(1, (w - padL - padR) / Math.max(src.length, 1));
-  const xPlan = planXLabels(
-    ctx,
-    src.map((b) => b.label || ""),
-    groupW0,
-    { temporal: !byLabel }
-  );
-  const padB = xPlan.padB;
+  const padB = X_AXIS_HEIGHT;
   const plotW = Math.max(10, w - padL - padR);
   const plotH = Math.max(10, h - padT - padB);
 
@@ -2045,7 +1954,7 @@ export function drawAggBars(canvas, buckets, opts) {
   ctx.font = "10px system-ui, Segoe UI, sans-serif";
   ctx.textAlign = "right";
   ctx.textBaseline = "middle";
-  eachCostYTick(0, max, y.step, axisUnit, (v) => {
+  eachCostYTick(0, max, y.step, plotH, (v) => {
     const yy = padT + plotH - (v / max) * plotH;
     ctx.beginPath();
     ctx.moveTo(0, yy);
@@ -2072,9 +1981,12 @@ export function drawAggBars(canvas, buckets, opts) {
       ctx.fillRect(x, y0, bw, Math.max(1, bh));
     });
     hit.push({ x, y: padT, w: bw, h: plotH, bar });
-    if (i % xPlan.every === 0)
-      drawXLabel(ctx, bar.b.label || "", x + bw / 2, h - padB + 6, xPlan.rotate);
   });
+
+  drawXAxis(ctx, bars.map((bar, i) => ({
+    x: padL + (i + 0.5) * groupW,
+    label: bar.b.label,
+  })), padL, w - 24, h - padB + 5);
 
   canvas._aggHit = { hit, w };
   if (!canvas._aggTipBound) {

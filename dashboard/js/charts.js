@@ -4,6 +4,7 @@ export {
   drawLineChart,
   drawBars,
   drawAggBars,
+  redrawCostChart,
   renderCostLegend,
   setCostUnit,
   hideAllChartTips,

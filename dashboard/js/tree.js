@@ -611,7 +611,6 @@ function renderRoundTree(rounds, opts) {
     root.innerHTML = `<div class="tree-empty">No rounds in this session yet. Follow an active session or pin one from the picker.</div>`;
     return;
   }
-  const prevScroll = root.scrollTop;
   // Preserve open/closed across live re-renders
   const openIds = new Set(
     [...root.querySelectorAll("details[data-rid][open]")].map(d => d.getAttribute("data-rid"))
@@ -1322,7 +1321,6 @@ function renderRoundTree(rounds, opts) {
   }
 
   root.innerHTML = html;
-  root.scrollTop = prevScroll;
 }
 
 function _densityMode(mode) {

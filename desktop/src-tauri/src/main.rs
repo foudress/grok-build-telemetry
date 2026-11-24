@@ -94,7 +94,7 @@ fn build_window(app: &tauri::AppHandle) -> tauri::Result<WebviewWindow> {
         .theme(Some(Theme::Dark))
         .background_color(tauri::window::Color(0x0b, 0x0f, 0x14, 255))
         .inner_size(width, height)
-        .min_inner_size(360.0, 640.0)
+        .min_inner_size(320.0, 360.0)
         .position(x, y)
         .resizable(true)
         .build()

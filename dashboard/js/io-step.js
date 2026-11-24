@@ -11,16 +11,14 @@ import {
 import { COST_COLORS, niceCostYMax } from './cost-model.js';
 import {
   PLOT_PAD_L,
+  X_AXIS_HEIGHT,
+  drawXAxis,
   CHART_AXIS,
   fitCanvas,
   drawChartEmpty,
   hideChartTip,
   ensureCostChartH,
-  guessXPlan,
-  applyXPadHeight,
-  planXLabels,
   clampYViewZoom,
-  drawXLabel,
   renderCostLegend,
   bindCostZoom,
   bindYStretch,
@@ -91,15 +89,11 @@ export function drawIoStepChart(canvas, pts, opts) {
     return;
   }
 
-  const labels = list.map((p) => p.label || "");
-  const padGuess = guessXPlan(labels, list.length, false);
-  applyXPadHeight(canvas, padGuess.padB);
   const laid = layoutRateCanvas(canvas, list.length, ids);
   const { w, h, ctx, slot } = laid;
-  const xPlan = planXLabels(ctx, labels, slot, { temporal: false });
   const padL = PLOT_PAD_L;
   const padT = 18;
-  const padB = Math.max(padGuess.padB || 28, xPlan.padB || 28);
+  const padB = X_AXIS_HEIGHT;
   const plotH = Math.max(10, h - padT - padB);
   let rawMax = 0;
   for (const p of list) {
@@ -148,10 +142,8 @@ export function drawIoStepChart(canvas, pts, opts) {
       yHit = sum / vis.length;
     }
     p._y = yHit;
-    if (p.label && (xPlan.every <= 1 || i % xPlan.every === 0 || i === list.length - 1)) {
-      drawXLabel(ctx, p.label, xs[i], h - padB + 6, xPlan.rotate);
-    }
   });
+  drawXAxis(ctx, list.map((p) => ({ x: p._x, label: p.label })), padL, w - 24, h - padB + 5);
 
   canvas._ratePts = list;
   canvas._rateGeom = { padL, padT, padB, plotH, slot, min, max };

@@ -10,7 +10,7 @@ import {
   normalizeModelFamily,
 } from './fmt.js';
 import { renderRoundTree, setTreeDensity, setRoundsOpen, clearRoundFocus, revealRound } from './tree.js';
-import { drawLineChart, drawBars, setCostUnit, drawRateChart, buildSessionRatePoints, clearRateHost, hideAllChartTips, bindCtxChartResize } from './charts.js';
+import { drawLineChart, drawBars, setCostUnit, drawRateChart, buildSessionRatePoints, clearRateHost, hideAllChartTips, bindCtxChartResize, redrawCostChart } from './charts.js';
 import { fillSessionSelect, switchSession, bindPoll } from './sessions.js';
 import {
   bindPeriodPoll,
@@ -210,6 +210,8 @@ function setOfficialFlipEnabled(on) {
   if (!on) {
     card.classList.remove("is-flipped");
     card.setAttribute("aria-pressed", "false");
+    card.querySelector(".card-face-front").removeAttribute("aria-hidden");
+    card.querySelector(".card-face-back").setAttribute("aria-hidden", "true");
   }
   card.tabIndex = on ? 0 : -1;
 }
@@ -1134,15 +1136,14 @@ function restorePanelCollapse() {
     try {
       if (localStorage.getItem("tt-collapse-" + id) === "1") {
         const el = $(id);
-        if (el) el.classList.add("is-collapsed");
+        el.classList.add("is-collapsed");
+        $(id + "Title").setAttribute("aria-expanded", "false");
       }
     } catch { /* ignore */ }
   });
 }
 
 function redrawExpandedPanel(id) {
-  // Layout must settle (display:none → visible) before canvas DPR/size or we get stretch/blur.
-  void document.body.offsetHeight;
   requestAnimationFrame(() => {
     if (id === "ctxPanel") {
       if (_graphMode) applyGraphHeight(storedGraphH());
@@ -1164,12 +1165,14 @@ function bindPanelCollapse() {
     if (head._collapseBound) return;
     head._collapseBound = true;
     head.addEventListener("click", (ev) => {
-      if (ev.target.closest("button, .unit-toggle, .period-nav, a, select, input")) return;
+      const toggle = head.querySelector(".panel-title-button");
+      if (!toggle.contains(ev.target) && ev.target.closest("button, .unit-toggle, .period-nav, a, select, input")) return;
       const id = head.getAttribute("data-collapse-panel");
       const panel = id && $(id);
       if (!panel) return;
       panel.classList.toggle("is-collapsed");
       const collapsed = panel.classList.contains("is-collapsed");
+      toggle.setAttribute("aria-expanded", String(!collapsed));
       try {
         localStorage.setItem("tt-collapse-" + id, collapsed ? "1" : "0");
       } catch { /* ignore */ }
@@ -1304,7 +1307,15 @@ const bootSid = new URLSearchParams(location.search).get("session")
 poll();
 if (bootSid) switchSession(bootSid);
 setInterval(poll, 1000);
+let resizeFrame;
+window.addEventListener("scroll", hideAllChartTips, { passive: true });
 window.addEventListener("resize", () => {
+  cancelAnimationFrame(resizeFrame);
+  resizeFrame = requestAnimationFrame(redrawForResize);
+});
+
+function redrawForResize() {
+  hideAllChartTips();
   if (isPeriodScope()) {
     redrawPeriod();
     return;
@@ -1316,5 +1327,5 @@ window.addEventListener("resize", () => {
   } else {
     paintCtxChart(st);
   }
-  drawBars($("costChart"), st.turns || [], st.rounds || []);
-});
+  redrawCostChart();
+}

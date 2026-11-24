@@ -8,7 +8,8 @@ import {
   GANTT_MIN_SPAN,
   fitCanvas,
   drawChartEmpty,
-  drawXLabel,
+  drawXAxis,
+  X_AXIS_HEIGHT,
   hideChartTip,
   placeCostTip,
   setCostTipOwner,
@@ -387,18 +388,10 @@ export function drawTimeline(canvas, agg) {
   const padL = PLOT_PAD_L;
   const padR = 18;
   const padT = 16;
-  let padB = 28;
+  const padB = X_AXIS_HEIGHT;
   const plotW = Math.max(10, w - padL - padR);
   const xOf = (ep) => padL + ((Number(ep) - win.t0) / span) * plotW;
   const ticks = buildGanttTicks(win.t0, win.t1);
-  ctx.font = "10px system-ui, Segoe UI, sans-serif";
-  let collide = false;
-  for (let i = 1; i < ticks.length; i++) {
-    const gap = xOf(ticks[i].t) - xOf(ticks[i - 1].t);
-    const need = (ctx.measureText(ticks[i - 1].label).width + ctx.measureText(ticks[i].label).width) / 2 + 8;
-    if (gap < need) { collide = true; break; }
-  }
-  if (collide) padB = 52;
   const plotH = Math.max(10, h - padT - padB);
   window.__aggChart._ganttGeom = { padT, padB, plotH, plotW, padL };
 
@@ -422,9 +415,13 @@ export function drawTimeline(canvas, agg) {
     ctx.moveTo(x, padT);
     ctx.lineTo(x, padT + plotH);
     ctx.stroke();
-    ctx.fillStyle = mid ? CHART_AXIS.label : CHART_AXIS.labelDim;
-    drawXLabel(ctx, tk.label, x, h - padB + 6, collide);
   }
+
+  drawXAxis(ctx, ticks.map((tick) => ({
+    x: xOf(tick.t),
+    label: tick.label,
+    priority: tick.kind === "date",
+  })), padL, w - 24, h - padB + 5);
 
   if (!sessions.length) {
     drawYSessionLabels([], padT, padB, h);

@@ -1,118 +1,6 @@
-/* App shell (?shell=app). The window opens at 9:16, which is narrower than the
-   browser breakpoints that restack the page. Keep the wide dashboard layout
-   and tighten it. Below 420px, cards drop to two columns so values stay readable. */
-
+/* WebView controls share a baseline in the native desktop shell. */
 html[data-shell="app"] {
-  color-scheme: dark;
-  --font-size-base: 12px;
-  --font-size-lg: 18px;
-  --space-4: 12px;
-  --space-5: 14px;
-  --ctl-h: 30px;
-  scrollbar-color: rgba(139, 156, 179, 0.38) transparent;
-}
-
-html[data-shell="app"] header {
-  gap: 6px 8px;
-  padding: 8px 10px 11px;
-}
-
-/* The window title and the source switch already name the product. */
-html[data-shell="app"] header h1 {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  margin: 0;
-  overflow: hidden;
-  clip: rect(0 0 0 0);
-}
-
-html[data-shell="app"] .src-switch a {
-  padding: 4px 8px;
-}
-
-html[data-shell="app"] .session-picker {
-  flex: 1 1 140px;
-  min-width: 0;
-  max-width: none;
-}
-
-html[data-shell="app"] #scopeSelect {
-  min-width: 6.2rem;
-}
-
-html[data-shell="app"] main {
-  gap: 8px;
-  padding: 8px 10px;
-}
-
-html[data-shell="app"] .cards {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 6px;
-}
-
-html[data-shell="app"] .card {
-  padding: 8px 8px 8px 10px;
-}
-
-html[data-shell="app"] .card .value {
-  font-size: clamp(14px, 3.1vw, 18px);
-}
-
-html[data-shell="app"] .card .sub {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-html[data-shell="app"] .card-flip .card-face {
-  padding: 8px 8px 8px 10px;
-}
-
-html[data-shell="app"] .chart-toolbar {
-  gap: 6px 8px;
-}
-
-html[data-shell="app"] .cost-panel-head {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: space-between;
-}
-
-html[data-shell="app"] .tree .round-head,
-html[data-shell="app"] .tree .compact-row {
-  grid-template-columns: auto minmax(0, 1fr) auto auto;
-  gap: 2px 6px;
-}
-
-html[data-shell="app"] .tree .round-head .round-meta,
-html[data-shell="app"] .tree .compact-row .compact-meta {
-  grid-column: auto;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-html[data-shell="app"] .tree .round-head .round-ledger,
-html[data-shell="app"] .tree .round-head .round-ctx,
-html[data-shell="app"] .tree .compact-row .compact-ledger,
-html[data-shell="app"] .tree .compact-row .compact-ctx {
-  justify-self: end;
-}
-
-html[data-shell="app"] .sess-row {
-  grid-template-columns: auto minmax(0, 1fr) auto auto auto;
-  gap: 2px 6px;
-  padding: 6px 8px;
-}
-
-html[data-shell="app"] .sess-row .sess-ledger,
-html[data-shell="app"] .sess-row .sess-price {
-  justify-self: end;
-}
-
-html[data-shell="app"] .split {
-  grid-template-columns: 1fr 1fr;
+  --ctl-h: 32px;
 }
 
 /* One control height so pills, the view menu, and the session menu line up. */
@@ -157,7 +45,7 @@ html[data-shell="app"] .session-dd-btn {
   font-size: 12px;
   cursor: pointer;
   padding: 0 26px 0 10px;
-  box-shadow: none;
+  transition: border-color var(--duration-fast) var(--ease-out), background-color var(--duration-normal) var(--ease-out);
 }
 
 html[data-shell="app"] .scope-dd-btn {
@@ -343,17 +231,23 @@ html[data-shell="app"] *::-webkit-scrollbar-corner {
   background: transparent;
 }
 
-@media (max-width: 420px) {
-  html[data-shell="app"] .cards {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+@media (max-width: 560px) {
+  html[data-shell="app"] {
+    --space-4: 12px;
+    --ctl-h: 30px;
   }
 
-  html[data-shell="app"] .sess-row {
-    grid-template-columns: auto minmax(0, 1fr);
+  html[data-shell="app"] .session-dd-menu {
+    width: min(320px, calc(100% + 6.4rem + var(--space-2)));
+    max-width: calc(100vw - 32px);
   }
+}
 
-  html[data-shell="app"] .sess-row .sess-ledger,
-  html[data-shell="app"] .sess-row .sess-price {
-    justify-self: start;
+@media (max-width: 400px) {
+  html[data-shell="app"] .session-dd-item {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  html[data-shell="app"] .session-dd-title {
+    grid-column: 1 / -1;
   }
 }

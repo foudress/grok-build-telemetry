@@ -69,13 +69,13 @@
 </head>
 <body>
   <header>
+    <h1>Metryx</h1>
     <nav class="src-switch" aria-label="Telemetry source">
       <a href="/?source=grok" data-source="grok">Grok Build</a>
       <a href="/?source=codex" data-source="codex">Codex</a>
       <a href="/?source=antigravity" data-source="antigravity">Antigravity</a>
     </nav>
     <button type="button" id="periodBack" class="ghost-btn period-back" hidden title="Back to period view">← Back</button>
-    <h1>Metryx</h1>
     <a href="/history" class="meta" style="text-decoration:none" hidden>history</a>
     <a href="/graph" class="meta" style="text-decoration:none" hidden>graph</a>
     <div class="session-picker">
@@ -141,8 +141,8 @@
     </section>
 
     <section class="panel" id="ctxPanel">
-      <div class="panel-head panel-head-toggle" data-collapse-panel="ctxPanel" title="Click title area to collapse">
-        <h2 id="ctxPanelTitle">Context tokens</h2>
+      <div class="panel-head panel-head-toggle" data-collapse-panel="ctxPanel">
+        <h2><button type="button" id="ctxPanelTitle" class="panel-title-button" aria-expanded="true" aria-controls="ctxChartWrap">Context tokens</button></h2>
         <span class="unit-toggle" title="Context panel view" role="group" aria-label="Context view">
           <button type="button" id="ctxModeTokens" class="unit-btn active" aria-pressed="true">Context</button>
           <button type="button" id="ctxModeRate" class="unit-btn" aria-pressed="false" title="Tokens per second" hidden>tok/s</button>
@@ -181,8 +181,8 @@
     </section>
 
     <section class="panel" id="costPanel">
-      <div class="panel-head cost-panel-head panel-head-toggle" data-collapse-panel="costPanel" title="Click title area to collapse">
-        <h2 id="costPanelTitle">Cost Per Turn</h2>
+      <div class="panel-head cost-panel-head panel-head-toggle" data-collapse-panel="costPanel">
+        <h2><button type="button" id="costPanelTitle" class="panel-title-button" aria-expanded="true" aria-controls="costChartWrap">Cost Per Turn</button></h2>
         <div id="periodNav" class="period-nav" hidden>
           <button type="button" id="periodPrev" class="ghost-btn" title="Previous period">←</button>
           <span id="periodLabel" class="mode-pill">—</span>

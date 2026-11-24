@@ -10,13 +10,11 @@ import {
   CHART_AXIS,
   COST_Y_LEFT,
   PLOT_PAD_L,
+  X_AXIS_HEIGHT,
+  drawXAxis,
   COST_MAX_SLOT,
   fitCanvas,
   drawChartEmpty,
-  drawXLabel,
-  planXLabels,
-  guessXPlan,
-  applyXPadHeight,
   storedCtxChartH,
   ensureCostChartH,
   bindChartResize,
@@ -340,20 +338,11 @@ export function drawRateChart(canvas, pts, opts) {
     return;
   }
 
-  const labels = list.map((p) => p.label || "");
-  // Pad from fit-view first; final X plan uses real slot after zoom (same as Session bars).
-  const padGuess = guessXPlan(labels, list.length, false);
-  if (host === "cost") applyXPadHeight(canvas, padGuess.padB);
-  else {
-    const base = storedCtxChartH();
-    canvas.style.height = (base + Math.max(0, (padGuess.padB || 28) - 28)) + "px";
-  }
   const laid = layoutRateCanvas(canvas, list.length, ids);
   const { w, h, ctx, slot } = laid;
-  const xPlan = planXLabels(ctx, labels, slot, { temporal: false });
   const padL = PLOT_PAD_L;
   const padT = 18;
-  const padB = Math.max(padGuess.padB || 28, xPlan.padB || 28);
+  const padB = X_AXIS_HEIGHT;
   const plotH = Math.max(10, h - padT - padB);
   const vals = list.map((p) => p.v);
   const yz = clampYViewZoom(ids.store._rateYZoom || 1);
@@ -394,17 +383,13 @@ export function drawRateChart(canvas, pts, opts) {
   ctx.fillStyle = color + "22";
   ctx.fill();
 
-  list.forEach((p, i) => {
-    const x = xOf(i);
-    const y = yOf(p.v);
+  list.forEach((p) => {
     ctx.fillStyle = color;
     ctx.beginPath();
-    ctx.arc(x, y, dotR, 0, Math.PI * 2);
+    ctx.arc(p._x, p._y, dotR, 0, Math.PI * 2);
     ctx.fill();
-    if (p.label && (xPlan.every <= 1 || i % xPlan.every === 0 || i === list.length - 1)) {
-      drawXLabel(ctx, p.label, x, h - padB + 6, xPlan.rotate);
-    }
   });
+  drawXAxis(ctx, list.map((p) => ({ x: p._x, label: p.label })), padL, w - 24, h - padB + 5);
 
   canvas._ratePts = list;
   canvas._rateGeom = { padL, padT, padB, plotH, slot, min, max };

@@ -5,15 +5,15 @@
 html {
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
-  height: 100%;
-  overflow: hidden;
+  color-scheme: dark;
+  scrollbar-gutter: stable;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+  scroll-padding-top: 112px;
 }
 
 body {
   margin: 0;
-  height: 100%;
-  max-height: 100%;
-  overflow: hidden;
+  min-height: 100vh;
   display: flex;
   flex-direction: column;
   font-family: var(--font-sans);
@@ -27,7 +27,6 @@ body {
   background-image:
     radial-gradient(ellipse 120% 80% at 50% -30%, rgba(61, 156, 240, 0.06), transparent 55%),
     radial-gradient(ellipse 80% 50% at 100% 100%, rgba(62, 207, 142, 0.03), transparent 45%);
-  background-attachment: fixed;
 }
 
 /* ── Sticky glass header ────────────────────────────────────── */
@@ -35,8 +34,8 @@ header {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-2) var(--space-5);
-  padding: var(--space-3) var(--space-4);
+  gap: var(--space-2) var(--space-3);
+  padding: var(--space-3) max(var(--space-4), calc((100% - 1560px) / 2));
   border-bottom: 1px solid var(--header-border);
   background: var(--header-bg);
   -webkit-backdrop-filter: var(--blur-header);
@@ -107,12 +106,15 @@ body.is-loading main {
 .src-switch {
   display: inline-flex;
   flex: 0 0 auto;
+  max-width: 100%;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-pill);
-  overflow: hidden;
+  overflow-x: auto;
+  scrollbar-width: thin;
   background: var(--bg-sunken);
 }
 .src-switch a {
+  flex: 0 0 auto;
   color: var(--muted);
   text-decoration: none;
   font-size: var(--font-size-xs);
@@ -120,7 +122,9 @@ body.is-loading main {
   letter-spacing: 0.02em;
   padding: 5px 12px;
   line-height: 1.2;
+  transition: background-color var(--duration-normal) var(--ease-out), color var(--duration-fast) var(--ease-out);
 }
+.src-switch a:focus-visible { box-shadow: var(--focus-ring-inset); }
 .src-switch a:hover { color: var(--text); }
 .src-switch a.is-active {
   color: var(--text);
@@ -140,6 +144,7 @@ header h1 {
   color: var(--muted);
   font-size: var(--font-size-sm);
   letter-spacing: 0.01em;
+  overflow-wrap: anywhere;
 }
 
 .meta code {
@@ -164,7 +169,7 @@ header h1 {
   align-items: center;
   gap: var(--space-2);
   flex: 1 1 280px;
-  min-width: 200px;
+  min-width: min(240px, 100%);
   max-width: 640px;
 }
 
@@ -225,11 +230,12 @@ body.scope-period #sessionMeta code {
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%238b9cb3' d='M3 4.5L6 8l3-3.5'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 8px center;
+  transition: border-color var(--duration-fast) var(--ease-out), background-color var(--duration-normal) var(--ease-out);
 }
 
 .session-dd-menu {
   position: absolute;
-  left: 0;
+  inset-inline-end: 0;
   top: calc(100% + 4px);
   z-index: 80;
   min-width: 100%;
@@ -397,24 +403,40 @@ body.scope-period #sessionMeta code {
   border-bottom-color: var(--rose-border);
 }
 
-/* ── Main column — single viewport page (no document scroll) ─── */
+/* The document scrolls so every panel stays reachable at any window height. */
 main {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-  padding: var(--space-3) var(--space-4) var(--space-3);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-4) var(--space-6);
   max-width: 1600px;
   margin: 0 auto;
   width: 100%;
   flex: 1 1 auto;
-  min-height: 0;
-  overflow: hidden;
 }
 
-@media (min-width: 1400px) {
+@media (min-width: 1280px) {
   main {
-    gap: var(--space-4);
-    padding: var(--space-4) var(--space-5) var(--space-4);
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: start;
+    padding-inline: var(--space-5);
+  }
+  .cards, .tree-panel, body.scope-period #costPanel { grid-column: 1 / -1; }
+}
+
+@media (max-width: 720px), (max-height: 620px) {
+  html { scroll-padding-top: var(--space-2); }
+  header { position: relative; }
+}
+
+@media (max-width: 560px) {
+  header, main { padding-inline: var(--space-3); }
+  main { gap: var(--space-3); }
+  .session-picker {
+    order: 1;
+    flex-basis: 100%;
+    max-width: none;
   }
 }
 

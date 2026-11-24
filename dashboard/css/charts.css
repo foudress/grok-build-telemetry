@@ -1,18 +1,21 @@
 /* Charts: canvas, legend chips, cost toolbar, tooltips */
 
-.chart-wrap {
-  position: relative;
-}
-
+#ctxChartWrap,
 #costChartWrap {
-  display: flex;
-  align-items: stretch;
+  position: relative;
   overflow: hidden;
   background: var(--bg-sunken);
   border-radius: var(--radius-md);
   border: 1px solid var(--border-subtle);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
 }
+
+#costChartWrap {
+  display: flex;
+  align-items: stretch;
+}
+
+#ctxGraphWrap { position: relative; }
 
 .chart-loader {
   position: absolute;
@@ -70,7 +73,8 @@ canvas {
 
 .bars { height: 240px; }
 
-#costChartWrap canvas.bars {
+#costChartWrap canvas.bars,
+#ctxChartWrap canvas {
   border: 0;
   border-radius: 0;
   box-shadow: none;
@@ -101,6 +105,8 @@ canvas {
   color: #8b9cb3;
   cursor: nwse-resize;
   opacity: 0.72;
+  touch-action: none;
+  transition: color var(--duration-fast) var(--ease-out), opacity var(--duration-normal) var(--ease-out);
 }
 
 .chart-resize:hover {
@@ -239,7 +245,7 @@ canvas {
   cursor: pointer;
 }
 
-.chart-toolbar button {
+.chart-toolbar > button {
   background: var(--panel-active);
   border: 1px solid var(--border);
   color: var(--text);
@@ -257,16 +263,16 @@ canvas {
     box-shadow var(--duration-fast) var(--ease-out);
 }
 
-.chart-toolbar button:hover {
+.chart-toolbar > button:hover {
   border-color: var(--accent);
   background: var(--accent-soft);
 }
 
-.chart-toolbar button:active {
+.chart-toolbar > button:active {
   transform: scale(0.97);
 }
 
-.chart-toolbar button:focus-visible {
+.chart-toolbar > button:focus-visible {
   box-shadow: var(--focus-ring);
   outline: none;
 }
@@ -313,7 +319,9 @@ canvas {
   line-height: 1.3;
   cursor: pointer;
   user-select: none;
-  white-space: nowrap;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  text-align: left;
   font-weight: var(--font-weight-medium);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
   transition:
@@ -415,6 +423,7 @@ canvas {
   overflow: hidden;
   background: var(--bg-sunken);
   box-shadow: var(--shadow-xs);
+  max-width: 100%;
 }
 
 .unit-btn {
@@ -464,6 +473,8 @@ canvas {
   background: rgba(61, 156, 240, 0.28);
   color: var(--text);
 }
+
+.chart-toolbar .unit-btn { padding-inline: 10px; }
 
 /* ── Chart tooltip ──────────────────────────────────────────── */
 /* Fixed to viewport so #costChartWrap overflow cannot clip long lists */
@@ -525,7 +536,7 @@ canvas {
 /* Reduced motion: opacity cross-fade only (no translate / scale) */
 @media (prefers-reduced-motion: reduce) {
   .cost-legend .leg-chip:active,
-  .chart-toolbar button:active,
+  .chart-toolbar > button:active,
   .unit-btn:active {
     transform: none;
   }
