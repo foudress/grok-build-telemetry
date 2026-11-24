@@ -5,6 +5,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
+from token_telemetry.antigravity import store
 from token_telemetry.antigravity.adapt import build_period, state_for
 from token_telemetry.antigravity.prices import price_usage, priced_model
 from token_telemetry.antigravity.proto import parse_usage
@@ -249,6 +250,28 @@ def test_usage_keeps_cache_read_out_of_uncached() -> None:
     assert usage["cached"] == 50
     assert usage["output"] == 30
     assert usage["reasoning"] == 10
+
+
+def test_system_estimate_subtracts_full_first_query_from_total_input(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(store, "count_tokens", lambda text: len(text.split()))
+    epoch = int(datetime(2026, 11, 21, 12, tzinfo=timezone.utc).timestamp())
+    first = _usage(uncached=100, cached=50, output=20, thinking=0, visible=20, response="first")
+    later = _usage(uncached=400, cached=40, output=10, thinking=0, visible=10, response="later")
+    _db(
+        tmp_path / "conversations/cascade.db",
+        [_gen(first) + _indices([1]), _gen(later) + _indices([3])],
+        [_user("instruction " * 70), _planner(epoch), _user("next"), _planner(epoch + 20)],
+    )
+    state = state_for(load_snapshot(tmp_path), "cascade", pinned="cascade")
+    first_round, second_round = state["rounds"]
+    estimate = first_round["system_estimate"]
+    assert estimate["input_tokens"] == 150
+    assert estimate["user_tokens"] == 70
+    assert estimate["tokens"] == 80
+    assert first_round["breakdown"]["tree_in_tokens"] == 100
+    assert first_round["breakdown"]["cached_tokens"] == 50
+    assert abs(first_round["estimate_usd"] - _list(100, 50, 20)) < 1e-12
+    assert "system_estimate" not in second_round
 
 
 def test_output_follows_thinking_plus_visible() -> None:

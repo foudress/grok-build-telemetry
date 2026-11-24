@@ -26,6 +26,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional, TextIO
 
+from token_telemetry.tokenizer import count_tokens
+
 _USAGE_KEYS = (
     "input_tokens",
     "cached_input_tokens",
@@ -217,9 +219,9 @@ def _clip(text: Any, n: int = _PREVIEW) -> str:
     return flat[: n - 1] + "…"
 
 
-def _text_from_content(content: Any) -> str:
+def _content_text(content: Any) -> str:
     if isinstance(content, str):
-        return _clip(content, 240)
+        return content
     if not isinstance(content, list):
         return ""
     parts: list[str] = []
@@ -230,7 +232,11 @@ def _text_from_content(content: Any) -> str:
             raw = part.get("text") or part.get("content")
             if isinstance(raw, str):
                 parts.append(raw)
-    return _clip(" ".join(parts), 240)
+    return " ".join(parts)
+
+
+def _text_from_content(content: Any) -> str:
+    return _clip(_content_text(content), 240)
 
 
 def _arg_bits(raw: Any) -> tuple[str, str]:
@@ -434,6 +440,8 @@ def _take_response_item(
     turn = _turn_of(payload)
     if pt == "message":
         role = payload.get("role") if isinstance(payload.get("role"), str) else ""
+        if role not in ("user", "assistant"):
+            return
         text = _text_from_content(payload.get("content"))
         if role == "user":
             remember_user(turn, text, event=False)
@@ -604,6 +612,8 @@ def _parse_file(path: Path) -> dict[str, Any]:
     closed: Optional[dict[str, Any]] = None
     turn_user: dict[str, str] = {}
     turn_user_event: set[str] = set()
+    base_instructions = ""
+    opening_instructions: list[str] = []
 
     def _remember_user(turn: str, text: str, *, event: bool) -> None:
         shown = _clip(text, 240)
@@ -646,6 +656,12 @@ def _parse_file(path: Path) -> dict[str, Any]:
         ts = obj.get("timestamp") if isinstance(obj.get("timestamp"), str) else ""
 
         if kind == "session_meta":
+            if not calls and not fallback and not base_instructions:
+                base = payload.get("base_instructions")
+                if isinstance(base, dict):
+                    base = base.get("text")
+                if isinstance(base, str) and base.strip():
+                    base_instructions = base
             mid = payload.get("id")
             if isinstance(mid, str) and mid:
                 meta_id = mid
@@ -707,6 +723,14 @@ def _parse_file(path: Path) -> dict[str, Any]:
             continue
 
         if kind == "response_item":
+            if (
+                not calls and not fallback
+                and payload.get("type") == "message"
+                and payload.get("role") in ("system", "developer")
+            ):
+                instructions = _content_text(payload.get("content"))
+                if instructions.strip():
+                    opening_instructions.append(instructions)
             _take_response_item(payload, llm_buf, closed, _remember_user, _has_llm)
             continue
 
@@ -736,6 +760,15 @@ def _parse_file(path: Path) -> dict[str, Any]:
             _seal(call)
             fallback.append(call)
 
+    recorded_calls = calls if calls else fallback
+    if recorded_calls and (base_instructions or opening_instructions):
+        if base_instructions and all(base_instructions.strip() != text.strip() for text in opening_instructions):
+            opening_instructions.insert(0, base_instructions)
+        recorded_calls[0]["system_estimate"] = {
+            "tokens": sum(count_tokens(text) for text in opening_instructions),
+            "label": "Recorded opening instructions",
+            "note": "Local token count of the recorded base, system and developer instructions before the first call. Tool definitions and provider-added context may be missing.",
+        }
     ids = _ids_in_name(path.name)
     thread_id = meta_id or (ids[-1] if ids else path.name)
     return {
@@ -747,7 +780,7 @@ def _parse_file(path: Path) -> dict[str, Any]:
         "source": source,
         "started": started,
         "window": window,
-        "calls": calls if calls else fallback,
+        "calls": recorded_calls,
         "from_usage_record": bool(calls),
     }
 
@@ -998,6 +1031,7 @@ def build_snapshot(
                     "harness": list(call.get("harness") or []),
                     "user_preview": call.get("user_preview") or "",
                     "compact_after": bool(call.get("compact_after")),
+                    **({"system_estimate": call["system_estimate"]} if "system_estimate" in call else {}),
                     **_public(usage),
                 }
             )

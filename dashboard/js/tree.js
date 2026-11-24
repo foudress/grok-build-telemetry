@@ -742,10 +742,10 @@ function renderRoundTree(rounds, opts) {
   }
 
   /** Session bootstrap card (before Round 1) — same shell as Compact. */
-  function renderSystemBootstrap(sp) {
-    if (!sp || !(sp.tokens_in || sp.logical_tokens || (sp.parts && sp.parts.length)))
+  function renderSystemBootstrap(sp, estimated = false) {
+    if (!sp || (!estimated && !(sp.tokens_in || sp.logical_tokens || (sp.parts && sp.parts.length))))
       return "";
-    const { rawParts, tot } = systemBoxPartsAndTotal(sp);
+    const { rawParts, tot } = estimated ? { rawParts: [], tot: sp.tokens } : systemBoxPartsAndTotal(sp);
     const parts = rawParts.map(p => {
       const tokZ = Math.round(Number(
         p.tokenizer_tokens || p.tok_w || p.tokens || p.tokens_in
@@ -762,11 +762,11 @@ function renderRoundTree(rounds, opts) {
       </div>`;
     }).join("");
     return `<div class="compact-row system-row" title="${esc(sp.note || "Session bootstrap (before Round 1)")}">
-      <span class="tag system">System</span>
+      <span class="tag system">${estimated ? "System ≈" : "System"}</span>
       <span class="compact-meta muted">${esc(sp.label || "System / tools / reminders / MCP / Tool Definitions")}</span>
       <span class="compact-ledger">
-        ${joinParts([partIn(tot, sp.cost_in_usd)])}
-        ${sp.estimate_usd != null ? totalPrice(sp.estimate_usd) : ""}
+        ${estimated ? `<span class="tok-in">${fmtTokens(tot)} tokens</span>` : joinParts([partIn(tot, sp.cost_in_usd)])}
+        ${!estimated && sp.estimate_usd != null ? totalPrice(sp.estimate_usd) : ""}
       </span>
       <span class="compact-ctx"></span>
       ${parts ? `<div class="system-parts">${parts}</div>` : ""}
@@ -1273,6 +1273,8 @@ function renderRoundTree(rounds, opts) {
   const firstRound = chrono.find(r => r && r.index === 1) || chrono[0];
   if (firstRound && firstRound.system_prompt) {
     systemCard = renderSystemBootstrap(firstRound.system_prompt);
+  } else if (firstRound && firstRound.system_estimate) {
+    systemCard = renderSystemBootstrap(firstRound.system_estimate, true);
   }
   // Newest-first: system should appear just above Round 1 card.
   // After reverse, R1 is last; inject system before the last details if R1 is last,

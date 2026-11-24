@@ -191,7 +191,7 @@ def _clip(text: str, limit: int) -> str:
     return flat[: limit - 1].rstrip() + "…"
 
 
-def _utf8(blob: object, limit: int = 240) -> tuple[str, int]:
+def _utf8(blob: object, limit: Optional[int] = 240) -> tuple[str, int]:
     """Clipped preview and the full character count. Empty when it is not text."""
     if not isinstance(blob, (bytes, bytearray)) or not blob:
         return "", 0
@@ -204,10 +204,10 @@ def _utf8(blob: object, limit: int = 240) -> tuple[str, int]:
         return "", 0
     if not text.strip():
         return "", 0
-    return _clip(text, limit), len(text)
+    return (text if limit is None else _clip(text, limit)), len(text)
 
 
-def _field_text(buf: bytes, number: int, limit: int = 240) -> tuple[str, int]:
+def _field_text(buf: bytes, number: int, limit: Optional[int] = 240) -> tuple[str, int]:
     for fn, wire, val in iter_fields(buf):
         if fn == number and wire == 2:
             preview, size = _utf8(val, limit)
@@ -245,13 +245,13 @@ def parse_step(buf: bytes) -> dict[str, object]:
     return {"epoch": epoch, "tool": tool}
 
 
-def parse_user_text(payload: bytes) -> str:
+def parse_user_text(payload: bytes, *, limit: Optional[int] = 240) -> str:
     """User step payload. The query is the user-input body, field 1 or 2."""
     body = _sub(payload, 19)
     if not body:
         return ""
     for number in (1, 2):
-        preview, _size = _field_text(body, number, 240)
+        preview, _size = _field_text(body, number, limit)
         if preview:
             return preview
     return ""

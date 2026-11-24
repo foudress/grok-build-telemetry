@@ -6,6 +6,8 @@ import json
 import time
 from pathlib import Path
 
+from token_telemetry.codex import store
+from token_telemetry.codex.adapt import state_for
 from token_telemetry.codex.store import (
     build_snapshot,
     clear_cache,
@@ -37,6 +39,35 @@ def _usage(total: int, cached: int = 0, out: int = 0, reason: int = 0) -> dict:
         "reasoning_output_tokens": reason,
         "total_tokens": total,
     }
+
+
+def test_system_estimate_counts_only_opening_instructions(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(store, "count_tokens", lambda text: len(text.split()))
+    base = "base instruction " * 80
+
+    def message(role, text):
+        return {"type": "response_item", "payload": {
+            "type": "message", "role": role, "content": [{"type": "input_text", "text": text}],
+        }}
+
+    _write(tmp_path / "sessions/rollout.jsonl", [
+        {"type": "session_meta", "payload": {"id": "thread", "base_instructions": {"text": base}}},
+        {"type": "turn_context", "payload": {"turn_id": "first", "model": "gpt-6.2-sol"}},
+        message("system", base),
+        message("developer", "opening developer instruction"),
+        message("user", "opening user message"),
+        {"type": "token_usage_record", "payload": {"turn_id": "first", "usage": _usage(500, cached=100, out=50)}},
+        message("developer", "later developer instruction"),
+        {"type": "token_usage_record", "payload": {"turn_id": "second", "usage": _usage(600, cached=130, out=80)}},
+    ])
+    state = state_for(build_snapshot(tmp_path), "thread", pinned="thread")
+    first, second = state["rounds"]
+    assert first["system_estimate"]["tokens"] == 163
+    assert first["breakdown"]["tree_in_tokens"] == 350
+    assert first["breakdown"]["cached_tokens"] == 100
+    assert "system_prompt" not in first
+    assert "system_estimate" not in second
+    assert base not in json.dumps(state)
 
 
 def test_sums_call_usage_not_cumulative_turn(tmp_path: Path):

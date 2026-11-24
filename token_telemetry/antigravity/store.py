@@ -32,6 +32,7 @@ from token_telemetry.antigravity.proto import (
     parse_step,
     parse_user_text,
 )
+from token_telemetry.tokenizer import count_tokens
 
 _USER = 14
 _PLANNER = 15
@@ -505,6 +506,20 @@ def _parse_db(
             seen[key] = call
     calls = [seen[key] for key in order]
     calls.sort(key=lambda c: (float(c.get("_epoch") or 0), int(c.get("_idx") or 0)))
+    if calls and user_steps and calls[0]["turn_id"] == str(user_steps[0]):
+        first = calls[0]
+        first_text = parse_user_text(steps[user_steps[0]]["payload"], limit=None)
+        if first_text:
+            user_tokens = count_tokens(first_text)
+            total_input = first["input_tokens"]
+            if user_tokens <= total_input:
+                first["system_estimate"] = {
+                    "tokens": total_input - user_tokens,
+                    "label": "First input − user text",
+                    "note": "First call total input, including cache, minus a local token count of the full user text. The remainder can include tool definitions, attachments, and other context.",
+                    "input_tokens": total_input,
+                    "user_tokens": user_tokens,
+                }
     for call in calls:
         call.pop("_epoch", None)
         call.pop("_idx", None)

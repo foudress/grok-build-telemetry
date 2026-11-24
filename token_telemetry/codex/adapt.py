@@ -668,6 +668,8 @@ def _view(
         )
         prev = rnd.get("_epoch")
         rounds_all.append(rnd)
+    if rounds_all and "system_estimate" in calls[0]:
+        rounds_all[0]["system_estimate"] = calls[0]["system_estimate"]
     turns = [_turn_from_round(r) for r in rounds_all]
     series = []
     for call in calls:

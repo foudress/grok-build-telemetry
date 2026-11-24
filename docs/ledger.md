@@ -39,18 +39,21 @@ Zero is present (v1.5). Do not replace a real 0 with another ledger.
 
 ## System attribution across connectors
 
-Grok Build records the opening history and the context checkpoints needed for
-the System R1 identities above. Codex records per-call prompt and cache usage.
-Some rollouts also contain `session_meta.base_instructions`, a fragment of the
-effective prompt. Antigravity records per-call usage in `gen_metadata`, along with
-conversation steps. Neither trace supplies the billed size of the system and
-developer messages, tool definitions, or their split across the cache.
+Grok Build records the opening history and context checkpoints for the System R1
+identities above. Codex and Antigravity show a local token estimate on Round 1
+under `system_estimate` when the opening data is available.
 
-For exact attribution, the connector would need the fully assembled first
-request with provider token counts by component and cache status. Measured
-system input could then populate the existing System card, with a separate
-unattributed balance whenever a component is missing. A count from locally
-visible instructions can be shown as an estimate, independent of the call totals.
+- **Antigravity** subtracts the local token count of the full first user message
+  from the total input of its first model call, including cache reads. The
+  remainder can include tools, message framing, attachments and other context.
+- **Codex** counts recorded `session_meta.base_instructions` and opening
+  `system` and `developer` messages. The count covers the recorded text. Tool
+  definitions and provider-added context can be absent.
+
+These estimates are displayed on their own card. The per-call token totals,
+cache split, costs and breakdowns continue to come from the connector ledger.
+Exact billing attribution would require the provider token counts by request
+component and cache status.
 
 ## Canonical round fields
 
