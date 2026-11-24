@@ -9,8 +9,8 @@ or run `python3 bootstrap_install.py` after clone. That creates `.venv`,
 `pip install -e .`, and installs the `/telemetry` skill.
 
 ```bash
-git clone https://github.com/foudress/grok-build-telemetry.git
-cd grok-build-telemetry
+git clone https://github.com/foudress/metryx.git
+cd metryx
 python3 bootstrap_install.py   # or: python bootstrap_install.py
 ```
 

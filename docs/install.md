@@ -4,7 +4,7 @@
 A user can paste only:
 
 ```text
-Follow https://github.com/foudress/grok-build-telemetry/blob/main/docs/install.md exactly.
+Follow https://github.com/foudress/metryx/blob/main/docs/install.md exactly.
 ```
 
 You are a **Grok Build agent** on **Windows, macOS, or Linux**. Execute every step with the host shell. Prefer idempotent commands. After install, daily use is **`/telemetry`** (not this doc).
@@ -62,14 +62,14 @@ If none found, clone:
 
 ```bash
 mkdir -p "$HOME/Grok"
-git clone https://github.com/foudress/grok-build-telemetry.git "$HOME/Grok/token-telemetry"
+git clone https://github.com/foudress/metryx.git "$HOME/Grok/token-telemetry"
 ```
 
 **Windows (PowerShell) equivalent if you are not in bash:**
 
 ```powershell
 New-Item -ItemType Directory -Force -Path (Join-Path $env:USERPROFILE "Grok") | Out-Null
-git clone https://github.com/foudress/grok-build-telemetry.git (Join-Path $env:USERPROFILE "Grok\token-telemetry")
+git clone https://github.com/foudress/metryx.git (Join-Path $env:USERPROFILE "Grok\token-telemetry")
 ```
 
 Set `ROOT` to that directory and:

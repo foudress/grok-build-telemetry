@@ -6,7 +6,7 @@ Local telemetry dashboard for **Grok Build**, **Codex**, and **Antigravity**. Ex
 
 ## Windows desktop app
 
-Download the [Windows x64 setup executable](https://github.com/foudress/grok-build-telemetry/releases/latest) and run it. The installer includes Python, the dashboard and the offline tokenizer. Launch **Metryx** from the Start menu.
+Download the [Windows x64 setup executable](https://github.com/foudress/metryx/releases/latest) and run it. The installer includes Python, the dashboard and the offline tokenizer. Launch **Metryx** from the Start menu.
 
 ```
 ~/.grok/sessions/.../updates.jsonl  ──tail──►  live dashboard  ──►  http://127.0.0.1:8765/
@@ -55,7 +55,7 @@ Direct hits to gated pages show a short polish/debug note; gated APIs return `50
 Paste in Grok Build (agent follows the doc):
 
 ```text
-Follow https://github.com/foudress/grok-build-telemetry/blob/main/docs/install.md exactly.
+Follow https://github.com/foudress/metryx/blob/main/docs/install.md exactly.
 ```
 
 Works on **Windows, macOS, and Linux**. Clones (if needed), creates `.venv`, `pip install -e .`, and installs **`/telemetry`** under `~/.grok/skills/telemetry/`.
@@ -63,8 +63,8 @@ Works on **Windows, macOS, and Linux**. Clones (if needed), creates `.venv`, `pi
 Manual equivalent: [docs/install.md](docs/install.md).
 
 ```bash
-git clone https://github.com/foudress/grok-build-telemetry.git
-cd grok-build-telemetry
+git clone https://github.com/foudress/metryx.git
+cd metryx
 python3 bootstrap_install.py   # or: python bootstrap_install.py
 ```
 

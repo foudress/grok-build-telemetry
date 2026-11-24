@@ -35,9 +35,9 @@ metryx = "token_telemetry.__main__:main"
 token-telemetry = "token_telemetry.__main__:main"
 
 [project.urls]
-Homepage = "https://github.com/foudress/grok-build-telemetry"
-Documentation = "https://github.com/foudress/grok-build-telemetry#readme"
-Repository = "https://github.com/foudress/grok-build-telemetry"
+Homepage = "https://github.com/foudress/metryx"
+Documentation = "https://github.com/foudress/metryx#readme"
+Repository = "https://github.com/foudress/metryx"
 
 [tool.setuptools.packages.find]
 where = ["."]
