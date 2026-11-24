@@ -1,14 +1,19 @@
 # Connector plugins
 
-token-telemetry ships three built-in sources:
+Metryx ships three built-in sources:
 
 | Source | API | Ledgers |
 |---|---|---|
 | **Grok Build** | `/api/*` | Official API, Tree In, System R1 |
 | **Codex** | `/api/codex/*` | Separate Codex wire (estimate only) |
-| **Antigravity** | `/api/antigravity/*` | Separate Antigravity wire (counts only, estimate stays 0) |
+| **Antigravity** | `/api/antigravity/*` | Separate Antigravity wire (estimates for models with a published rate) |
 
 Extra products can add a header tab **without** forking the dashboard or merging into the Grok ledgers.
+
+The Windows installer includes the three built-in sources. WaifuOS appears as
+an extra tab when the local connector is discovered through one of the locations
+below. The bundled Python runtime is isolated, so an editable install in a
+development environment is visible only when running Metryx from that environment.
 
 ## Contract
 

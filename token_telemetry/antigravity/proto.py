@@ -166,7 +166,7 @@ def step_indices(buf: bytes) -> list[int]:
 
 
 def parse_generation(buf: bytes) -> Optional[dict[str, object]]:
-    """One gen_metadata.data row. Chat model is field 1, usage is its field 4."""
+    """One gen_metadata.data row. Keep the provider ID alongside the UI label."""
     chat = _sub(buf, 1)
     if not chat:
         return None
@@ -178,6 +178,7 @@ def parse_generation(buf: bytes) -> Optional[dict[str, object]]:
     model_id = _string_field(chat, 19)
     return {
         "model": label or model_id,
+        "model_id": model_id,
         "usage": usage,
         "steps": step_indices(buf),
     }

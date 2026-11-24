@@ -50,18 +50,29 @@ const RATE_CARD_47 = [
   { in: 2, cached: 0.5, out: 6 },
   { in: 4, cached: 1.0, out: 12 },
 ];
+const RATE_CARD_47_FAST = [
+  { in: 4, cached: 1, out: 12 },
+  { in: 6, cached: 1.5, out: 18 },
+];
+const RATE_CARD_BUILD_01 = [
+  { in: 1, cached: 0.2, out: 2 },
+  { in: 2, cached: 0.4, out: 4 },
+];
 const RATE_CARD_ALL = [...RATE_CARD_45, ...RATE_CARD_46];
 /** Component $/M and absolute $ session match — do not force-snap beyond this. */
 const RATE_SNAP_EPS = 0.02;
 
 function normalizeModelFamily(raw) {
-  const s = String(raw || "").toLowerCase().replace(/_/g, "-");
+  const s = String(raw || "").trim().toLowerCase().replace(/[ _]/g, "-");
   if (!s) return null;
   if (s.includes("4.20") || s.includes("4-20")) return "grok-4.20";
-  if (s.includes("4.7") || s.includes("4-7")) return "grok-4.7";
+  if (s.includes("4.7") || s.includes("4-7")) {
+    return s.split("-").includes("fast") ? "grok-4.7-fast" : "grok-4.7";
+  }
   if (s.includes("4.6") || s.includes("4-6")) return "grok-4.6";
   if (s.includes("4.5") || s.includes("4-5")) return "grok-4.5";
   if (s.includes("4.3") || s.includes("4-3")) return "grok-4.3";
+  if (s.includes("grok-build-0.1") || s.includes("grok-build-0-1")) return "grok-build-0.1";
   return null;
 }
 
@@ -69,6 +80,8 @@ function normalizeModelFamily(raw) {
 function rateCardsForModel(model) {
   const fam = normalizeModelFamily(model);
   if (fam === "grok-4.20" || fam === "grok-4.3") return RATE_CARD_420;
+  if (fam === "grok-4.7-fast") return RATE_CARD_47_FAST;
+  if (fam === "grok-build-0.1") return RATE_CARD_BUILD_01;
   if (fam === "grok-4.7") return RATE_CARD_47;
   if (fam === "grok-4.6") return RATE_CARD_46;
   if (fam === "grok-4.5") return RATE_CARD_45;

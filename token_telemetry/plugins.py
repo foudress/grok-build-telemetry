@@ -299,7 +299,7 @@ def builtin_sources() -> list[dict[str, Any]]:
         {
             "id": "grok",
             "label": "Grok Build",
-            "title": "Grok Build Telemetry",
+            "title": "Metryx — Grok Build",
             "api_prefix": "/api",
             "builtin": True,
             "context_cliff": 200_000,
@@ -307,7 +307,7 @@ def builtin_sources() -> list[dict[str, Any]]:
         {
             "id": "codex",
             "label": "Codex",
-            "title": "Codex Telemetry",
+            "title": "Metryx — Codex",
             "api_prefix": "/api/codex",
             "builtin": True,
             "context_cliff": 272_000,
@@ -315,7 +315,7 @@ def builtin_sources() -> list[dict[str, Any]]:
         {
             "id": "antigravity",
             "label": "Antigravity",
-            "title": "Antigravity Telemetry",
+            "title": "Metryx — Antigravity",
             "api_prefix": "/api/antigravity",
             "builtin": True,
             "context_cliff": 0,

@@ -163,8 +163,12 @@ def build_aggregate(
         except TypeError:
             try:
                 on_progress(done, total)
+            except BrokenPipeError:
+                raise
             except Exception:
                 pass
+        except BrokenPipeError:
+            raise
         except Exception:
             pass
 

@@ -1,12 +1,12 @@
 [package]
-name = "token-telemetry-desktop"
-version = "1.5.2"
-description = "Windows shell for the Token Telemetry dashboard"
+name = "metryx-desktop"
+version = "1.5.3"
+description = "Windows shell for the Metryx dashboard"
 edition = "2021"
 publish = false
 
 [[bin]]
-name = "token-telemetry"
+name = "metryx"
 path = "src/main.rs"
 
 [build-dependencies]

@@ -100,6 +100,18 @@ RATES_BY_FAMILY: dict[str, dict[str, Any]] = {
             "cached_input": 1.0,
         },
     },
+    "grok-4.7-fast": {
+        "family": "grok-4.7-fast",
+        "label": "Grok 4.7 Fast",
+        "low": {"name": "≤200k", "input": 4.0, "output": 12.0, "cached_input": 1.0},
+        "high": {"name": ">200k", "input": 6.0, "output": 18.0, "cached_input": 1.5},
+    },
+    "grok-build-0.1": {
+        "family": "grok-build-0.1",
+        "label": "Grok Build 0.1",
+        "low": {"name": "≤200k", "input": 1.0, "output": 2.0, "cached_input": 0.2},
+        "high": {"name": ">200k", "input": 2.0, "output": 4.0, "cached_input": 0.4},
+    },
 }
 
 # Back-compat aliases = grok-4.5 list (historical default)
@@ -138,13 +150,15 @@ def normalize_model_id(raw: Any) -> Optional[str]:
     if "4.20" in s or "4-20" in s:
         return "grok-4.20"
     if "4.7" in s or "4-7" in s:
-        return "grok-4.7"
+        return "grok-4.7-fast" if "fast" in s.split("-") else "grok-4.7"
     if "4.6" in s or "4-6" in s:
         return "grok-4.6"
     if "4.5" in s or "4-5" in s:
         return "grok-4.5"
     if "4.3" in s or "4-3" in s:
         return "grok-4.3"
+    if "grok-build-0.1" in s or "grok-build-0-1" in s:
+        return "grok-build-0.1"
     return None
 
 
@@ -240,7 +254,7 @@ def pricing_payload(
         "Session estimate = sum of full per-turn API bills "
         "(R1 api_total includes System; white R1 total stays peeled)",
         "Compact $ = pre-read full ctx + reload tools/system",
-        f"Rates: {pack['label']} (docs.x.ai); cache is the only 4.5↔4.6 delta",
+        f"Rates: {pack['label']} (docs.x.ai)",
     ]
     if mixed:
         notes.append(

@@ -7,6 +7,7 @@ import {
 assert.equal(normalizeModelFamily("grok-4.20"), "grok-4.20");
 assert.equal(normalizeModelFamily("grok-4.3"), "grok-4.3");
 assert.equal(normalizeModelFamily("grok-4.7"), "grok-4.7");
+assert.equal(normalizeModelFamily("Grok 4.7 Fast"), "grok-4.7-fast");
 assert.equal(normalizeModelFamily("grok-4.6"), "grok-4.6");
 assert.equal(normalizeModelFamily("grok-4.5"), "grok-4.5");
 
@@ -24,6 +25,10 @@ assert.equal(card43.cached, 0.2);
 const card47 = implyOfficialRatesPerM(8.5, tok, { model: "grok-4.7" });
 assert.equal(card47.snapped, true);
 assert.equal(card47.cached, 0.5);
+
+const card47Fast = implyOfficialRatesPerM(25.5, tok, { model: "grok-4.7-fast" });
+assert.equal(card47Fast.snapped, true);
+assert.deepEqual([card47Fast.in, card47Fast.cached, card47Fast.out], [6, 1.5, 18]);
 
 const card47near45 = implyOfficialRatesPerM(8.3, tok, { model: "grok-4.7" });
 assert.notEqual(card47near45.cached, 0.3);

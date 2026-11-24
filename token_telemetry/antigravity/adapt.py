@@ -2,8 +2,8 @@
 
 Call rows use the Codex field meanings: ``input_tokens`` is the full prompt
 (uncached plus cache read), and ``reasoning_output_tokens`` sits inside
-``output_tokens``. ``official_usd`` stays 0. ``estimate_usd`` is the Gemini
-API standard list price. The conversation logs store no dollar amount.
+``output_tokens``. ``official_usd`` stays 0. ``estimate_usd`` uses published
+API rates for the observed models. The conversation logs store no dollar amount.
 """
 
 from __future__ import annotations
@@ -16,16 +16,15 @@ from token_telemetry.codex.adapt import build_period as _codex_period
 from token_telemetry.codex.adapt import sessions_for_ui, state_for as _codex_state
 
 _PRICE_NOTE = (
-    "Estimate uses Gemini API standard list prices "
-    "(ai.google.dev/gemini-api/docs/pricing). "
-    "Cached input uses the published context-caching rate. "
+    "Estimates use public Google and Anthropic API list prices. "
+    "Premium rates apply to explicitly identified Priority or supported Fast calls. "
     "Thinking tokens are included in output. "
-    "There is no long-context surcharge on these models. "
+    "Gemini 3.1 Pro has a long-context tier. Claude cache writes use the 5-minute rate. "
     "Gemini 4 Argon and Carbon use the introductory rate through 30 Nov 2026. "
     "Gemini 3.8 Flash uses its introductory rate through 31 Dec 2026. "
-    "The Hydrogen worker inside Orchestrator is priced as Gemini 4 Hydrogen. "
-    "An Antigravity plan may bill quota instead of this list. "
-    "The local logs do not include a dollar amount from the API."
+    "Orchestrator uses the actual model per call when available. "
+    "GPT-OSS 120B and calls without a published rate retain their token counts and are excluded from the estimate. "
+    "Antigravity subscriptions may use quota; the local logs contain no invoice amount."
 )
 
 

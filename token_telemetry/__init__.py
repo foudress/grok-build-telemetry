@@ -1,3 +1,3 @@
-"""Grok Build token telemetry — live cost/context companion dashboard."""
+"""Metryx token telemetry for Grok Build, Codex, and Antigravity."""
 
 __version__ = "1.5.2"

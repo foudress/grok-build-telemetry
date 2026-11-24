@@ -8,6 +8,7 @@ Line tokens are a split of that call's ``usage``, not a second ledger.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
@@ -146,6 +147,17 @@ def _ev_chars(ev: Any) -> int:
         return 0
 
 
+def _call_bill(call, price, unc, cached, out):
+    prompt = call.get("input_tokens")
+    return price(
+        call.get("billing_model") or call.get("model"),
+        uncached=unc, cached=cached, output=out,
+        cache_write=_int(call.get("cache_write_input_tokens")),
+        prompt=_int(prompt) if prompt is not None else unc + cached,
+        when=call.get("t"), service_tier=call.get("service_tier"),
+    )
+
+
 def _annotate(
     calls: list[dict[str, Any]],
     *,
@@ -160,20 +172,11 @@ def _annotate(
         prompt = _int(call.get("input_tokens")) or (unc + cached)
         out = _int(call.get("output_tokens"))
         reason = _int(call.get("reasoning_output_tokens"))
-        write = _int(call.get("cache_write_input_tokens"))
         if prev_prompt and cached + _MISS_SLACK < prev_prompt:
             miss = min(unc, prev_prompt - cached)
         else:
             miss = 0
-        bill = price(
-            call.get("model"),
-            uncached=unc,
-            cached=cached,
-            output=out,
-            cache_write=write,
-            prompt=prompt,
-            when=call.get("t"),
-        )
+        bill = _call_bill(call, price, unc, cached, out)
         notes.append({
             "miss": miss,
             "new": max(0, unc - miss),
@@ -883,9 +886,10 @@ def state_for(
             "assumed": False,
             "mixed": len(set(priced)) > 1,
             "note": (
-                "Estimate uses OpenAI standard API list prices "
+                "Estimate uses OpenAI API list prices "
                 "(developers.openai.com/api/docs/pricing). "
                 "Context above 272k uses the published long-context rates. "
+                "Fast and Ultrafast apply when the call identifies that tier. "
                 "codex-auto-review is priced as gpt-5.6-luna. "
                 "A Codex subscription may not bill these calls."
             ),
@@ -916,29 +920,17 @@ def _acc() -> dict[str, float]:
 
 def _add_call(
     acc: dict[str, float],
-    call: dict[str, Any],
-    *,
-    price: Callable[..., dict[str, Any]] = price_usage,
+    unc: int,
+    cached: int,
+    out: int,
+    reason: int,
+    bill: dict[str, Any],
 ) -> None:
-    unc = _int(call.get("uncached_input_tokens"))
-    cached = _int(call.get("cached_input_tokens"))
-    out = _int(call.get("output_tokens"))
-    reason = _int(call.get("reasoning_output_tokens"))
     acc["tokens_in"] += unc
     acc["tokens_cached"] += cached
     acc["tokens_out"] += out
     acc["tokens_reason"] += reason
     acc["turns"] += 1
-    prompt = _int(call.get("input_tokens")) or (unc + cached)
-    bill = price(
-        call.get("model"),
-        uncached=unc,
-        cached=cached,
-        output=out,
-        cache_write=_int(call.get("cache_write_input_tokens")),
-        prompt=prompt,
-        when=call.get("t"),
-    )
     acc["cost_in_usd"] += bill["in"]
     acc["cost_cached_usd"] += bill["cached"]
     acc["cost_out_usd"] += bill["out"]
@@ -991,10 +983,6 @@ def _cats_from_acc(acc: dict[str, float], *, tools: bool) -> list[dict[str, Any]
     return [r for r in rows if r["tok"] > 0]
 
 
-def _in_window(ep: Optional[float], start: float, end: float) -> bool:
-    return ep is not None and start <= ep < end
-
-
 def build_period(
     snapshot: dict[str, Any],
     *,
@@ -1018,7 +1006,9 @@ def build_period(
     start_e, end_e = start.timestamp(), end.timestamp()
     specs = _bucket_specs(period, start, end, grain, billing=use_billing)
     session_grain = grain == "session"
-    buckets = [{**s, **_acc(), "_parts": _acc(), "_tools": _acc()} for s in specs]
+    buckets = [{**s, **_acc()} for s in specs]
+    bucket_starts = [b["start_epoch"] for b in buckets]
+    totals = _acc()
 
     threads = _threads(snapshot)
     kids = _children(threads)
@@ -1026,15 +1016,34 @@ def build_period(
     roots = [t for t in threads if str(t["id"]) not in child_ids]
     roots.sort(key=lambda t: _epoch(t.get("started")) or _epoch(t.get("updated")) or 0)
 
-    def calls_in(thread: dict[str, Any]) -> list[dict[str, Any]]:
-        out = []
+    def calls_in(thread: dict[str, Any]) -> list[tuple[dict[str, Any], float]]:
+        calls = []
         for call in _calls(thread):
-            if _in_window(_epoch(call.get("t")), start_e, end_e):
-                out.append(call)
-        return out
+            epoch = _epoch(call.get("t"))
+            if epoch is not None and start_e <= epoch < end_e:
+                calls.append((call, epoch))
+        return calls
+
+    def period_session(thread, calls, **row):
+        acc = _acc()
+        first = last = None
+        for call, epoch in calls:
+            unc = _int(call.get("uncached_input_tokens"))
+            cached = _int(call.get("cached_input_tokens"))
+            out = _int(call.get("output_tokens"))
+            reason = _int(call.get("reasoning_output_tokens"))
+            bill = _call_bill(call, price, unc, cached, out)
+            _add_call(acc, unc, cached, out, reason, bill)
+            _add_call(totals, unc, cached, out, reason, bill)
+            if buckets and not session_grain:
+                pos = bisect_right(bucket_starts, epoch) - 1
+                if pos >= 0 and epoch < buckets[pos]["end_epoch"]:
+                    _add_call(buckets[pos], unc, cached, out, reason, bill)
+            first = epoch if first is None else min(first, epoch)
+            last = epoch if last is None else max(last, epoch)
+        return _period_session(thread, [call for call, _ in calls], acc, first, last, **row)
 
     sessions: list[dict[str, Any]] = []
-    totals = _acc()
     n_parent = 0
     for root in roots:
         root_calls = calls_in(root)
@@ -1046,24 +1055,18 @@ def build_period(
         if not root_calls and not child_rows:
             continue
         n_parent += 1
-        sessions.append(_period_session(
-            root, root_calls, n=n_parent, depth=0, child_n=None, price=price,
-        ))
-        for acc_calls in (root_calls,):
-            _fold_calls(acc_calls, totals, buckets, session_grain, price=price)
+        sessions.append(period_session(root, root_calls, n=n_parent, depth=0, child_n=None))
         for i, (child, cc) in enumerate(child_rows, start=1):
             sessions.append(
-                _period_session(
+                period_session(
                     child,
                     cc,
                     n=n_parent,
                     depth=1,
                     child_n=i,
                     parent_id=str(root["id"]),
-                    price=price,
                 )
             )
-            _fold_calls(cc, totals, buckets, session_grain, price=price)
 
     if session_grain:
         buckets_out = []
@@ -1087,16 +1090,14 @@ def build_period(
     else:
         buckets_out = []
         for b in buckets:
-            parts_acc = b.pop("_parts")
-            tools_acc = b.pop("_tools")
             buckets_out.append({
                 "key": b["key"],
                 "label": b["label"],
                 "start_epoch": b.get("start_epoch"),
                 "end_epoch": b.get("end_epoch"),
                 **_public_acc(b),
-                "parts": _cats_from_acc(parts_acc, tools=False),
-                "tools": _cats_from_acc(tools_acc, tools=True),
+                "parts": _cats_from_acc(b, tools=False),
+                "tools": _cats_from_acc(b, tools=True),
             })
 
     return {
@@ -1123,51 +1124,18 @@ def build_period(
     }
 
 
-def _fold_calls(
-    calls: list[dict[str, Any]],
-    totals: dict[str, float],
-    buckets: list[dict[str, Any]],
-    session_grain: bool,
-    *,
-    price: Callable[..., dict[str, Any]] = price_usage,
-) -> None:
-    for call in calls:
-        _add_call(totals, call, price=price)
-        if session_grain:
-            continue
-        ep = _epoch(call.get("t"))
-        if ep is None:
-            continue
-        for bucket in buckets:
-            if bucket["start_epoch"] <= ep < bucket["end_epoch"]:
-                _add_call(bucket, call, price=price)
-                _add_call(bucket["_parts"], call, price=price)
-                _add_call(bucket["_tools"], call, price=price)
-                break
-
-
 def _period_session(
     thread: dict[str, Any],
     calls: list[dict[str, Any]],
+    acc: dict[str, float],
+    first: Optional[float],
+    last: Optional[float],
     *,
     n: int,
     depth: int,
     child_n: Optional[int],
     parent_id: Optional[str] = None,
-    price: Callable[..., dict[str, Any]] = price_usage,
 ) -> dict[str, Any]:
-    acc = _acc()
-    first = None
-    last = None
-    for call in calls:
-        _add_call(acc, call, price=price)
-        ep = _epoch(call.get("t"))
-        if ep is None:
-            continue
-        if first is None or ep < first:
-            first = ep
-        if last is None or ep > last:
-            last = ep
     title = str(thread.get("title") or thread["id"])
     kind = "subagent" if depth else "main"
     label = f"Sub Agent {child_n}" if depth and child_n else f"Session {n}"

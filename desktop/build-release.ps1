@@ -72,9 +72,9 @@ finally {
     Pop-Location
 }
 
-$setup = Join-Path $tauri "target/$target/release/bundle/nsis/Token Telemetry_${version}_x64-setup.exe"
+$setup = Join-Path $tauri "target/$target/release/bundle/nsis/Metryx_${version}_x64-setup.exe"
 $dist = Join-Path $repo "dist"
 New-Item -ItemType Directory -Path $dist -Force | Out-Null
-$output = Join-Path $dist "Token-Telemetry-v$version-windows-x64-setup.exe"
+$output = Join-Path $dist "Metryx-v$version-windows-x64-setup.exe"
 Copy-Item -LiteralPath $setup -Destination $output -Force
 Write-Output $output

@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping improve **Grok Build Telemetry** (`token-telemetry`).
+Thanks for helping improve **Metryx**.
 
 ## Setup
 

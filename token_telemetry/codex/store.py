@@ -54,6 +54,7 @@ _cache: dict[str, tuple[str, dict[str, Any], bytes, str]] = {}
 _file_cache: dict[str, tuple[int, int, dict[str, Any]]] = {}
 # home -> (stat fingerprint, catalog rows)
 _catalog_cache: dict[str, tuple[str, list[dict[str, Any]]]] = {}
+_header_cache: dict[Path, tuple[int, int, dict[str, str]]] = {}
 # home -> ((fingerprint, focus id), merged snapshot)
 _focus_cache: dict[str, tuple[tuple[str, str], dict[str, Any]]] = {}
 # (home, fingerprint, focus id) while that parent's children are parsing
@@ -73,6 +74,7 @@ def clear_cache() -> None:
         _cache.clear()
         _file_cache.clear()
         _catalog_cache.clear()
+        _header_cache.clear()
         _focus_cache.clear()
         _focus_jobs.clear()
 
@@ -593,8 +595,9 @@ def _parse_file(path: Path) -> dict[str, Any]:
     window = 0
     current_model = ""
     current_effort = ""
+    current_tier = ""
     current_turn = ""
-    by_turn: dict[str, tuple[str, str]] = {}
+    by_turn: dict[str, tuple[str, str, str]] = {}
     calls: list[dict[str, Any]] = []
     fallback: list[dict[str, Any]] = []
     llm_buf: list[dict[str, str]] = []
@@ -670,10 +673,12 @@ def _parse_file(path: Path) -> dict[str, Any]:
                 current_model = model
             if isinstance(effort, str) and effort:
                 current_effort = effort
+            tier = payload.get("service_tier")
+            current_tier = tier if isinstance(tier, str) else ""
             turn_id = payload.get("turn_id")
             if isinstance(turn_id, str) and turn_id:
                 current_turn = turn_id
-                by_turn[turn_id] = (current_model, current_effort)
+                by_turn[turn_id] = (current_model, current_effort, current_tier)
             continue
 
         if kind == "token_usage_record":
@@ -683,7 +688,10 @@ def _parse_file(path: Path) -> dict[str, Any]:
             turn_id = payload.get("turn_id") if isinstance(payload.get("turn_id"), str) else ""
             if turn_id:
                 current_turn = turn_id
-            model, effort = by_turn.get(turn_id, (current_model, current_effort))
+            model, effort, tier = by_turn.get(
+                turn_id, (current_model, current_effort, current_tier)
+            )
+            call_tier = payload.get("service_tier")
             response_id = payload.get("response_id")
             call = {
                 "t": ts,
@@ -691,6 +699,7 @@ def _parse_file(path: Path) -> dict[str, Any]:
                 "response_id": response_id if isinstance(response_id, str) else "",
                 "model": model,
                 "effort": effort,
+                "service_tier": call_tier if isinstance(call_tier, str) and call_tier else tier,
                 "usage": usage,
             }
             _seal(call)
@@ -721,6 +730,7 @@ def _parse_file(path: Path) -> dict[str, Any]:
                 "response_id": "",
                 "model": current_model,
                 "effort": current_effort,
+                "service_tier": current_tier,
                 "usage": usage,
             }
             _seal(call)
@@ -749,21 +759,14 @@ def _project_name(cwd: str) -> str:
 
 
 def _fingerprint(home: Path) -> str:
-    parts: list[str] = []
-    sessions = home / "sessions"
-    index = home / "session_index.jsonl"
-    if index.is_file():
-        st = index.stat()
-        parts.append(f"index:{st.st_mtime_ns}:{st.st_size}")
-    if sessions.is_dir():
-        for path in sorted(sessions.rglob("*")):
-            if not path.is_file():
-                continue
-            if path.name.endswith(".jsonl") or path.name.endswith(".jsonl.zst"):
-                st = path.stat()
-                parts.append(f"{path.name}:{st.st_mtime_ns}:{st.st_size}")
+    parts = [f"{path}:{st.st_mtime_ns}:{st.st_size}" for path, st in _catalog_files(home)]
     parts.append("zstd" if _zstd_mod() is not None else "nozstd")
     return hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def source_revision(home: Optional[Path] = None) -> str:
+    root = Path(home) if home is not None else codex_home()
+    return _fingerprint(root) if root.is_dir() else "missing"
 
 
 def _empty(note: str, *, zst_skipped: int = 0) -> dict[str, Any]:
@@ -990,6 +993,7 @@ def build_snapshot(
                     "turn_id": call["turn_id"],
                     "model": call["model"],
                     "effort": call["effort"],
+                    "service_tier": call["service_tier"],
                     "detail": list(call.get("detail") or []),
                     "harness": list(call.get("harness") or []),
                     "user_preview": call.get("user_preview") or "",
@@ -1094,16 +1098,17 @@ def _load(
 ) -> tuple[dict[str, Any], bytes, str]:
     root = Path(home) if home is not None else codex_home()
     key = str(root.resolve()) if root.exists() else str(root)
-    fp = _fingerprint(root) if root.is_dir() else "missing"
+    fp = source_revision(root)
     with _lock:
         hit = _cache.get(key)
-        if hit and hit[0] == fp:
-            if on_progress is not None:
-                files = hit[1].get("files") if isinstance(hit[1], dict) else {}
-                n = int((files or {}).get("jsonl") or 0) + int((files or {}).get("zst") or 0)
-                on_progress(n or 1, n or 1, 0)
-            return hit[1], hit[2], hit[3]
+    if hit and hit[0] == fp:
+        if on_progress is not None:
+            files = hit[1].get("files") or {}
+            n = int(files.get("jsonl") or 0) + int(files.get("zst") or 0)
+            on_progress(n or 1, n or 1, 0)
+        return hit[1], hit[2], hit[3]
     payload = build_snapshot(root, pause_s=pause_s, on_progress=on_progress)
+    payload["source_revision"] = fp
     body = json.dumps(_slim(payload), ensure_ascii=False, separators=(",", ":")).encode(
         "utf-8"
     )
@@ -1212,16 +1217,18 @@ def catalog_rows(home: Optional[Path] = None) -> list[dict[str, Any]]:
     return rows
 
 
-def _catalog(home: Path) -> tuple[str, list[dict[str, Any]]]:
-    specs: list[tuple[Path, os.stat_result]] = []
-    parts: list[str] = []
-    for path in _rollout_paths(home):
+def _catalog_files(home: Path):
+    paths = [home / "session_index.jsonl", *sorted(_rollout_paths(home))]
+    for path in paths:
         try:
-            st = path.stat()
+            yield path, path.stat()
         except OSError:
             continue
-        specs.append((path, st))
-        parts.append(f"{path}:{st.st_mtime_ns}:{st.st_size}")
+
+
+def _catalog(home: Path) -> tuple[str, list[dict[str, Any]]]:
+    specs = list(_catalog_files(home))
+    parts = [f"{path}:{st.st_mtime_ns}:{st.st_size}" for path, st in specs]
     fp = hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
     key = str(home.resolve()) if home.exists() else str(home)
     with _lock:
@@ -1231,7 +1238,15 @@ def _catalog(home: Path) -> tuple[str, list[dict[str, Any]]]:
     titles = _titles(home / "session_index.jsonl")
     by_id: dict[str, dict[str, Any]] = {}
     for path, st in specs:
-        header = _header(path)
+        if path == home / "session_index.jsonl":
+            continue
+        stamp = (st.st_mtime_ns, st.st_size)
+        cached = _header_cache.get(path)
+        if cached and cached[:2] == stamp:
+            header = cached[2]
+        else:
+            header = _header(path)
+            _header_cache[path] = (*stamp, header)
         tid = header["id"]
         row = by_id.get(tid)
         if row is None:

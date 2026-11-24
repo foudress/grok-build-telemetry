@@ -1,12 +1,12 @@
-# Grok Build Telemetry
+# Metryx
 
-Live companion dashboard for **[Grok Build](https://x.ai)** sessions: exact token fields Grok already writes, cache vs uncached split, official `$` ticks, and list-price estimates — outside the TUI.
+Local telemetry dashboard for **Grok Build**, **Codex**, and **Antigravity**. Explore sessions, context, token usage, cache and published-rate estimates. Grok Build also exposes the official cost recorded in its session logs.
 
-> Package: `token-telemetry` **v1.5.2** (`pip install -e .` / `token-telemetry` CLI).
+> Package: `metryx` **v1.5.3** (`pip install -e .` / `metryx` CLI).
 
 ## Windows desktop app
 
-Download the [Windows x64 setup executable](https://github.com/foudress/grok-build-telemetry/releases/latest) and run it. The installer includes Python, the dashboard and the offline tokenizer. Launch **Token Telemetry** from the Start menu.
+Download the [Windows x64 setup executable](https://github.com/foudress/grok-build-telemetry/releases/latest) and run it. The installer includes Python, the dashboard and the offline tokenizer. Launch **Metryx** from the Start menu.
 
 ```
 ~/.grok/sessions/.../updates.jsonl  ──tail──►  live dashboard  ──►  http://127.0.0.1:8765/

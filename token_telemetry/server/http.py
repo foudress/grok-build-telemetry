@@ -150,6 +150,10 @@ class Handler(BaseHTTPRequestHandler):
         except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError):
             return False
 
+    def _sse_progress(self, done: int, total: int, cold: int = 0) -> None:
+        if not self._sse_write("progress", {"done": int(done), "total": int(total), "cold": int(cold)}):
+            raise BrokenPipeError("aggregate client disconnected")
+
     def _stream_aggregate(
         self,
         period: str,
@@ -174,17 +178,6 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.close_connection = True
 
-        alive = True
-
-        def on_progress(done: int, total: int, cold: int = 0) -> None:
-            nonlocal alive
-            if not alive:
-                return
-            alive = self._sse_write(
-                "progress",
-                {"done": int(done), "total": int(total), "cold": int(cold)},
-            )
-
         try:
             payload = build_aggregate(
                 period,
@@ -193,19 +186,15 @@ class Handler(BaseHTTPRequestHandler):
                 stack=stack,
                 rate=rate,
                 billing=billing,
-                on_progress=on_progress,
+                on_progress=self._sse_progress,
             )
-        except Exception as exc:  # noqa: BLE001
-            if alive:
-                self._sse_write("error", {"error": f"{type(exc).__name__}: {exc}"})
+            if isinstance(payload, dict):
+                payload = {**payload, **cache_meta()}
+            self._sse_write("result", payload)
+        except BrokenPipeError:
             return
-        if alive:
-            try:
-                if isinstance(payload, dict):
-                    payload = {**payload, **cache_meta()}
-                self._sse_write("result", payload)
-            except Exception as exc:  # noqa: BLE001
-                self._sse_write("error", {"error": f"{type(exc).__name__}: {exc}"})
+        except Exception as exc:  # noqa: BLE001
+            self._sse_write("error", {"error": f"{type(exc).__name__}: {exc}"})
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         self._send(204, b"", "text/plain")
@@ -495,17 +484,6 @@ class Handler(BaseHTTPRequestHandler):
         except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError):
             return
         self.close_connection = True
-        alive = True
-
-        def on_progress(done: int, total: int, cold: int = 0) -> None:
-            nonlocal alive
-            if not alive:
-                return
-            alive = self._sse_write(
-                "progress",
-                {"done": int(done), "total": int(total), "cold": int(cold)},
-            )
-
         try:
             payload = _connector_aggregate(
                 feed,
@@ -513,14 +491,14 @@ class Handler(BaseHTTPRequestHandler):
                 offset,
                 grain,
                 billing=billing,
-                on_progress=on_progress,
+                on_progress=self._sse_progress,
             )
-        except Exception as exc:  # noqa: BLE001
-            if alive:
-                self._sse_write("error", {"error": f"{type(exc).__name__}: {exc}"})
+        except BrokenPipeError:
             return
-        if alive:
-            self._sse_write("result", payload)
+        except Exception as exc:  # noqa: BLE001
+            self._sse_write("error", {"error": f"{type(exc).__name__}: {exc}"})
+            return
+        self._sse_write("result", payload)
 
     def _read_json_body(self) -> Optional[dict[str, Any]]:
         try:

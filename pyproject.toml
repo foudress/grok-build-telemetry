@@ -3,13 +3,13 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "token-telemetry"
-version = "1.5.2"
+name = "metryx"
+version = "1.5.3"
 description = "Live companion dashboard for Grok Build, Codex, and Antigravity token usage, cache, and cost"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
-authors = [{ name = "token-telemetry contributors" }]
+authors = [{ name = "Metryx contributors" }]
 keywords = ["grok", "xai", "codex", "openai", "antigravity", "gemini", "tokens", "telemetry", "dashboard", "cost"]
 classifiers = [
   "Development Status :: 4 - Beta",
@@ -31,6 +31,7 @@ dependencies = [
 ]
 
 [project.scripts]
+metryx = "token_telemetry.__main__:main"
 token-telemetry = "token_telemetry.__main__:main"
 
 [project.urls]

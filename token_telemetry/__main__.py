@@ -1,4 +1,4 @@
-"""CLI entry: ``python -m token_telemetry`` or ``token-telemetry``."""
+"""CLI entry for ``metryx`` and ``python -m token_telemetry``."""
 
 from __future__ import annotations
 

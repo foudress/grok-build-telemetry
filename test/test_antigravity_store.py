@@ -1,13 +1,14 @@
 """Antigravity reads gen_metadata counts. Cache read is not inside input."""
 
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
 from token_telemetry.antigravity.adapt import build_period, state_for
 from token_telemetry.antigravity.prices import price_usage, priced_model
 from token_telemetry.antigravity.proto import parse_usage
-from token_telemetry.antigravity.store import clear_cache, load_snapshot
+from token_telemetry.antigravity.store import clear_cache, focused_snapshot, load_snapshot
 
 
 def _list(uncached: int, cached: int, output: int) -> float:
@@ -202,6 +203,41 @@ def test_public_model_rates() -> None:
     assert early["total"] == 12.0
     assert late["total"] == 24.0
     assert price_usage("not-a-model", uncached=10, cached=0, output=1)["priced"] is False
+
+
+def test_orchestrator_prices_the_observed_model_and_wal_updates_the_snapshot(tmp_path: Path) -> None:
+    root = _home(tmp_path)
+    db = root / "conversations/root-cascade.db"
+    with closing(sqlite3.connect(db)) as writer:
+        writer.execute("PRAGMA journal_mode=WAL")
+        first = focused_snapshot(root, "root-cascade")
+        before = db.stat().st_mtime_ns
+        generation = _gen(
+            _usage(uncached=100, cached=50, output=20, thinking=0, visible=20, response="opus"),
+            model="claude-opus-5.5-fast", label="Orchestrator (Neon)",
+        )
+        writer.execute("INSERT INTO gen_metadata (idx, data) VALUES (?, ?)", (999, generation))
+        writer.commit()
+        assert db.stat().st_mtime_ns == before
+        refreshed = focused_snapshot(root, "root-cascade")
+        assert refreshed["n_calls"] == first["n_calls"] + 1
+        same_revision = focused_snapshot(root, "root-cascade")
+        assert refreshed is same_revision
+        state = state_for(refreshed, "root-cascade", pinned="root-cascade")
+        previous = state_for(first, "root-cascade", pinned="root-cascade")
+        delta = state["totals"]["estimate_usd"] - previous["totals"]["estimate_usd"]
+        assert abs(delta - (100 * 8 + 50 * 0.40 + 20 * 40) / 1_000_000) < 1e-12
+
+
+def test_antigravity_premium_and_unpriced_models() -> None:
+    usage = {"uncached": 100, "cached": 50, "output": 20}
+    assert price_usage("GPT-OSS 120B (Medium)", **usage)["priced"] is False
+    standard = price_usage("Gemini 4 Neon", **usage)
+    priority = price_usage("Gemini 4 Neon (Priority)", **usage)
+    assert abs(priority["total"] - standard["total"] * 1.8) < 1e-12
+    sonnet = price_usage("Claude Sonnet 5.5 Medium", cache_write=50, **usage)
+    assert sonnet["model"] == "claude-sonnet-5-5"
+    assert sonnet["write"] == 50 * 2.5 / 1_000_000
 
 
 def test_usage_keeps_cache_read_out_of_uncached() -> None:

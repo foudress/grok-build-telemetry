@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Near real-time Grok Build token/cost companion (outside the TUI).
+Metryx local dashboard for Grok Build, Codex, and Antigravity.
 
 Tails session updates.jsonl, polls signals.json + events.jsonl, applies
 published xAI rates, serves a local dashboard on http://127.0.0.1:8765/
@@ -60,7 +60,7 @@ from token_telemetry.server.http import (
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    ap = argparse.ArgumentParser(description="Grok token telemetry live dashboard")
+    ap = argparse.ArgumentParser(description="Metryx token telemetry dashboard")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--session-id", help="Pin to a session UUID")

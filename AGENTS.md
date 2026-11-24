@@ -1,6 +1,6 @@
-# token-telemetry
+# Metryx
 
-Grok Build token telemetry dashboard (ledgers must stay pixel-honest).
+Token telemetry dashboard for Grok Build, Codex, and Antigravity (ledgers must stay pixel-honest).
 Stack: Python 3.12 + static dashboard
 Live: `http://127.0.0.1:8765/` via `/telemetry` or `python launch_dashboard.py`
 

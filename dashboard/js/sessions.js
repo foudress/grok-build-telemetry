@@ -1,19 +1,13 @@
 /** Session picker + switch POST */
 import { $ } from './fmt.js';
 
-let _sessionSwitching = false;
+let _queuedSelection = null;
 let _lastSessionOptsKey = "";
 let _fullPickerLoaded = false;
 /** @type {null | (() => Promise<void>)} */
 let _pollRef = null;
 /** @type {null | Record<string, any>} */
 let _lastStateRef = null;
-
-function endViewLoad() {
-  document.body.classList.remove("is-loading");
-  const el = document.getElementById("viewLoader");
-  if (el) el.hidden = true;
-}
 
 export function bindPoll(fn) {
   _pollRef = fn;
@@ -264,62 +258,45 @@ function _optimisticPicker(sessionId) {
 
 async function switchSession(sessionId) {
   const want = _wantSid(sessionId);
-  _sessionSwitching = true;
-  window.__sessionSwitching = true;
+  _queuedSelection = { sid: want || null };
   window.__pendingSid = want || null;
   _optimisticPicker(sessionId);
-  // Force a fresh /api/state body after pin/follow change.
-  try { window.__clearStateEtag && window.__clearStateEtag(); } catch { /* ignore */ }
+  window.__clearStateEtag?.();
+  if (window.__sessionSwitching) return;
+
+  // POSTs change a shared server pin. Send them in order and skip intermediate clicks.
+  window.__sessionSwitching = true;
   try {
-    const r = await fetch("/api/session", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: sessionId || null }),
-    });
-    const res = await r.json();
-    if (!res.ok) {
-      console.warn("session switch failed", res);
-      $("liveBadge").textContent = "switch err";
-      $("liveBadge").className = "badge warn";
-      window.__pendingSid = null;
-      endViewLoad();
-      return;
-    }
-    // Prefer server-resolved id so pending checks match /api/state.
-    if (res.session_id) window.__pendingSid = String(res.session_id);
-    else if (!want) window.__pendingSid = null;
-    _lastSessionOptsKey = "";
-    if (_pollRef) {
-      // One body after the pin returns. Interval polls stay out until this
-      // settles — a queued poll that awaited the next one never reached here,
-      // so the loader stayed up and the picker stayed on "loading…".
-      window.__allowPollDuringSwitch = true;
+    while (_queuedSelection) {
+      const { sid } = _queuedSelection;
+      _queuedSelection = null;
       try {
-        await _pollRef();
-      } finally {
-        window.__allowPollDuringSwitch = false;
+        const r = await fetch("/api/session", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: sid }),
+          signal: AbortSignal.timeout(20000),
+        });
+        const res = await r.json();
+        if (!r.ok || !res.ok) throw new Error(res.error || "Could not select session");
+        if (_queuedSelection) continue;
+        window.__pendingSid = res.session_id || null;
+        _lastSessionOptsKey = "";
+      } catch (error) {
+        if (_queuedSelection) continue;
+        console.warn("Session switch failed", error);
+        window.__pendingSid = null;
+        const badge = $("liveBadge");
+        if (badge) {
+          badge.textContent = "switch err";
+          badge.className = "badge warn";
+        }
       }
     }
-    if (window.__pendingSid && _pollRef) {
-      window.__pendingSid = null;
-      try { window.__clearStateEtag && window.__clearStateEtag(); } catch { /* ignore */ }
-      window.__allowPollDuringSwitch = true;
-      try {
-        await _pollRef();
-      } finally {
-        window.__allowPollDuringSwitch = false;
-      }
-    }
-  } catch (e) {
-    console.warn(e);
-    window.__pendingSid = null;
   } finally {
-    _sessionSwitching = false;
     window.__sessionSwitching = false;
-    window.__allowPollDuringSwitch = false;
-    endViewLoad();
+    if (_pollRef) await _pollRef();
   }
 }
-
 
 export { fillSessionSelect, switchSession };

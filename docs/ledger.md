@@ -37,6 +37,21 @@ Zero is present (v1.5). Do not replace a real 0 with another ledger.
 - Codex cache-write rate 0.0 bills 0, not the input rate.
 - The >200k list rate follows each LLM call's `context_start`. Round `context_end` does not reprice the other calls. Header Cached tokens stay the official sum. Header Cached $ is each call's share at that call's tier, including the omitted last prefix.
 
+## System attribution across connectors
+
+Grok Build records the opening history and the context checkpoints needed for
+the System R1 identities above. Codex records per-call prompt and cache usage.
+Some rollouts also contain `session_meta.base_instructions`, a fragment of the
+effective prompt. Antigravity records per-call usage in `gen_metadata`, along with
+conversation steps. Neither trace supplies the billed size of the system and
+developer messages, tool definitions, or their split across the cache.
+
+For exact attribution, the connector would need the fully assembled first
+request with provider token counts by component and cache status. Measured
+system input could then populate the existing System card, with a separate
+unattributed balance whenever a component is missing. A count from locally
+visible instructions can be shown as an estimate, independent of the call totals.
+
 ## Canonical round fields
 
 ```

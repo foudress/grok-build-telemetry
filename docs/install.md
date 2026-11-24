@@ -1,4 +1,4 @@
-# Token Telemetry — install (Grok Build agent)
+# Metryx — install (Grok Build agent)
 
 **This file is the single install procedure (OS-independent).**  
 A user can paste only:

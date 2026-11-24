@@ -64,6 +64,10 @@ let _subTabClicksBound = false;
 function clearStateEtag() {
   _stateEtag = null;
   _paintedEtag = null;
+  _pollEpoch += 1;
+  _pollController?.abort();
+  _pollController = null;
+  _pollAgain = false;
 }
 window.__clearStateEtag = clearStateEtag;
 
@@ -971,9 +975,10 @@ function render(state) {
   return true;
 }
 
-let _pollBusy = false;
+let _pollController = null;
 let _pollEpoch = 0;
 let _pollAgain = false;
+let _pendingPickerEpoch = -1;
 /** ETag of a body this document has already drawn. Not sent before that. */
 let _paintedEtag = null;
 
@@ -984,25 +989,20 @@ function _pendingSid() {
 }
 
 async function poll() {
-  // Pin POST owns the first body. An interval poll during that POST used to
-  // take the only slot, then wait on the next poll before settling — the
-  // loader never cleared and the picker stayed on "loading…".
-  if (window.__sessionSwitching && !window.__allowPollDuringSwitch) {
+  if (window.__sessionSwitching && !isPeriodScope()) return;
+  if (_pollController) {
     _pollAgain = true;
     return;
   }
-  if (_pollBusy) {
-    _pollAgain = true;
-    return;
-  }
-  _pollBusy = true;
   const epoch = _pollEpoch;
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort("timeout"), 60000);
+  _pollController = ac;
+  const period = isPeriodScope();
+  const timer = period ? null : setTimeout(() => ac.abort("timeout"), 20000);
   try {
-    if (isPeriodScope()) {
+    if (period) {
       dropGraphForPeriod();
-      await fetchPeriod();
+      await fetchPeriod(ac.signal);
       return;
     }
     const pendingPre = _pendingSid();
@@ -1031,7 +1031,22 @@ async function poll() {
     if (epoch !== _pollEpoch) return;
     const pending = _pendingSid();
     const sid = state && state.session_id ? String(state.session_id) : "";
-    if (pending && sid.toLowerCase() !== pending.toLowerCase()) {
+    if (state.pending) {
+      render(state);
+      if (!window.__lastState && _pendingPickerEpoch !== epoch) {
+        _pendingPickerEpoch = epoch;
+        fetch("/api/sessions", { signal: AbortSignal.timeout(10000) })
+          .then((response) => response.ok ? response.json() : null)
+          .then((data) => {
+            if (data && epoch === _pollEpoch && !window.__lastState) {
+              fillSessionSelect({ ...data, session_id: data.current, pinned_session_id: data.pinned });
+            }
+          })
+          .catch(() => {});
+      }
+      return;
+    }
+    if (!state.error && pending && sid.toLowerCase() !== pending.toLowerCase()) {
       // Wrong session for this pin. Show its name in the picker, keep the
       // pending id, and do not remember the etag — the next body must be a 200.
       try { fillSessionSelect(state); } catch (e) { console.error(e); }
@@ -1044,7 +1059,7 @@ async function poll() {
       _paintedEtag = et;
       _stateEtag = et;
     }
-    if (!pending || (sid && sid.toLowerCase() === pending.toLowerCase())) {
+    if (painted) {
       window.__pendingSid = null;
     }
   } catch (e) {
@@ -1069,13 +1084,13 @@ async function poll() {
     );
   } finally {
     clearTimeout(timer);
-    _pollBusy = false;
-    if (epoch === _pollEpoch) endViewLoad();
-    // Schedule the follow-up. Do not await it: switchSession must settle
-    // when THIS body settles, even if the next /api/state is still running.
-    if (_pollAgain && epoch === _pollEpoch) {
-      _pollAgain = false;
-      setTimeout(poll, 50);
+    if (_pollController === ac) {
+      _pollController = null;
+      if (!_pollAgain) endViewLoad();
+      else {
+        _pollAgain = false;
+        setTimeout(poll, 50);
+      }
     }
   }
 }
@@ -1183,8 +1198,6 @@ $("cacheReset")?.addEventListener("click", async () => {
     await fetch("/api/cache/reset", { method: "POST" });
   } catch { /* ignore */ }
   clearStateEtag();
-  _pollEpoch += 1;
-  _pollBusy = false;
   try {
     await poll();
   } finally {

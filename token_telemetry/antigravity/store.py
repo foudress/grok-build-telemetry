@@ -18,11 +18,13 @@ import os
 import sqlite3
 import threading
 import time
+from bisect import bisect_left, bisect_right
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import unquote, urlparse
 
+from token_telemetry.antigravity.prices import priced_model
 from token_telemetry.antigravity.proto import (
     parse_aux,
     parse_generation,
@@ -48,7 +50,9 @@ _METRIC = (
 
 _lock = threading.Lock()
 _cache: dict[str, tuple[str, dict[str, Any]]] = {}
-_file_cache: dict[str, tuple[int, int, dict[str, Any]]] = {}
+_file_cache: dict[Path, tuple[tuple, dict[str, Any]]] = {}
+_focus_cache: dict[Path, tuple[tuple[str, Optional[str]], dict[str, Any]]] = {}
+_summary_cache: dict[Path, tuple[tuple, dict[str, dict[str, Any]]]] = {}
 
 
 def antigravity_home() -> Path:
@@ -62,6 +66,8 @@ def clear_cache() -> None:
     with _lock:
         _cache.clear()
         _file_cache.clear()
+        _focus_cache.clear()
+        _summary_cache.clear()
 
 
 def _connect(path: Path) -> sqlite3.Connection:
@@ -96,8 +102,12 @@ def _cwd(raw: str) -> str:
 
 def _summaries(root: Path) -> dict[str, dict[str, Any]]:
     path = root / "conversation_summaries.db"
-    if not path.is_file():
+    stamp = _db_stamp(path)
+    if not stamp:
         return {}
+    cached = _summary_cache.get(path)
+    if cached and cached[0] == stamp:
+        return cached[1]
     try:
         con = _connect(path)
     except sqlite3.Error:
@@ -122,6 +132,7 @@ def _summaries(root: Path) -> dict[str, dict[str, Any]]:
             "parent_id": parent if isinstance(parent, str) else "",
             "agent": agent if isinstance(agent, str) else "",
         }
+    _summary_cache[path] = (stamp, out)
     return out
 
 
@@ -271,12 +282,8 @@ def _load_steps(con: sqlite3.Connection) -> dict[int, dict[str, Any]]:
 
 
 def _turn_id(user_steps: list[int], planner: Optional[int]) -> str:
-    if planner is None:
-        return "start"
-    prev = [step for step in user_steps if step < planner]
-    if not prev:
-        return "start"
-    return str(prev[-1])
+    pos = bisect_left(user_steps, planner) if planner is not None else 0
+    return str(user_steps[pos - 1]) if pos else "start"
 
 
 def _detail_and_harness(
@@ -392,6 +399,7 @@ def _parse_db(
     except sqlite3.Error as exc:
         return _thread(cid, title, info, parent, mtime, calls, error=type(exc).__name__)
     try:
+        con.execute("BEGIN")
         gens = list(con.execute("SELECT idx, data FROM gen_metadata ORDER BY idx"))
         steps = _load_steps(con)
     except sqlite3.Error as exc:
@@ -419,23 +427,17 @@ def _parse_db(
         })
         covered.update(indices)
     parsed.sort(key=lambda row: (
-        row["planner"] if isinstance(row["planner"], int) else 10**9,
+        row["planner"] if isinstance(row["planner"], int) else float("inf"),
         row["idx"],
     ))
     user_steps = sorted(idx for idx, row in steps.items() if row["type"] == _USER)
-    bounds = [row["planner"] if isinstance(row["planner"], int) else None for row in parsed]
+    bounds = [row["planner"] for row in parsed if isinstance(row["planner"], int)]
     orphans: dict[int, list[int]] = {i: [] for i in range(len(parsed))}
     for step_id, row in steps.items():
         if step_id in covered or row["type"] == _USER:
             continue
-        owner = None
-        for i, bound in enumerate(bounds):
-            if not isinstance(bound, int):
-                continue
-            nxt = next((b for b in bounds[i + 1:] if isinstance(b, int)), None)
-            if bound <= step_id and (nxt is None or step_id < nxt):
-                owner = i
-        if owner is not None:
+        owner = bisect_right(bounds, step_id) - 1
+        if owner >= 0:
             orphans[owner].append(step_id)
     previews: dict[str, str] = {}
     for step_id in user_steps:
@@ -475,6 +477,14 @@ def _parse_db(
             gen_idx=planner if planner is not None else int(row["idx"]),
             compact_after=compact,
         )
+        model_id = gen.get("model_id")
+        if priced_model(model_id):
+            call["billing_model"] = model_id
+            label_words = str(gen.get("model") or "").lower().replace("-", " ").split()
+            if "priority" in label_words:
+                call["service_tier"] = "priority"
+            elif "fast" in label_words:
+                call["service_tier"] = "fast"
         key = str(call.get("response_id") or "") or f"gen-{row['idx']}"
         prev = seen.get(key)
         if prev is None:
@@ -540,40 +550,45 @@ def _thread(
     }
 
 
+def _db_stamp(path: Path) -> tuple[tuple[str, int, int], ...]:
+    stamps = []
+    for suffix in ("", "-wal"):
+        try:
+            st = path.with_name(path.name + suffix).stat()
+        except OSError:
+            continue
+        stamps.append((suffix, st.st_mtime_ns, st.st_size))
+    return tuple(stamps)
+
+
 def _parsed_file(
     path: Path,
     summary: Optional[dict[str, Any]],
     known: set[str],
 ) -> dict[str, Any]:
-    try:
-        st = path.stat()
-    except OSError:
+    stamp = _db_stamp(path)
+    if not stamp:
         return _parse_db(path, summary, known)
-    key = str(path)
-    hit = _file_cache.get(key)
-    if hit and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
-        return hit[2]
+    parent = _parent_id(str((summary or {}).get("parent_id") or ""), path.stem, known)
+    key = (stamp, summary, parent)
+    hit = _file_cache.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
     parsed = _parse_db(path, summary, known)
-    _file_cache[key] = (st.st_mtime_ns, st.st_size, parsed)
+    if not parsed.get("error"):
+        _file_cache[path] = (key, parsed)
     return parsed
 
 
 def _fingerprint(root: Path) -> str:
-    parts: list[str] = []
-    for path in _conversation_paths(root):
-        try:
-            st = path.stat()
-        except OSError:
-            continue
-        parts.append(f"{path.name}:{st.st_mtime_ns}:{st.st_size}")
-    summary = root / "conversation_summaries.db"
-    if summary.is_file():
-        try:
-            st = summary.stat()
-            parts.append(f"summaries:{st.st_mtime_ns}:{st.st_size}")
-        except OSError:
-            pass
+    paths = [root / "conversation_summaries.db", *_conversation_paths(root)]
+    parts = [f"{path.name}:{_db_stamp(path)}" for path in paths]
     return hashlib.sha1("\n".join(parts).encode()).hexdigest()
+
+
+def source_revision(home: Optional[Path] = None) -> str:
+    root = Path(home) if home is not None else antigravity_home()
+    return _fingerprint(root) if root.is_dir() else "missing"
 
 
 def catalog_rows(home: Optional[Path] = None) -> list[dict[str, Any]]:
@@ -585,10 +600,7 @@ def catalog_rows(home: Optional[Path] = None) -> list[dict[str, Any]]:
     for path in paths:
         info = summaries.get(path.stem) or {}
         parent = _parent_id(str(info.get("parent_id") or ""), path.stem, known)
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            mtime = 0.0
+        mtime = max((ns for _, ns, _ in _db_stamp(path)), default=0) / 1e9
         title = str(info.get("title") or "").strip() or path.stem[:8]
         rows.append({
             "id": path.stem,
@@ -663,17 +675,19 @@ def load_snapshot(
 ) -> dict[str, Any]:
     root = Path(home) if home is not None else antigravity_home()
     key = str(root.resolve()) if root.exists() else str(root)
-    fp = _fingerprint(root) if root.is_dir() else "missing"
+    fp = source_revision(root)
     with _lock:
         hit = _cache.get(key)
-        if hit and hit[0] == fp:
-            if on_progress is not None:
-                n = int((hit[1].get("files") or {}).get("db") or 0)
-                on_progress(n or 1, n or 1, 0)
-            return hit[1]
+    if hit and hit[0] == fp:
+        if on_progress is not None:
+            n = int((hit[1].get("files") or {}).get("db") or 0)
+            on_progress(n or 1, n or 1, 0)
+        return hit[1]
     payload = build_snapshot(root, on_progress=on_progress)
-    with _lock:
-        _cache[key] = (fp, payload)
+    payload["source_revision"] = fp
+    if not payload["files"]["read_errors"]:
+        with _lock:
+            _cache[key] = (fp, payload)
     return payload
 
 
@@ -683,6 +697,11 @@ def focused_snapshot(
 ) -> dict[str, Any]:
     """Picker rows for every root, with calls for the open root and its children."""
     root = Path(home) if home is not None else antigravity_home()
+    key = (source_revision(root), focus_id)
+    with _lock:
+        hit = _focus_cache.get(root)
+    if hit and hit[0] == key:
+        return hit[1]
     rows = catalog_rows(root)
     ids = {str(row["id"]) for row in rows}
     chosen = ""
@@ -725,7 +744,7 @@ def focused_snapshot(
             merged.append(by_id[rid])
         elif row.get("is_root"):
             merged.append(_public_header(row))
-    return {
+    snapshot = {
         "ok": True,
         "source": "antigravity",
         "metric": _METRIC,
@@ -736,6 +755,10 @@ def focused_snapshot(
         "n_calls": int(parsed.get("n_calls") or 0) if isinstance(parsed, dict) else 0,
         "n_threads": len(merged),
     }
+    if not (snapshot["files"] or {}).get("read_errors"):
+        with _lock:
+            _focus_cache[root] = (key, snapshot)
+    return snapshot
 
 
 def newest_mtime(home: Optional[Path] = None) -> float:

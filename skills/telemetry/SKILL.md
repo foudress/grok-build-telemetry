@@ -1,10 +1,10 @@
 ---
 name: telemetry
-description: "Open Grok Build Token Telemetry dashboard (kill :8765 if busy, clean relaunch). Use when the user runs /telemetry, asks to open/launch/start the telemetry dashboard, or ends a prompt with /telemetry."
+description: "Open Metryx dashboard (kill :8765 if busy, clean relaunch). Use when the user runs /telemetry, asks to open/launch/start the telemetry dashboard, or ends a prompt with /telemetry."
 user-invocable: true
 argument-hint: ""
 metadata:
-  short-description: "Launch Token Telemetry dashboard"
+  short-description: "Launch Metryx dashboard"
 ---
 
 # /telemetry

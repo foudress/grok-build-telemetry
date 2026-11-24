@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -381,3 +383,66 @@ def test_feed_pin_does_not_touch_real_home(tmp_path: Path) -> None:
     health = feed.health(home=home)
     assert health["source"] == "codex"
     assert health["ok"] is True
+
+
+def test_feed_switch_is_responsive_and_discards_the_previous_read(monkeypatch) -> None:
+    feed = CodexFeed()
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def focus(home, pin):
+        if pin == "slow":
+            started.set()
+            try:
+                assert release.wait(3)
+            finally:
+                finished.set()
+        return {"id": pin}
+
+    monkeypatch.setattr(feed, "_catalog", lambda home: [{"id": "slow"}, {"id": "latest"}])
+    monkeypatch.setattr(feed, "_focus", focus)
+    monkeypatch.setattr(feed, "_state", lambda snapshot, pin, pinned: {"session_id": snapshot["id"]})
+    assert feed.select("slow")["ok"]
+    try:
+        assert json.loads(feed.state_bytes()[0])["pending"] is True
+        assert started.is_set()
+        assert feed.select("latest")["ok"]
+        until = time.monotonic() + 1
+        while time.monotonic() < until:
+            latest = json.loads(feed.state_bytes()[0])
+            if not latest.get("pending"):
+                break
+        assert latest["session_id"] == "latest"
+    finally:
+        release.set()
+    assert finished.wait(1)
+    assert json.loads(feed.state_bytes()[0])["session_id"] == "latest"
+
+
+def test_health_never_replays_history_and_matches_aggregate_revision(tmp_path: Path, monkeypatch) -> None:
+    feed = CodexFeed()
+    first = feed.aggregate("daily", 0, "hour", home=tmp_path)
+
+    def unexpected_replay(*args, **kwargs):
+        raise AssertionError("health replayed the history")
+
+    monkeypatch.setattr(feed, "_history", unexpected_replay)
+    assert feed.health(tmp_path)["cache_gen"] == first["cache_gen"]
+    (tmp_path / "session_index.jsonl").write_text("\n", encoding="utf-8")
+    assert feed.health(tmp_path)["cache_gen"] != first["cache_gen"]
+
+
+def test_gpt_6_2_list_prices_and_explicit_speed_tiers() -> None:
+    usage = {"uncached": 100_000, "cached": 50_000, "output": 20_000, "cache_write": 10_000}
+    standard = price_usage("gpt-6.2-astra", prompt=272_000, **usage)
+    assert standard["long"] is False
+    assert abs(standard["total"] - (0.09 * 8 + 0.01 * 10 + 0.05 * 0.4 + 0.02 * 40)) < 1e-12
+    long = price_usage("gpt-6.2-sol", prompt=272_001, **usage)
+    assert long["long"] is True
+    fast = price_usage("gpt-6.2-sol-fast", prompt=272_001, **usage)
+    assert abs(fast["total"] - 2 * long["total"]) < 1e-12
+    promo = price_usage("gpt-6.2-astra", service_tier="ultrafast", when="2027-03-01T07:59Z", **usage)
+    later = price_usage("gpt-6.2-astra", service_tier="ultrafast", when="2027-03-01T08:00Z", **usage)
+    assert abs(promo["total"] - 3 * standard["total"]) < 1e-12
+    assert abs(later["total"] - 6 * standard["total"]) < 1e-12

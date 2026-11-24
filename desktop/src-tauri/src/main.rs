@@ -1,4 +1,4 @@
-//! Desktop window for the local Token Telemetry dashboard.
+//! Desktop window for the local Metryx dashboard.
 //! The Python server in the repo stays the owner of the data and the UI.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -62,7 +62,7 @@ fn main() {
             Ok(())
         })
         .build(tauri::generate_context!())
-        .expect("failed to start Token Telemetry")
+        .expect("failed to start Metryx")
         .run(move |app, event| {
             if matches!(event, RunEvent::Exit) {
                 if let Some(host) = app.try_state::<Arc<Host>>() {
@@ -74,7 +74,7 @@ fn main() {
 
 fn open_host() -> Result<Host, String> {
     let root = resolve_root().ok_or_else(|| {
-        "Token Telemetry root was not found. Set GROK_TELEMETRY_ROOT or rebuild the app from the repo.".to_string()
+        "Metryx root was not found. Set GROK_TELEMETRY_ROOT or rebuild the app from the repo.".to_string()
     })?;
     let python = resolve_python(&root).ok_or_else(|| {
         format!("Python runtime was not found under {}", root.display())
@@ -90,7 +90,7 @@ fn open_host() -> Result<Host, String> {
 fn build_window(app: &tauri::AppHandle) -> tauri::Result<WebviewWindow> {
     let (width, height, x, y) = window_frame(app);
     WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-        .title("Token Telemetry")
+        .title("Metryx")
         .theme(Some(Theme::Dark))
         .background_color(tauri::window::Color(0x0b, 0x0f, 0x14, 255))
         .inner_size(width, height)

@@ -292,7 +292,7 @@ def resolve_root() -> Path:
             return c.resolve()
 
     raise SystemExit(
-        "Token Telemetry root not found. Set GROK_TELEMETRY_ROOT or run docs/install.md."
+        "Metryx root not found. Set GROK_TELEMETRY_ROOT or run docs/install.md."
     )
 
 
@@ -623,7 +623,7 @@ def _spawn_detached(cmd: list[str], root: Path, out_log: Path, err_log: Path) ->
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Launch Grok Token Telemetry dashboard")
+    ap = argparse.ArgumentParser(description="Launch Metryx dashboard")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--session-id", default="")
     ap.add_argument("--detached", action="store_true")
@@ -653,7 +653,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.detached or args.no_open:
         cmd.append("--no-open")
 
-    print(f"Starting Grok Token Telemetry on {url}")
+    print(f"Starting Metryx on {url}")
     print(f"  root:   {root}")
     print(f"  python: {py}")
     if session_id:

@@ -77,9 +77,14 @@ export function isPeriodScope() {
   return PERIODS.has(_scope);
 }
 
+function scopePreference() {
+  const source = document.documentElement.dataset.source || "grok";
+  return source === "grok" ? "tt-scope" : "tt-scope-" + source;
+}
+
 function persist() {
   try {
-    localStorage.setItem("tt-scope", _scope);
+    localStorage.setItem(scopePreference(), _scope);
     localStorage.setItem("tt-agg-mode", _mode);
     localStorage.setItem("tt-period-grain", _grain);
     localStorage.setItem("tt-agg-bylabel", _byLabel ? "1" : "0");
@@ -94,7 +99,7 @@ function persist() {
 
 export function restoreScope() {
   try {
-    const s = localStorage.getItem("tt-scope");
+    const s = localStorage.getItem(scopePreference());
     if (PERIODS.has(s) || s === "session") _scope = s;
     const m = localStorage.getItem("tt-agg-mode");
     if (AGG_MODES.has(m)) _mode = m;
@@ -405,6 +410,7 @@ export function restorePeriodReturn() {
   _periodReturn = null;
   syncPeriodBack();
   if (!snap) return;
+  window.__clearStateEtag?.();
   beginViewLoad();
   _scope = snap.scope;
   _offset = snap.offset || 0;
@@ -429,6 +435,9 @@ export function restorePeriodReturn() {
 export function setScope(scope, opts = {}) {
   const next = PERIODS.has(scope) || scope === "session" ? scope : "session";
   if (next !== _scope) {
+    _aggAbort?.abort();
+    window.__clearStateEtag?.();
+    endAggLoaders();
     if (PERIODS.has(next)) {
       _periodReturn = null;
       if (!billingAllowed(next)) _billing = false;
@@ -852,108 +861,76 @@ export function invalidatePeriodCache() {
   _aggKey = "";
   _aggDirty = true;
   _cacheGen = null;
+  _aggAbort?.abort();
 }
 
-export async function fetchPeriod() {
+export async function fetchPeriod(pollSignal) {
   const reqKey = aggRequestKey();
-  // Quiet 1s poll: same period params already on screen — do not restream / flash loader.
-  // Still notice Reset calc / dashboard relaunch via cache_gen.
-  if (!_aggDirty && _lastAgg && reqKey === _aggKey) {
-    let same = true;
-    try {
-      const r = await fetch("/api/health");
-      const j = await r.json();
-      if (
-        j
-        && typeof j.cache_gen === "number"
-        && _cacheGen != null
-        && j.cache_gen !== _cacheGen
-      ) {
-        same = false;
-        _aggDirty = true;
-        _lastAgg = null;
-      }
-    } catch { /* ignore */ }
-    if (same) return;
-  }
-
-  const badge = $("liveBadge");
-  if (badge && !_lastAgg) {
-    badge.textContent = "loading";
-    badge.className = "badge idle";
-  }
-  // Loader: full-page on first paint; chart overlay deferred until SSE cold>0.
-  if (_aggDirty && !_aggLoadMode && !_chartLoaderAwaitCold) {
-    if (_lastAgg) beginChartLoad();
-    else beginViewLoad();
-  }
-  if (_aggAbort) {
-    try { _aggAbort.abort(); } catch { /* ignore */ }
-  }
+  if (_aggAbort) _aggAbort.abort();
   const ctrl = new AbortController();
   _aggAbort = ctrl;
-  const signal = ctrl.signal;
-  // No bytes for 3 minutes means this stream is dead. Progress resets it.
-  // Abort this controller only — a later period fetch has its own.
-  let silence = setTimeout(() => ctrl.abort("timeout"), 180000);
+  const signal = AbortSignal.any([pollSignal, ctrl.signal]);
+  let silence;
   const bumpSilence = () => {
     clearTimeout(silence);
     silence = setTimeout(() => ctrl.abort("timeout"), 180000);
   };
-  // rate=1 when user is on tok/s (includes sub-agent points). Otherwise still
-  // returns Parts/Tools cats + mains tps so stack switches stay local.
-  const url = `/api/aggregate?period=${encodeURIComponent(_scope)}&offset=${_offset}&grain=${encodeURIComponent(_grain)}&stack=${encodeURIComponent(_stack)}&rate=${_rate ? "1" : "0"}&billing=${_billing ? "1" : "0"}&stream=1&_=${Date.now()}`;
-  let agg = null;
   try {
-  try {
-    const r = await fetch(url, { signal });
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    const ctype = (r.headers.get("content-type") || "").toLowerCase();
-    if (ctype.includes("text/event-stream")) {
-      agg = await readAggregateSse(r, (done, total, meta) => {
-        bumpSilence();
-        setAggProgress(done, total, meta);
-      });
-    } else {
-      agg = await r.json();
-    }
-  } catch (e) {
-    if (e && e.name === "AbortError") {
-      if (signal.reason === "timeout") {
-        endAggLoaders();
-        throw new Error("aggregate timed out");
+    if (!_aggDirty && _lastAgg && reqKey === _aggKey) {
+      // Check the file revision without reopening the period stream on a warm poll.
+      try {
+        const healthSignal = AbortSignal.any([signal, AbortSignal.timeout(5000)]);
+        const r = await fetch("/api/health", { signal: healthSignal });
+        const data = await r.json();
+        if (signal.aborted || !r.ok || typeof data.cache_gen !== "number"
+            || _cacheGen == null || data.cache_gen === _cacheGen) return;
+      } catch {
+        return;
       }
-      return;
+      _aggDirty = true;
     }
+
+    const badge = $("liveBadge");
+    if (badge && !_lastAgg) {
+      badge.textContent = "loading";
+      badge.className = "badge idle";
+    }
+    if (_aggDirty && !_aggLoadMode && !_chartLoaderAwaitCold) {
+      if (_lastAgg) beginChartLoad();
+      else beginViewLoad();
+    }
+    bumpSilence();
+    const params = new URLSearchParams({
+      period: _scope, offset: _offset, grain: _grain, stack: _stack,
+      rate: _rate ? "1" : "0", billing: _billing ? "1" : "0", stream: "1", _: Date.now(),
+    });
+    const r = await fetch("/api/aggregate?" + params, { signal });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const isStream = (r.headers.get("content-type") || "").includes("text/event-stream");
+    const agg = isStream
+      ? await readAggregateSse(r, (done, total, meta) => {
+          if (signal.aborted) return;
+          bumpSilence();
+          setAggProgress(done, total, meta);
+        })
+      : await r.json();
+    if (signal.aborted || !isPeriodScope() || aggRequestKey() !== reqKey) return;
+    if (!agg || agg.error) throw new Error(agg?.error || "empty aggregate");
+    paintPeriod(agg);
+    _aggKey = reqKey;
+    _aggDirty = false;
+    if (typeof agg.cache_gen === "number") _cacheGen = agg.cache_gen;
+    _chartLoaderAwaitCold = false;
+    endChartLoad();
+  } catch (error) {
+    if (signal.aborted && signal.reason !== "timeout") return;
     _chartLoaderAwaitCold = false;
     endAggLoaders();
-    throw e;
-  }
-  if (!isPeriodScope()) {
-    _chartLoaderAwaitCold = false;
-    endAggLoaders();
-    return;
-  }
-  // Params changed while this stream ran — keep dirty; a follow-up poll will refetch.
-  if (aggRequestKey() !== reqKey) {
-    _aggDirty = true;
-    return;
-  }
-  if (!agg || agg.error) {
-    _chartLoaderAwaitCold = false;
-    endAggLoaders();
-    throw new Error((agg && agg.error) || "empty aggregate");
-  }
-  paintPeriod(agg);
-  _aggKey = reqKey;
-  _aggDirty = false;
-  if (typeof agg.cache_gen === "number") _cacheGen = agg.cache_gen;
-  _chartLoaderAwaitCold = false;
-  // Hide chart-local overlay immediately; full-page spinner is cleared by poll().
-  endChartLoad();
-  // endViewLoad left to poll() so a superseded in-flight fetch does not hide the spinner.
+    if (signal.reason === "timeout") throw new Error("aggregate timed out");
+    throw error;
   } finally {
     clearTimeout(silence);
+    if (_aggAbort === ctrl) _aggAbort = null;
   }
 }
 
