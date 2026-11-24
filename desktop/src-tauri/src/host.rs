@@ -47,10 +47,13 @@ pub fn pick_root(candidates: &[Option<PathBuf>]) -> Option<PathBuf> {
 }
 
 pub fn resolve_root() -> Option<PathBuf> {
+    let bundled = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("runtime")));
     let env = std::env::var("GROK_TELEMETRY_ROOT").ok().map(PathBuf::from);
     let marker = install_root();
     let baked = option_env!("TT_REPO_ROOT").map(PathBuf::from);
-    pick_root(&[env, marker, baked])
+    pick_root(&[bundled, env, marker, baked])
 }
 
 fn install_root() -> Option<PathBuf> {
@@ -61,9 +64,13 @@ fn install_root() -> Option<PathBuf> {
     data.get("root").and_then(|v| v.as_str()).map(PathBuf::from)
 }
 
-pub fn venv_python(root: &Path) -> Option<PathBuf> {
-    let path = root.join(".venv").join("Scripts").join("python.exe");
-    path.is_file().then_some(path)
+pub fn resolve_python(root: &Path) -> Option<PathBuf> {
+    [
+        root.join("python").join("python.exe"),
+        root.join(".venv").join("Scripts").join("python.exe"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
 }
 
 pub fn dashboard_url(python: &Path, root: &Path) -> String {

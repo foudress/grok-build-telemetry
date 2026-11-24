@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import warnings
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 
@@ -204,6 +205,13 @@ def count_user_prompt_tokens(text: Any) -> int:
     return count_tokens(wrap_user_query(text))
 
 
+def _count_grok2(tokenizer: Any, text: str) -> int:
+    return len(tokenizer.encode(text, add_special_tokens=False))
+
+
+_cached_grok2_count = lru_cache(maxsize=2048)(_count_grok2)
+
+
 def count_tokens(text: Any) -> int:
     """
     Count tokens for a text payload with the active tokenizer.
@@ -225,9 +233,10 @@ def count_tokens(text: Any) -> int:
 
     if mode == "grok2" and _hf_tok is not None:
         try:
-            # add_special_tokens=False: pure text weight for pro-rata (no BOS/EOS)
-            ids = _hf_tok.encode(text, add_special_tokens=False)
-            return len(ids)
+            # Cap retained text. Large payloads and failed encodes stay uncached.
+            if type(text) is str and len(text) <= 8192:
+                return _cached_grok2_count(_hf_tok, text)
+            return _count_grok2(_hf_tok, text)
         except Exception:
             pass
 

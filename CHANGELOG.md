@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.2] — 2026-11-24
+
+- Reuse Grok-2 token counts for repeated text and refresh tool history once per round, preserving reconstructed ledgers and period attribution.
+- Publish a Windows x64 setup executable with the dashboard, Python runtime and offline tokenizer included.
+
 ## [1.5.1] — 2026-11-22
 
 The >200k list rate applies to the LLM call that crossed it. A round that ends above 200k no longer reprices the other calls. `CACHE_VER` is 32.

@@ -28,6 +28,7 @@ from token_telemetry.hierarchy.tooldef_r1 import (
     _is_cold_session_first,
 )
 from token_telemetry.hierarchy.thoughts_enc import _stamp_stream_window
+from token_telemetry.hierarchy.step_tree import _finalize_steps
 
 def _attach_step_estimates(hb: Any, r: dict[str, Any]) -> None:
     if reconstruct_model_step_usage is None:
@@ -351,9 +352,7 @@ def _enc_stamp_signature(hb: Any) -> tuple:
 def _reprice_completed_rounds(hb: Any) -> None:
     """Rebuild step trees + pricing after encrypted stamps move."""
     for rr in hb.rounds:
-        for step in rr.get("model_steps") or []:
-            if isinstance(step, dict):
-                hb._finalize_step(step)
+        _finalize_steps(hb, rr.get("model_steps") or [])
         hb._attach_step_estimates(rr)
         from token_telemetry.hierarchy.gen_rate import attach_gen_rates
 

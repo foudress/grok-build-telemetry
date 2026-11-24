@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 from token_telemetry.pricing import pricing_model_scope, reconstruct_model_step_usage
 from token_telemetry.tokenizer import (
@@ -22,8 +22,6 @@ from token_telemetry.hierarchy.bootstrap import (
 from token_telemetry.hierarchy.compact_out import compact_round_inplace
 from token_telemetry.hierarchy.tools_meta import _tool_seq_from_id
 from token_telemetry.util import as_int as _as_tok
-
-from token_telemetry.hierarchy.step_tree import _is_kept_model_step
 
 def _reasoning_fp(rs: dict[str, Any]) -> tuple:
     return (
@@ -99,29 +97,30 @@ def _tool_results_sig(session_dir: Path) -> tuple:
             parts.append((fp.name, float(st.st_mtime), int(st.st_size)))
     return tuple(parts)
 
-def _load_tool_results_fresh(hb: Any) -> dict[str, dict[str, Any]]:
-    """Reload chat_history tool_result content tokens when files change."""
-    if not hb._session_dir:
-        return {}
-    sig = _tool_results_sig(Path(hb._session_dir))
-    if hb._tool_results_cache is None or sig != getattr(hb, "_tool_results_mtime", None):
-        hb._tool_results_cache = load_chat_history_tool_results(hb._session_dir)
-        hb._tool_results_mtime = sig
-    return dict(hb._tool_results_cache or {})
+class ToolHistory(NamedTuple):
+    signature: tuple
+    results: dict[str, dict[str, Any]]
+    requests: dict[str, dict[str, Any]]
 
-def _load_tool_requests_fresh(hb: Any) -> dict[str, dict[str, Any]]:
-    """Reload chat_history tool_calls[].arguments tokens when files change."""
-    if not hb._session_dir:
-        return {}
-    sig = _tool_results_sig(Path(hb._session_dir))
-    if hb._tool_requests_cache is None or sig != getattr(
-        hb, "_tool_requests_mtime", None
-    ):
-        hb._tool_requests_cache = load_chat_history_tool_requests(hb._session_dir)
-        hb._tool_requests_mtime = sig
-    return dict(hb._tool_requests_cache or {})
 
-def _stamp_tool_chat_results(hb: Any, tools: list[dict[str, Any]]) -> None:
+def _load_tool_history(hb: Any) -> ToolHistory:
+    """Read the shared history indexes once for the round's model steps."""
+    if not hb._session_dir:
+        return ToolHistory((), {}, {})
+    sig = _tool_results_sig(Path(hb._session_dir))
+    history = hb._tool_history
+    if history is None or history.signature != sig:
+        history = ToolHistory(
+            sig,
+            load_chat_history_tool_results(hb._session_dir),
+            load_chat_history_tool_requests(hb._session_dir),
+        )
+        hb._tool_history = history
+    return history
+
+def _stamp_tool_chat_results(
+    by_id: dict[str, dict[str, Any]], tools: list[dict[str, Any]]
+) -> None:
     """Attach chat_history tool_result.content tokenizer size onto harness tools.
 
     chat_history is authoritative for result **chars** and tokenizer **weights**
@@ -131,7 +130,6 @@ def _stamp_tool_chat_results(hb: Any, tools: list[dict[str, Any]]) -> None:
     """
     from token_telemetry.session.subagents import apply_history_subagent_ids
 
-    by_id = hb._load_tool_results_fresh()
     if not by_id:
         return
     for t in tools:
@@ -163,13 +161,14 @@ def _stamp_tool_chat_results(hb: Any, tools: list[dict[str, Any]]) -> None:
         if waitish:
             apply_history_subagent_ids(t, hit)
 
-def _stamp_tool_chat_args(hb: Any, tools: list[dict[str, Any]]) -> None:
+def _stamp_tool_chat_args(
+    by_id: dict[str, dict[str, Any]], tools: list[dict[str, Any]]
+) -> None:
     """Attach chat_history tool_calls[].arguments as ToolRequest Out weights.
 
     Authoritative over stream ``rawInput`` (updates often add harness-only
     fields like ``variant`` / ``is_background``).
     """
-    by_id = hb._load_tool_requests_fresh()
     if not by_id:
         return
     for t in tools:
@@ -248,6 +247,8 @@ def _enrich_session_thoughts(hb: Any) -> None:
     Empty placeholder steps do not consume a row. Consecutive identical
     blobs are skipped. Extra unique rows merge into the last kept call.
     """
+    from token_telemetry.hierarchy.step_tree import _is_kept_model_step
+
     if not hb._session_dir:
         return
     reasonings = _unique_reasonings(hb._load_reasonings_fresh())

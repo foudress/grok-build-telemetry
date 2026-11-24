@@ -5,6 +5,7 @@ Tool-request weights use chat_history tool_calls[].arguments (not update rawInpu
 
 import json
 
+from token_telemetry.hierarchy import HierarchyBuilder
 from token_telemetry.hierarchy.bootstrap import (
     load_chat_history_tool_requests,
     load_chat_history_tool_results,
@@ -207,16 +208,6 @@ def test_stamp_results_always_body_not_envelope(tmp_path):
         encoding="utf-8",
     )
 
-    class _HB:
-        _session_dir = tmp_path
-        _tool_results_cache = None
-        _tool_results_mtime = None
-
-        def _load_tool_results_fresh(self):
-            from token_telemetry.hierarchy.thoughts_enc import _load_tool_results_fresh
-
-            return _load_tool_results_fresh(self)
-
     tools = [
         {
             "name": "read_file",
@@ -225,7 +216,7 @@ def test_stamp_results_always_body_not_envelope(tmp_path):
             "result_tokens_est": 1,
         }
     ]
-    _stamp_tool_chat_results(_HB(), tools)
+    _stamp_tool_chat_results(load_chat_history_tool_results(tmp_path), tools)
     assert tools[0]["ch_result_tokens"] == count_tokens(body)
     assert tools[0]["result_tokens_est"] == count_tokens(body)
     env = count_tokens(
@@ -255,16 +246,6 @@ def test_stamp_args_overwrites_inflated_update_raw_input(tmp_path):
         encoding="utf-8",
     )
 
-    class _HB:
-        _session_dir = tmp_path
-        _tool_requests_cache = None
-        _tool_requests_mtime = None
-
-        def _load_tool_requests_fresh(self):
-            from token_telemetry.hierarchy.thoughts_enc import _load_tool_requests_fresh
-
-            return _load_tool_requests_fresh(self)
-
     tools = [
         {
             "name": "run_terminal_command",
@@ -274,8 +255,45 @@ def test_stamp_args_overwrites_inflated_update_raw_input(tmp_path):
             "arg_tokens_est": 80,
         }
     ]
-    _stamp_tool_chat_args(_HB(), tools)
+    _stamp_tool_chat_args(load_chat_history_tool_requests(tmp_path), tools)
     assert tools[0]["arg_chars"] == len(args)
     assert tools[0]["arg_tokens_est"] == count_tokens(args)
     assert tools[0]["arg_weight_source"] == "chat_history_arguments"
     assert tools[0]["arg_tokens_est"] < 80
+
+
+def test_open_round_refreshes_tool_weights_after_history_is_rewritten(tmp_path):
+    builder = HierarchyBuilder()
+    builder.set_session_dir(tmp_path)
+    tool_ids = ["call-read-1", "call-read-2"]
+    for index, tool_id in enumerate(tool_ids, 1):
+        builder.feed_raw({
+            "params": {
+                "_meta": {"streamStartMs": index, "totalTokens": 100 + index},
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": tool_id,
+                    "title": "Read file",
+                },
+            },
+        })
+
+    history = tmp_path / "chat_history.jsonl"
+    for body, args in [
+        ("short body", '{"path":"a.txt"}'),
+        ("rewritten result with more tokens", '{"path":"docs/another-file.txt"}'),
+    ]:
+        rows = []
+        for tool_id in tool_ids:
+            rows.extend([
+                {"type": "tool_result", "tool_call_id": tool_id, "content": body},
+                {"type": "function_call", "call_id": tool_id, "arguments": args},
+            ])
+        history.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+
+        round_, = builder.snapshot_rounds()
+        assert len(round_["model_steps"]) == 2
+        for step in round_["model_steps"]:
+            tool, = step["tools"]
+            assert tool["ch_result_tokens"] == count_tokens(body)
+            assert tool["ch_arg_tokens"] == count_tokens(args)

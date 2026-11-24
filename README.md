@@ -2,7 +2,11 @@
 
 Live companion dashboard for **[Grok Build](https://x.ai)** sessions: exact token fields Grok already writes, cache vs uncached split, official `$` ticks, and list-price estimates — outside the TUI.
 
-> Package: `token-telemetry` **v1.5.1** (`pip install -e .` / `token-telemetry` CLI).
+> Package: `token-telemetry` **v1.5.2** (`pip install -e .` / `token-telemetry` CLI).
+
+## Windows desktop app
+
+Download the [Windows x64 setup executable](https://github.com/foudress/grok-build-telemetry/releases/latest) and run it. The installer includes Python, the dashboard and the offline tokenizer. Launch **Token Telemetry** from the Start menu.
 
 ```
 ~/.grok/sessions/.../updates.jsonl  ──tail──►  live dashboard  ──►  http://127.0.0.1:8765/
@@ -216,4 +220,4 @@ MIT — see [LICENSE](LICENSE).
 
 ### Vendor note
 
-`vendor/grok-2-tokenizer/` is third-party tokenizer data used offline for weight estimates. Respect its upstream license/terms when redistributing. The dashboard falls back to a bytes÷4 heuristic if the tokenizer cannot load.
+The offline Grok-2 tokenizer is **Powered by xAI**. This product includes materials licensed under the xAI Community License. All rights reserved. Copyright © xAI 2025. See the [tokenizer license](vendor/grok-2-tokenizer/LICENSE).

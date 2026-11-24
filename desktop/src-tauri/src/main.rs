@@ -12,7 +12,10 @@ use std::time::Duration;
 use tauri::webview::WebviewWindow;
 use tauri::{Manager, RunEvent, Theme, WebviewUrl, WebviewWindowBuilder};
 
-use host::{dashboard_url, fit_portrait, log_line, resolve_root, stamp, venv_python, wait_healthy, Host, PORT};
+use host::{
+    dashboard_url, fit_portrait, log_line, resolve_python, resolve_root, stamp, wait_healthy, Host,
+    PORT,
+};
 
 fn main() {
     let (host, startup_error) = match open_host() {
@@ -52,7 +55,9 @@ fn main() {
                     return;
                 }
                 boot(&app_handle, &host);
-                watch(&app_handle, &host);
+                if host.python.starts_with(host.root.join(".venv")) {
+                    watch(&app_handle, &host);
+                }
             });
             Ok(())
         })
@@ -71,8 +76,8 @@ fn open_host() -> Result<Host, String> {
     let root = resolve_root().ok_or_else(|| {
         "Token Telemetry root was not found. Set GROK_TELEMETRY_ROOT or rebuild the app from the repo.".to_string()
     })?;
-    let python = venv_python(&root).ok_or_else(|| {
-        format!("No .venv Python under {}", root.display())
+    let python = resolve_python(&root).ok_or_else(|| {
+        format!("Python runtime was not found under {}", root.display())
     })?;
     Ok(Host {
         root,

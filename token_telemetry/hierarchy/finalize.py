@@ -44,20 +44,16 @@ from token_telemetry.hierarchy.tooldef_r1 import (
     _tooldef_jump_window,
     stamp_r1_tooldef_jump,
 )
-from token_telemetry.hierarchy.step_tree import _finalize_step, _is_kept_model_step
+from token_telemetry.hierarchy.step_tree import _finalize_steps, _is_kept_model_step
 from token_telemetry.hierarchy.thoughts_enc import (
     _clear_enc_stamp,
     _enrich_round_thoughts,
     _enrich_session_thoughts,
     _load_reasonings_fresh,
-    _load_tool_requests_fresh,
-    _load_tool_results_fresh,
     _patch_reasoning_chars_on_trees,
     _reasoning_fp,
     _stamp_step_reasoning,
     _stamp_stream_window,
-    _stamp_tool_chat_args,
-    _stamp_tool_chat_results,
     _tool_results_sig,
     _unique_reasonings,
 )
@@ -89,8 +85,7 @@ def _finalize_round(hb: Any, r: dict[str, Any]) -> None:
     # Stamp thought sizes from chat_history (encrypted + summary) *before* tree build
     hb._enrich_round_thoughts(r)
     # Re-chain tools for clean serial display + rebuild children
-    for step in r.get("model_steps") or []:
-        hb._finalize_step(step)
+    _finalize_steps(hb, r.get("model_steps") or [])
 
     start = r.get("context_start")
     end = r.get("context_end")

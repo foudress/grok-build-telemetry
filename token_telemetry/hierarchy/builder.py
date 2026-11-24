@@ -55,20 +55,16 @@ from token_telemetry.hierarchy.finalize import (
     _enrich_round_thoughts,
     _enrich_session_thoughts,
     _finalize_round,
-    _finalize_step,
     _inject_system_message_residual,
     _load_reasonings_fresh,
-    _load_tool_requests_fresh,
-    _load_tool_results_fresh,
     _merge_bootstrap_into_breakdown,
     _patch_reasoning_chars_on_trees,
     _price_bootstrap_prompts,
     _reprice_completed_rounds,
     _stamp_step_reasoning,
-    _stamp_tool_chat_args,
-    _stamp_tool_chat_results,
     stamp_r1_tooldef_jump,
 )
+from token_telemetry.hierarchy.thoughts_enc import ToolHistory
 from token_telemetry.hierarchy.hooks import _hook_slot
 from token_telemetry.hierarchy.recap_compact import (
     _attach_pending_recap_compact,
@@ -129,10 +125,7 @@ class HierarchyBuilder:
         self._reasonings_mtime: Optional[float] = None
         self._reasonings_cursor: int = 0
         self._enc_stamp_sig: Optional[tuple] = None
-        self._tool_results_cache: Optional[dict[str, dict[str, Any]]] = None
-        self._tool_results_mtime: Any = None
-        self._tool_requests_cache: Optional[dict[str, dict[str, Any]]] = None
-        self._tool_requests_mtime: Any = None
+        self._tool_history: Optional[ToolHistory] = None
         # Priced family (grok-4.5 / grok-4.6); None until a session id is seen
         self._pricing_model: Optional[str] = None
         self._models_raw: list[str] = []
@@ -153,10 +146,7 @@ class HierarchyBuilder:
         self._reasonings_cache = None
         self._reasonings_mtime = None
         self._reasonings_cursor = 0
-        self._tool_results_cache = None
-        self._tool_results_mtime = None
-        self._tool_requests_cache = None
-        self._tool_requests_mtime = None
+        self._tool_history = None
         self._child_usage_cache = {}
         self._subagent_ordinal = {}
         self._subagent_result_n = {}
@@ -188,10 +178,7 @@ class HierarchyBuilder:
         self._reasonings_mtime = None
         self._reasonings_cursor = 0
         self._enc_stamp_sig = None
-        self._tool_results_cache = None
-        self._tool_results_mtime = None
-        self._tool_requests_cache = None
-        self._tool_requests_mtime = None
+        self._tool_history = None
         self._pricing_model = None
         self._models_raw = []
         self._priced_with = None
@@ -1031,18 +1018,6 @@ class HierarchyBuilder:
     def _load_reasonings_fresh(self) -> list[dict[str, Any]]:
         return _load_reasonings_fresh(self)
 
-    def _load_tool_results_fresh(self) -> dict[str, dict[str, Any]]:
-        return _load_tool_results_fresh(self)
-
-    def _load_tool_requests_fresh(self) -> dict[str, dict[str, Any]]:
-        return _load_tool_requests_fresh(self)
-
-    def _stamp_tool_chat_results(self, tools: list[dict[str, Any]]) -> None:
-        return _stamp_tool_chat_results(self, tools)
-
-    def _stamp_tool_chat_args(self, tools: list[dict[str, Any]]) -> None:
-        return _stamp_tool_chat_args(self, tools)
-
     @staticmethod
     def _stamp_step_reasoning(step: dict[str, Any], rs: dict[str, Any]) -> None:
         return _stamp_step_reasoning(step, rs)
@@ -1067,9 +1042,6 @@ class HierarchyBuilder:
 
     def _price_bootstrap_prompts(self, r: dict[str, Any]) -> None:
         return _price_bootstrap_prompts(self, r)
-
-    def _finalize_step(self, step: dict[str, Any]) -> None:
-        return _finalize_step(self, step)
 
     def _attach_step_estimates(self, r: dict[str, Any]) -> None:
         return _attach_step_estimates(self, r)

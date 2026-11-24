@@ -20,6 +20,13 @@ from token_telemetry.hierarchy.bootstrap import (
     resolve_tool_definitions,
 )
 from token_telemetry.hierarchy.compact_out import compact_round_inplace
+from token_telemetry.hierarchy.thoughts_enc import (
+    ToolHistory,
+    _load_tool_history,
+    _stamp_stream_window,
+    _stamp_tool_chat_args,
+    _stamp_tool_chat_results,
+)
 from token_telemetry.hierarchy.tools_meta import _tool_seq_from_id
 from token_telemetry.util import as_int as _as_tok
 
@@ -43,9 +50,15 @@ def _is_kept_model_step(step: Any) -> bool:
         or emit > 0
     )
 
-def _finalize_step(hb: Any, step: dict[str, Any]) -> None:
-    from token_telemetry.hierarchy.thoughts_enc import _stamp_stream_window
+def _finalize_steps(hb: Any, steps: list[dict[str, Any]]) -> None:
+    if steps:
+        history = _load_tool_history(hb)
+        for step in steps:
+            if isinstance(step, dict):
+                _finalize_step(step, history)
 
+
+def _finalize_step(step: dict[str, Any], history: ToolHistory) -> None:
     s0 = step.get("context_start")
     s1 = step.get("context_end")
     _stamp_stream_window(step)
@@ -100,8 +113,8 @@ def _finalize_step(hb: Any, step: dict[str, Any]) -> None:
             }
         )
     # Stamp chat_history tool_result + tool_calls[].arguments (authoritative)
-    hb._stamp_tool_chat_results(cleaned)
-    hb._stamp_tool_chat_args(cleaned)
+    _stamp_tool_chat_results(history.results, cleaned)
+    _stamp_tool_chat_args(history.requests, cleaned)
     for t in cleaned:
         # also keep on step.tools for later reprice
         tid = t.get("tool_call_id")
