@@ -62,9 +62,18 @@ def test_system_estimate_counts_only_opening_instructions(tmp_path: Path, monkey
     ])
     state = state_for(build_snapshot(tmp_path), "thread", pinned="thread")
     first, second = state["rounds"]
-    assert first["system_estimate"]["tokens"] == 163
-    assert first["breakdown"]["tree_in_tokens"] == 350
-    assert first["breakdown"]["cached_tokens"] == 100
+    system = first["system_estimate"]
+    assert system["tokens"] == 163
+    assert system["opening_tokens"] == 447
+    assert (system["tokens_in"], system["tokens_cached"]) == (347, 100)
+    assert first["user_prompt"]["prompt_tokens_in"] == first["breakdown"]["tree_in_tokens"] == 3
+    assert first["user_prompt"]["tokens_cached"] == first["breakdown"]["cached_tokens"] == 0
+    assert state["turns"][0]["uncached_input_tokens"] == 350
+    assert state["turns"][0]["cached_read_tokens"] == 100
+    opening_cost = system["cost_in_usd"] + system["cost_cached_usd"]
+    assert abs(opening_cost + first["estimate_usd"] - state["turns"][0]["estimate_usd"]) < 1e-12
+    assert (first["context_start"], first["context_end"], first["context_delta"]) == (447, 500, 53)
+    assert (second["context_start"], second["context_end"], second["context_delta"]) == (500, 600, 100)
     assert "system_prompt" not in first
     assert "system_estimate" not in second
     assert base not in json.dumps(state)

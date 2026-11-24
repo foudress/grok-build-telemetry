@@ -1280,6 +1280,7 @@ body.scope-period .sess-list {
 }
 
 .tree.density-standard .eol-meta { display: none; }
+.tree:not(.density-expert) .ctx-metric { display: none; }
 
 .tree .muted { color: var(--muted); }
 

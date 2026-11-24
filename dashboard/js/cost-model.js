@@ -443,8 +443,8 @@ export function turnCostParts(t, round, { detail, peelSystem } = {}) {
     total_tok: stackTok || tinTok + tcacheTok + toutTok,
     official: peelSystem ? null : t.official_usd,
     index: t.index,
-    uncached_tokens: t.uncached_input_tokens ?? tinTok,
-    cached_tokens: t.cached_read_tokens ?? tcacheTok,
+    uncached_tokens: peelSystem && round?.system_estimate ? tinTok : (t.uncached_input_tokens ?? tinTok),
+    cached_tokens: peelSystem && round?.system_estimate ? tcacheTok : (t.cached_read_tokens ?? tcacheTok),
     out_tokens: t.output_tokens ?? toutTok,
     label: String(t.index),
     kind: "turn",
@@ -676,9 +676,12 @@ function systemToolsSegs(sp, sysUsd, sysTok) {
 export function systemCostBar(round, { stack } = {}) {
   const sp = round && round.system_prompt;
   const bd = (round && round.breakdown) || {};
-  const sys = Number(bd.system_in_usd) || Number(sp && sp.cost_in_usd) || 0;
-  const sysTok = Number(bd.system_in_tokens) || Number(sp && (sp.tokens_in ?? sp.logical_tokens)) || 0;
-  if (sys <= 0 && sysTok <= 0) return null;
+  const opening = round?.system_estimate;
+  const sys = ledgerNum(bd.system_in_usd) ?? ledgerNum(sp?.cost_in_usd) ?? ledgerNum(opening?.cost_in_usd) ?? 0;
+  const sysTok = ledgerNum(bd.system_in_tokens) ?? ledgerNum(sp?.tokens_in ?? sp?.logical_tokens) ?? ledgerNum(opening?.tokens_in) ?? 0;
+  const cached = ledgerNum(opening?.cost_cached_usd) ?? 0;
+  const cachedTok = ledgerNum(opening?.tokens_cached) ?? 0;
+  if (sys <= 0 && sysTok <= 0 && cached <= 0 && cachedTok <= 0) return null;
   const st = (stack || (window.__costChart && window.__costChart.stack) || "io");
   let segs;
   if (st === "io") {
@@ -706,19 +709,22 @@ export function systemCostBar(round, { stack } = {}) {
       tokens: sysTok || null,
     }];
   }
+  if (cached > 0 || cachedTok > 0) {
+    segs.push({ k: "cached", label: "Cached", legendKey: "cached", v: cached, tok: cachedTok, color: COST_COLORS.cached });
+  }
   return {
     segs,
     in: sys,
-    cached: 0,
+    cached,
     out: 0,
-    total: sys || 0,
-    total_tok: sysTok || 0,
+    total: ledgerNum(opening?.estimate_usd) ?? sys,
+    total_tok: ledgerNum(opening?.opening_tokens) ?? sysTok,
     official: null,
     index: "sys",
-    label: "Sys",
+    label: opening ? "Sys ≈" : "Sys",
     kind: "system",
     uncached_tokens: sysTok,
-    cached_tokens: 0,
+    cached_tokens: cachedTok,
     out_tokens: 0,
   };
 }
@@ -746,11 +752,12 @@ export function userCostBar(round, { stack } = {}) {
   if (!(inUsd > 0) && coUsd > 0) inUsd = coUsd;
 
   // Keep User Cached even on round KV miss (Σ User+calls may exceed round Cached).
-  // R1 User never has Cached — leave at 0.
-  let cacheTok = isR1
+  // Grok R1 stamps zero. Connectors may attribute a cached share of the user text.
+  const hideOpeningCache = isR1 && round?.system_estimate?.opening_tokens == null;
+  let cacheTok = hideOpeningCache
     ? 0
     : (Number(up.tokens_cached ?? up.cached_est ?? bd.user_cached_tokens) || 0);
-  let cacheUsd = isR1
+  let cacheUsd = hideOpeningCache
     ? 0
     : (Number(up.cost_cached_usd ?? bd.user_cached_usd) || 0);
 

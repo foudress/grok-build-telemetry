@@ -704,7 +704,7 @@ function renderRoundTree(rounds, opts) {
         ${headParts}
         ${totalUsd > 0 ? totalPrice(totalUsd) : ""}
       </span>
-      <span class="compact-ctx muted">
+      <span class="compact-ctx muted ctx-metric">
         ${absBit}
         ${deltaBit}
       </span>
@@ -737,7 +737,7 @@ function renderRoundTree(rounds, opts) {
         ${headParts}
         ${totalUsd > 0 ? totalPrice(totalUsd) : ""}
       </span>
-      <span class="compact-ctx muted" title="Full session context re-read on the fork (cached)">${absBit}</span>
+      <span class="compact-ctx muted ctx-metric" title="Full session context re-read on the fork (cached)">${absBit}</span>
     </div>`;
   }
 
@@ -745,7 +745,17 @@ function renderRoundTree(rounds, opts) {
   function renderSystemBootstrap(sp, estimated = false) {
     if (!sp || (!estimated && !(sp.tokens_in || sp.logical_tokens || (sp.parts && sp.parts.length))))
       return "";
-    const { rawParts, tot } = estimated ? { rawParts: [], tot: sp.tokens } : systemBoxPartsAndTotal(sp);
+    const { rawParts, tot } = estimated ? { rawParts: [], tot: sp.opening_tokens ?? sp.tokens } : systemBoxPartsAndTotal(sp);
+    const recorded = estimated && sp.tokens != null && sp.tokens !== tot
+      ? ` · recorded instructions ≈${fmtTokens(sp.tokens)}`
+      : "";
+    const label = estimated
+      ? `${fmtTokens(tot)} tokens · ${sp.label || "Opening context"}${recorded}`
+      : (sp.label || "System / tools / reminders / MCP / Tool Definitions");
+    const title = estimated ? `${label}. ${sp.note || ""}` : (sp.note || "Session bootstrap (before Round 1)");
+    const ledger = estimated
+      ? joinParts([partIn(sp.tokens_in, sp.cost_in_usd), partCached(sp.tokens_cached, sp.cost_cached_usd)])
+      : partIn(tot, sp.cost_in_usd);
     const parts = rawParts.map(p => {
       const tokZ = Math.round(Number(
         p.tokenizer_tokens || p.tok_w || p.tokens || p.tokens_in
@@ -761,12 +771,12 @@ function renderRoundTree(rounds, opts) {
         ${eolTokenizerMeta({ tokenizer_tokens: tokZ }, tokF > 0 ? tokF : null)}
       </div>`;
     }).join("");
-    return `<div class="compact-row system-row" title="${esc(sp.note || "Session bootstrap (before Round 1)")}">
+    return `<div class="compact-row system-row" title="${esc(title)}">
       <span class="tag system">${estimated ? "System ≈" : "System"}</span>
-      <span class="compact-meta muted">${esc(sp.label || "System / tools / reminders / MCP / Tool Definitions")}</span>
+      <span class="compact-meta muted">${esc(label)}</span>
       <span class="compact-ledger">
-        ${estimated ? `<span class="tok-in">${fmtTokens(tot)} tokens</span>` : joinParts([partIn(tot, sp.cost_in_usd)])}
-        ${!estimated && sp.estimate_usd != null ? totalPrice(sp.estimate_usd) : ""}
+        ${ledger}
+        ${sp.estimate_usd != null ? totalPrice(sp.estimate_usd) : ""}
       </span>
       <span class="compact-ctx"></span>
       ${parts ? `<div class="system-parts">${parts}</div>` : ""}
@@ -1121,8 +1131,7 @@ function renderRoundTree(rounds, opts) {
       const apiCost = (lineSumUsd > 0 || growthIn || cacheTok || outTokLine)
         ? lineSumUsd
         : (s.cost_of_call_usd ?? s.estimate_usd ?? se.cost_of_call_usd ?? se.estimate_usd);
-      // Δctx = same estimated Call In on this line (tree / Cached growth), not
-      // API `_meta.totalTokens` window (ctxB−ctxA). Last call: skip_context.
+      // Prefer the context bounds attached to this call.
       const skipCtx = !!s.skip_context;
       const ctxA = s.display_context_start ?? s.context_start;
       const ctxB = s.display_context_end ?? s.context_end;
@@ -1136,7 +1145,7 @@ function renderRoundTree(rounds, opts) {
         if (gin > 0) ctxGrowth = gin;
       }
       const ctxSpan = (!skipCtx && ctxA != null && ctxB != null)
-        ? `<span class="muted" title="Call ctx: (prompt − harness) → (+ Out [+ Lead Out on Livre])">ctx ${fmtTokens(ctxA)}${AR}${fmtTokens(ctxB)}</span>`
+        ? `<span class="muted ctx-metric" title="Context at the start and end of this call">ctx ${fmtTokens(ctxA)}${AR}${fmtTokens(ctxB)}</span>`
         : "";
       const subCards = (s.subagents_after || []).map((sa) =>
         renderSubagentCard(sa, opts && opts.subSessions)
@@ -1150,7 +1159,7 @@ function renderRoundTree(rounds, opts) {
           ${callLine || ""}
           ${callLine && ctxSpan ? " " : ""}${ctxSpan}
           ${apiCost != null ? " " + totalPrice(apiCost) : ""}
-          ${ctxGrowth != null ? `<span class="muted" title="Δctx = context_end − context_start"> · Δctx ${fmtDelta(ctxGrowth)}</span>` : ""}
+          ${ctxGrowth != null ? `<span class="muted ctx-metric" title="Δctx = context_end − context_start"> · Δctx ${fmtDelta(ctxGrowth)}</span>` : ""}
         </summary>
         ${compBar(s.composition, se, s)}
         ${children || `<div class="node muted">—</div>`}
@@ -1221,7 +1230,7 @@ function renderRoundTree(rounds, opts) {
             ${rTotal != null ? totalPrice(rTotal) : ""}
           </span>
           <span class="round-ctx muted">ctx ${fmtTokens(r.context_start)}${AR}${fmtTokens(r.context_end)}
-            <span class="tok-cached">${fmtDelta(r.context_delta)}</span></span>
+            <span class="tok-cached">Δctx ${fmtDelta(r.context_delta)}</span></span>
         </div>
       </summary>
       ${usageBlock}

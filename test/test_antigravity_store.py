@@ -5,6 +5,8 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from token_telemetry.antigravity import store
 from token_telemetry.antigravity.adapt import build_period, state_for
 from token_telemetry.antigravity.prices import price_usage, priced_model
@@ -252,10 +254,13 @@ def test_usage_keeps_cache_read_out_of_uncached() -> None:
     assert usage["reasoning"] == 10
 
 
-def test_system_estimate_subtracts_full_first_query_from_total_input(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize(("cached", "user_uncached", "user_cached"), [(50, 70, 0), (130, 20, 50)])
+def test_system_estimate_subtracts_full_first_query_from_total_input(
+    tmp_path: Path, monkeypatch, cached: int, user_uncached: int, user_cached: int,
+) -> None:
     monkeypatch.setattr(store, "count_tokens", lambda text: len(text.split()))
     epoch = int(datetime(2026, 11, 21, 12, tzinfo=timezone.utc).timestamp())
-    first = _usage(uncached=100, cached=50, output=20, thinking=0, visible=20, response="first")
+    first = _usage(uncached=150 - cached, cached=cached, output=20, thinking=0, visible=20, response="first")
     later = _usage(uncached=400, cached=40, output=10, thinking=0, visible=10, response="later")
     _db(
         tmp_path / "conversations/cascade.db",
@@ -268,9 +273,16 @@ def test_system_estimate_subtracts_full_first_query_from_total_input(tmp_path: P
     assert estimate["input_tokens"] == 150
     assert estimate["user_tokens"] == 70
     assert estimate["tokens"] == 80
-    assert first_round["breakdown"]["tree_in_tokens"] == 100
-    assert first_round["breakdown"]["cached_tokens"] == 50
-    assert abs(first_round["estimate_usd"] - _list(100, 50, 20)) < 1e-12
+    assert estimate["tokens_in"] + estimate["tokens_cached"] == 80
+    assert first_round["breakdown"]["tree_in_tokens"] == first_round["user_prompt"]["prompt_tokens_in"] == user_uncached
+    assert first_round["breakdown"]["cached_tokens"] == first_round["user_prompt"]["tokens_cached"] == user_cached
+    assert abs(first_round["estimate_usd"] - _list(user_uncached, user_cached, 20)) < 1e-12
+    opening_cost = estimate["cost_in_usd"] + estimate["cost_cached_usd"]
+    assert abs(opening_cost + first_round["estimate_usd"] - _list(150 - cached, cached, 20)) < 1e-12
+    assert state["turns"][0]["input_tokens"] == 150
+    assert state["turns"][0]["cached_read_tokens"] == cached
+    assert (first_round["context_start"], first_round["context_end"], first_round["context_delta"]) == (80, 170, 90)
+    assert second_round["context_start"] == 170
     assert "system_estimate" not in second_round
 
 
@@ -287,8 +299,9 @@ def test_output_follows_thinking_plus_visible() -> None:
     assert usage["reasoning"] == 3
 
 
-def test_snapshot_sums_generations_once(tmp_path: Path) -> None:
+def test_snapshot_sums_generations_once(tmp_path: Path, monkeypatch) -> None:
     clear_cache()
+    monkeypatch.setattr(store, "count_tokens", lambda text: len(text.split()))
     home = _home(tmp_path)
     snap = load_snapshot(home)
     state = state_for(snap, "root-cascade", pinned="root-cascade")
@@ -299,13 +312,13 @@ def test_snapshot_sums_generations_once(tmp_path: Path) -> None:
     assert len(state["rounds"]) == 2
     rnd = state["rounds"][0]
     bd = rnd["breakdown"]
-    assert bd["tree_in_tokens"] == 140
-    assert bd["cached_tokens"] == 200
+    assert bd["tree_in_tokens"] == 42
+    assert bd["cached_tokens"] == 150
     assert bd["output_tokens"] == 40
     assert bd["llm_reasoning_tokens"] == 10
-    assert bd["user_in_tokens"] == 100
+    assert bd["user_in_tokens"] == 2
     assert bd["harness_in_tokens"] == 40
-    assert rnd["context_end"] == 190
+    assert rnd["context_end"] == 200
     assert rnd["user_prompt"]["preview"] == "déjà look"
     assert len(rnd["model_steps"]) == 2
     first = rnd["model_steps"][0]
@@ -327,8 +340,8 @@ def test_snapshot_sums_generations_once(tmp_path: Path) -> None:
     child = _list(7, 0, 1)
     assert state["totals"]["official_usd"] == 0
     assert abs(state["totals"]["estimate_usd"] - (parent + child)) < 1e-9
-    assert abs(state["rounds"][0]["estimate_usd"] - (_list(100, 50, 30) + _list(40, 150, 10))) < 1e-9
-    assert abs(state["rounds"][0]["breakdown"]["tree_in_usd"] - (_list(100, 0, 0) + _list(40, 0, 0))) < 1e-9
+    assert abs(state["rounds"][0]["estimate_usd"] - (_list(2, 0, 30) + _list(40, 150, 10))) < 1e-9
+    assert abs(state["rounds"][0]["breakdown"]["tree_in_usd"] - (_list(2, 0, 0) + _list(40, 0, 0))) < 1e-9
     assert state["pricing"]["model"] == "gemini-4-hydrogen"
     assert state["sessions"][0]["model"] == "Gemini 4 Hydrogen"
     assert state["sub_sessions"][0]["model"] == "gemini-flash-worker-agy"

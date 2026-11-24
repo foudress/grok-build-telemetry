@@ -270,11 +270,13 @@ export function buildCtxPoints(rounds) {
     const userHeadUsd = Number(up.display_in_usd)
       || (Number(up.prompt_cost_in_usd ?? up.cost_in_usd) || 0)
       || 0;
-    const upCache = isR1 ? 0 : (Number(up.tokens_cached ?? up.cached_est ?? priorCache) || 0);
-    const upCacheUsd = isR1 ? 0 : (Number(up.cost_cached_usd) || 0);
+    const hideOpeningCache = isR1 && r.system_estimate?.opening_tokens == null;
+    const upCache = hideOpeningCache ? 0 : (Number(up.tokens_cached ?? up.cached_est ?? priorCache) || 0);
+    const upCacheUsd = hideOpeningCache ? 0 : (Number(up.cost_cached_usd) || 0);
     // Absolute context after User In (baseline = hierarchy round.context_start).
     let userV = null;
-    if (hasRoundA) userV = roundCtxA + userHeadIn;
+    if (up.context_tokens != null) userV = Number(up.context_tokens);
+    else if (hasRoundA) userV = roundCtxA + userHeadIn;
     else if (plottable.length && Number.isFinite(plottable[0].ownStart))
       userV = plottable[0].ownStart;
     else if (isR1 && sysTok > 0) userV = sysTok + userHeadIn;

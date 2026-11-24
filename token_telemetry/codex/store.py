@@ -440,12 +440,9 @@ def _take_response_item(
     turn = _turn_of(payload)
     if pt == "message":
         role = payload.get("role") if isinstance(payload.get("role"), str) else ""
-        if role not in ("user", "assistant"):
-            return
-        text = _text_from_content(payload.get("content"))
         if role == "user":
-            remember_user(turn, text, event=False)
-        elif role == "assistant" and text:
+            remember_user(turn, _content_text(payload.get("content")), event=False)
+        elif role == "assistant" and (text := _text_from_content(payload.get("content"))):
             chars = _content_len(payload.get("content"))
             if llm_buf and llm_buf[-1].get("kind") == "message" and not llm_buf[-1].get("preview"):
                 llm_buf[-1]["preview"] = text
@@ -512,7 +509,7 @@ def _take_item_completed(
         return
     turn = _turn_of(payload)
     if it == "UserMessage":
-        remember_user(turn, _text_from_content(item.get("content")), event=True)
+        remember_user(turn, _content_text(item.get("content")), event=True)
         return
     if it == "ContextCompaction":
         if closed is not None:
@@ -614,14 +611,21 @@ def _parse_file(path: Path) -> dict[str, Any]:
     turn_user_event: set[str] = set()
     base_instructions = ""
     opening_instructions: list[str] = []
+    opening_user = ""
+    opening_user_event = False
 
     def _remember_user(turn: str, text: str, *, event: bool) -> None:
+        nonlocal opening_user, opening_user_event
         shown = _clip(text, 240)
         if not shown:
             return
         key = turn or current_turn
         if not key:
             return
+        if not calls and not fallback and (event or not opening_user):
+            if not opening_user_event:
+                opening_user = text
+                opening_user_event = event
         if event:
             turn_user[key] = shown
             turn_user_event.add(key)
@@ -761,14 +765,17 @@ def _parse_file(path: Path) -> dict[str, Any]:
             fallback.append(call)
 
     recorded_calls = calls if calls else fallback
-    if recorded_calls and (base_instructions or opening_instructions):
+    if recorded_calls and (base_instructions or opening_instructions or opening_user):
         if base_instructions and all(base_instructions.strip() != text.strip() for text in opening_instructions):
             opening_instructions.insert(0, base_instructions)
         recorded_calls[0]["system_estimate"] = {
-            "tokens": sum(count_tokens(text) for text in opening_instructions),
-            "label": "Recorded opening instructions",
-            "note": "Local token count of the recorded base, system and developer instructions before the first call. Tool definitions and provider-added context may be missing.",
+            "label": "Opening context",
+            "note": "Local token counts of the opening user text and recorded base, system and developer instructions. Opening context can also include tools and provider-added context.",
         }
+        if opening_instructions:
+            recorded_calls[0]["system_estimate"]["tokens"] = sum(count_tokens(text) for text in opening_instructions)
+        if opening_user:
+            recorded_calls[0]["system_estimate"]["user_tokens"] = count_tokens(opening_user)
     ids = _ids_in_name(path.name)
     thread_id = meta_id or (ids[-1] if ids else path.name)
     return {

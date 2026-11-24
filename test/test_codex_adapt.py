@@ -93,8 +93,12 @@ def test_state_matches_dashboard_rounds() -> None:
     assert rounds[0]["breakdown"]["llm_out_to_user_tokens"] == 5
     assert rounds[0]["breakdown"]["tree_in_usd"] == 0
     assert len(rounds[0]["model_steps"]) == 2
-    assert rounds[0]["model_steps"][0]["context_end"] == 50
-    assert rounds[0]["context_end"] == 58
+    first, last = rounds[0]["model_steps"]
+    assert (first["context_start"], first["context_end"]) == (50, 55)
+    assert (last["context_start"], last["context_end"]) == (58, 61)
+    assert (rounds[0]["context_start"], rounds[0]["context_end"], rounds[0]["context_delta"]) == (40, 61, 21)
+    assert (rounds[1]["context_start"], rounds[1]["context_end"], rounds[1]["context_delta"]) == (61, 66, 5)
+    assert state["turns"][0]["context_tokens_for_tier"] == 58
     assert rounds[0]["user_prompt"]["tokens_cached"] == 40
     assert rounds[0]["model_steps"][0]["tokens_cached"] == 50
     assert rounds[0]["model_steps"][1]["tokens_cached"] == 0

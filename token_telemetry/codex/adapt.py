@@ -147,13 +147,19 @@ def _ev_chars(ev: Any) -> int:
         return 0
 
 
-def _call_bill(call, price, unc, cached, out):
+def _prompt_tokens(call: dict[str, Any]) -> int:
     prompt = call.get("input_tokens")
+    if prompt is not None:
+        return _int(prompt)
+    return _int(call.get("uncached_input_tokens")) + _int(call.get("cached_input_tokens"))
+
+
+def _call_bill(call, price, unc, cached, out):
     return price(
         call.get("billing_model") or call.get("model"),
         uncached=unc, cached=cached, output=out,
         cache_write=_int(call.get("cache_write_input_tokens")),
-        prompt=_int(prompt) if prompt is not None else unc + cached,
+        prompt=_prompt_tokens(call),
         when=call.get("t"), service_tier=call.get("service_tier"),
     )
 
@@ -169,7 +175,7 @@ def _annotate(
     for call in calls:
         unc = _int(call.get("uncached_input_tokens"))
         cached = _int(call.get("cached_input_tokens"))
-        prompt = _int(call.get("input_tokens")) or (unc + cached)
+        prompt = _prompt_tokens(call)
         out = _int(call.get("output_tokens"))
         reason = _int(call.get("reasoning_output_tokens"))
         if prev_prompt and cached + _MISS_SLACK < prev_prompt:
@@ -224,14 +230,8 @@ def _annotate(
             # The tree does not spend it: Out and tool results are separate.
             notes[prev]["harness_rate"] = notes[i]["in_rate"]
             out_prev = _int(calls[prev].get("output_tokens"))
-            prompt_prev = _int(calls[prev].get("input_tokens")) or (
-                _int(calls[prev].get("uncached_input_tokens"))
-                + _int(calls[prev].get("cached_input_tokens"))
-            )
-            prompt_next = _int(calls[i].get("input_tokens")) or (
-                _int(calls[i].get("uncached_input_tokens"))
-                + _int(calls[i].get("cached_input_tokens"))
-            )
+            prompt_prev = _prompt_tokens(calls[prev])
+            prompt_next = _prompt_tokens(calls[i])
             # Context this call added. LLM Out is this call's billed Out,
             # not a slice of that growth. Tools keep whatever is left.
             delta = prompt_next - prompt_prev
@@ -420,6 +420,7 @@ def _round_from_calls(
     index: int,
     calls: list[dict[str, Any]],
     prev_end: Optional[float],
+    prev_context: Optional[int],
     notes: list[dict[str, Any]],
 ) -> dict[str, Any]:
     totals = _sum_calls(calls)
@@ -433,11 +434,7 @@ def _round_from_calls(
     if prev_end is not None and start_ep is not None:
         idle_ms = max(0, int((start_ep - prev_end) * 1000))
     steps = []
-    first_prompt = _int(first.get("input_tokens")) or (
-        _int(first.get("uncached_input_tokens")) + _int(first.get("cached_input_tokens"))
-    )
-    # Prefix before this turn's new user text. Chart User Y = prefix + user.
-    ctx_cursor = max(0, first_prompt - int(notes[0].get("user_new") or 0))
+    first_prompt = _prompt_tokens(first)
     usd_in = usd_cached = usd_out = 0.0
     miss_tok = user_tok = harness_tok = 0
     msg_out = tool_out = 0
@@ -445,14 +442,10 @@ def _round_from_calls(
     for n, call in enumerate(calls, start=1):
         note = notes[n - 1]
         bill = note["bill"]
-        unc = _int(call.get("uncached_input_tokens"))
         cached = _int(call.get("cached_input_tokens"))
         out = _int(call.get("output_tokens"))
         reason = _int(call.get("reasoning_output_tokens"))
-        prompt = _int(call.get("input_tokens")) or (unc + cached)
-        ctx_a = ctx_cursor
-        ctx_b = prompt
-        ctx_cursor = prompt
+        prompt = _prompt_tokens(call)
         usd_in += bill["in"]
         usd_cached += bill["cached"]
         usd_out += bill["out"]
@@ -494,22 +487,18 @@ def _round_from_calls(
             "cost_in_usd": caused_usd,
             "cost_cached_usd": bill["cached"],
             "cost_out_usd": bill["out"],
-            "context_start": ctx_a,
-            "context_end": ctx_b,
+            "context_start": prompt,
+            "context_end": prompt + out,
             "context_plot_tokens": prompt,
             "cache_miss_in_tokens": note["miss"],
             "cache_miss_in_usd": note["miss"] * float(note.get("in_rate") or 0),
             "children": children,
         }
-        if len(calls) >= 2 and n == len(calls):
-            step["skip_context"] = True
         if call.get("compact_after"):
             nxt = calls[n] if n < len(calls) else None
             after = None
             if nxt is not None:
-                after = _int(nxt.get("input_tokens")) or (
-                    _int(nxt.get("uncached_input_tokens")) + _int(nxt.get("cached_input_tokens"))
-                )
+                after = _prompt_tokens(nxt)
             removed = max(0, prompt - after) if after is not None else None
             step["compacts_after"] = [{
                 "kind": "compaction",
@@ -583,8 +572,36 @@ def _round_from_calls(
         "llm_out_to_user_usd": msg_usd,
         "total_usd": usd_in + usd_cached + usd_out,
     }
-    ctx_start = max(0, first_prompt - user_tok)
-    ctx_end = _int(last.get("input_tokens")) or (totals["uncached"] + totals["cached"])
+    system = None
+    if index == 1 and first.get("system_estimate"):
+        system = _split_opening(first, notes[0]["bill"], first_prompt)
+        breakdown.update({
+            "api_uncached_input_tokens": totals["uncached"],
+            "api_cached_read_tokens": totals["cached"],
+            "api_in_usd": usd_in,
+            "api_cached_usd": usd_cached,
+            "api_total_usd": breakdown["total_usd"],
+            "round_total_peeled_system": True,
+        })
+        user_tok -= system["tokens_in"]
+        user_cache -= system["tokens_cached"]
+        user_usd -= system["cost_in_usd"]
+        user_cache_usd -= system["cost_cached_usd"]
+        usd_in -= system["cost_in_usd"]
+        usd_cached -= system["cost_cached_usd"]
+        breakdown.update({
+            "tree_in_tokens": totals["uncached"] - system["tokens_in"],
+            "tree_in_usd": usd_in,
+            "cached_tokens": totals["cached"] - system["tokens_cached"],
+            "cached_usd": usd_cached,
+            "user_in_tokens": user_tok,
+            "user_in_usd": user_usd,
+            "total_usd": usd_in + usd_cached + usd_out,
+        })
+    ctx_start = prev_context
+    if ctx_start is None:
+        ctx_start = system["opening_tokens"] if system else max(0, first_prompt - user_tok)
+    ctx_end = steps[-1]["context_end"]
     return {
         "index": index,
         "completed": True,
@@ -592,21 +609,24 @@ def _round_from_calls(
         "model_family": model,
         "effort": effort,
         "breakdown": breakdown,
-        "tree_in_tokens": totals["uncached"],
-        "cached_read_tokens": totals["cached"],
+        "tree_in_tokens": breakdown["tree_in_tokens"],
+        "cached_read_tokens": breakdown["cached_tokens"],
         "output_tokens": totals["output"],
         "estimate_usd": usd_in + usd_cached + usd_out,
         "cost_cached_usd": usd_cached,
         "cost_out_usd": usd_out,
         "context_start": ctx_start,
         "context_end": ctx_end,
+        "context_delta": ctx_end - ctx_start,
         "idle_gap_ms": idle_ms,
+        **({"system_estimate": system} if system is not None else {}),
         "user_prompt": {
             "kind": "user_prompt",
             "tokens_in": user_tok,
             "uncached_est": user_tok,
             "prompt_tokens_in": user_tok,
             "tokens_cached": user_cache,
+            "context_tokens": first_prompt,
             "cost_cached_usd": user_cache_usd,
             "cost_in_usd": user_usd,
             "prompt_cost_in_usd": user_usd,
@@ -617,26 +637,51 @@ def _round_from_calls(
     }
 
 
+def _split_opening(call: dict[str, Any], bill: dict[str, Any], prompt: int) -> dict[str, Any]:
+    estimate = call["system_estimate"]
+    uncached = _int(call.get("uncached_input_tokens"))
+    cached = _int(call.get("cached_input_tokens"))
+    user = estimate.get("user_tokens")
+    prefix = max(0, prompt - user) if user is not None else estimate.get("tokens", 0)
+    prefix = min(prefix, uncached + cached)
+    prefix_cached = min(prefix, cached)
+    prefix_uncached = prefix - prefix_cached
+    cost_in = bill["in"] * (prefix_uncached / uncached) if uncached else 0.0
+    cost_cached = bill["cached"] * (prefix_cached / cached) if cached else 0.0
+    return {
+        **estimate,
+        "opening_tokens": prefix,
+        "tokens_in": prefix_uncached,
+        "tokens_cached": prefix_cached,
+        "cost_in_usd": cost_in,
+        "cost_cached_usd": cost_cached,
+        "estimate_usd": cost_in + cost_cached,
+    }
+
+
 def _turn_from_round(rnd: dict[str, Any]) -> dict[str, Any]:
     bd = rnd["breakdown"]
+    uncached = bd.get("api_uncached_input_tokens", bd["tree_in_tokens"])
+    cached = bd.get("api_cached_read_tokens", bd["cached_tokens"])
+    prompt = rnd["model_steps"][-1]["context_plot_tokens"]
     return {
         "index": rnd["index"],
         "turn_index": rnd["index"],
         "official_usd": 0,
-        "estimate_usd": bd.get("total_usd") or 0,
-        "uncached_input_tokens": bd["tree_in_tokens"],
-        "cached_read_tokens": bd["cached_tokens"],
+        "estimate_usd": bd.get("api_total_usd", bd["total_usd"]),
+        "uncached_input_tokens": uncached,
+        "cached_read_tokens": cached,
         "output_tokens": bd["output_tokens"],
-        "input_tokens": bd["tree_in_tokens"] + bd["cached_tokens"],
-        "tokens_in": bd["tree_in_tokens"],
-        "tokens_cached": bd["cached_tokens"],
+        "input_tokens": uncached + cached,
+        "tokens_in": uncached,
+        "tokens_cached": cached,
         "tokens_out": bd["output_tokens"],
         "tokens_reason": bd["llm_reasoning_tokens"],
-        "cost_in_usd": bd.get("tree_in_usd") or 0,
-        "cost_cached_usd": bd.get("cached_usd") or 0,
+        "cost_in_usd": bd.get("api_in_usd", bd["tree_in_usd"]),
+        "cost_cached_usd": bd.get("api_cached_usd", bd["cached_usd"]),
         "cost_out_usd": bd.get("output_usd") or 0,
-        "context_tokens_for_tier": rnd.get("context_end") or 0,
-        "peak_context_tokens": rnd.get("context_end") or 0,
+        "context_tokens_for_tier": prompt,
+        "peak_context_tokens": prompt,
         "epoch": rnd.get("_epoch"),
     }
 
@@ -664,19 +709,16 @@ def _view(
             n,
             [calls[i] for i in idxs],
             prev,
+            rounds_all[-1]["context_end"] if rounds_all else None,
             [notes[i] for i in idxs],
         )
         prev = rnd.get("_epoch")
         rounds_all.append(rnd)
-    if rounds_all and "system_estimate" in calls[0]:
-        rounds_all[0]["system_estimate"] = calls[0]["system_estimate"]
     turns = [_turn_from_round(r) for r in rounds_all]
     series = []
     for call in calls:
         ep = _epoch(call.get("t"))
-        prompt = _int(call.get("input_tokens")) or (
-            _int(call.get("uncached_input_tokens")) + _int(call.get("cached_input_tokens"))
-        )
+        prompt = _prompt_tokens(call)
         if ep is None:
             continue
         series.append({"t": int(ep * 1000), "v": prompt})

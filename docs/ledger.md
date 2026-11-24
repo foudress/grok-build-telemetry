@@ -47,13 +47,19 @@ under `system_estimate` when the opening data is available.
   from the total input of its first model call, including cache reads. The
   remainder can include tools, message framing, attachments and other context.
 - **Codex** counts recorded `session_meta.base_instructions` and opening
-  `system` and `developer` messages. The count covers the recorded text. Tool
-  definitions and provider-added context can be absent.
+  `system` and `developer` messages. The first user message determines the
+  remaining opening context when present. Otherwise the recorded instructions
+  provide the opening estimate.
 
-These estimates are displayed on their own card. The per-call token totals,
-cache split, costs and breakdowns continue to come from the connector ledger.
-Exact billing attribution would require the provider token counts by request
-component and cache status.
+Round 1 and the System card share the first call's uncached and cached budget.
+Only the prefix belongs to System. The estimate allocates cached tokens to
+the prefix first, then to the user message if the cache hit extends past the
+prefix. Raw API token and cost totals remain on `turns` for the session KPIs.
+
+Connector round context starts at the previous round's end, or at the opening
+prefix for Round 1. It ends at the last call's input plus its own output.
+Pricing and live context use the observed input, and each call's context line
+shows its own input and output.
 
 ## Canonical round fields
 
