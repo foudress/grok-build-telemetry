@@ -1131,33 +1131,17 @@ function restorePrefs() {
   applyFeatureGates();
 }
 
-function restorePanelCollapse() {
-  ["ctxPanel", "costPanel"].forEach((id) => {
-    try {
-      if (localStorage.getItem("tt-collapse-" + id) === "1") {
-        const el = $(id);
-        el.classList.add("is-collapsed");
-        $(id + "Title").setAttribute("aria-expanded", "false");
-      }
-    } catch { /* ignore */ }
-  });
+function setPanelCollapsed(id, collapsed) {
+  $(id + "Body").inert = collapsed;
+  $(id + "Title").setAttribute("aria-expanded", String(!collapsed));
 }
 
-function redrawExpandedPanel(id) {
-  requestAnimationFrame(() => {
-    if (id === "ctxPanel") {
-      if (_graphMode) applyGraphHeight(storedGraphH());
-      else if (window.__lastState) paintCtxChart(window.__lastState);
-      return;
-    }
-    if (id === "costPanel") {
-      if (isPeriodScope()) redrawPeriod();
-      else {
-        const st = window.__costChart;
-        if (st) drawBars($("costChart"), st.turns, st.rounds);
-      }
-    }
-  });
+function restorePanelCollapse() {
+  for (const id of ["ctxPanel", "costPanel"]) {
+    try {
+      setPanelCollapsed(id, localStorage.getItem("tt-collapse-" + id) === "1");
+    } catch { /* ignore */ }
+  }
 }
 
 function bindPanelCollapse() {
@@ -1168,15 +1152,12 @@ function bindPanelCollapse() {
       const toggle = head.querySelector(".panel-title-button");
       if (!toggle.contains(ev.target) && ev.target.closest("button, .unit-toggle, .period-nav, a, select, input")) return;
       const id = head.getAttribute("data-collapse-panel");
-      const panel = id && $(id);
-      if (!panel) return;
-      panel.classList.toggle("is-collapsed");
-      const collapsed = panel.classList.contains("is-collapsed");
-      toggle.setAttribute("aria-expanded", String(!collapsed));
+      const collapsed = !$(id + "Body").inert;
+      if (collapsed) hideAllChartTips();
+      setPanelCollapsed(id, collapsed);
       try {
         localStorage.setItem("tt-collapse-" + id, collapsed ? "1" : "0");
       } catch { /* ignore */ }
-      if (!collapsed) redrawExpandedPanel(id);
     });
   });
 }

@@ -695,10 +695,7 @@ export function paintPeriod(agg) {
   const meta = $("sessionMeta");
   if (meta) meta.textContent = "";
   const lab = $("periodLabel");
-  if (lab) {
-    lab.textContent = agg.label || "—";
-    lab.classList.toggle("is-billing", !!_billing);
-  }
+  if (lab) lab.textContent = agg.label || "—";
   const next = $("periodNext");
   if (next) next.disabled = _offset >= 0;
   paintCards(agg.totals || {});
