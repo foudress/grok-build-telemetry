@@ -822,10 +822,7 @@ function renderRoundTree(rounds, opts) {
       partOut(rOut, rOutUsd),
     ]);
 
-    // User [N]: LLM answer [N-1] (Thought TokZ + Reasoning TokF + Message TokZ)
-    // + prompt residual — no double-count. Server peels when answer fits in pool.
-    // On cache miss: prior re-read already includes answer N-1 — hide/skip it.
-    // Miss lives on Attribution Reread→LLM + red box, never under User.
+    // User [N] splits the previous answer from the prompt using the server stamp.
     const missTok = ledgerNum(bd.cache_miss_in_tokens)
       ?? ledgerNum(r.cache_miss_in_tokens)
       ?? ledgerNum(up.cache_miss_in_tokens)
@@ -842,21 +839,13 @@ function renderRoundTree(rounds, opts) {
       ?? ledgerNum(up.reread_in_usd)
       ?? ledgerNum(bd.reread_in_usd)
       ?? 0;
-    const rereadHit = !!(missTok > 0 || missUsd > 0
-      || up.session_restart || up.cache_miss || r.session_restart
-      || up.context_reread || r.context_reread || r.cache_miss
-      || (bd && bd.context_reread));
     const prevAns = up.prev_llm_answer || {};
-    const prevAbsorbed = false;
     // TokZ meta for eol chip only — not billed In.
-    const prevTokZ = Math.round(Number(
-      prevAns.tokenizer_tokens || prevAns.tokens_in_full || prevAns.tokens_in || 0
-    )) || 0;
-    // Billed continuity In only (peel-capped on server). Do not fall back to
-    // tokens_in_full / tokenizer — that re-invents warm cached answer as In.
-    const prevInTokRaw = Math.round(Number(prevAns.tokens_in) || 0) || 0;
-    const prevInTok = prevAbsorbed ? 0 : prevInTokRaw;
-    const prevOutInUsd = prevAbsorbed ? 0 : (Number(prevAns.cost_in_usd) || 0);
+    const prevTokZ = ledgerNum(prevAns.tokenizer_tokens) ?? ledgerNum(prevAns.tokens_in_full);
+    const prevInTok = ledgerNum(prevAns.tokens_in) ?? 0;
+    const prevCachedTok = ledgerNum(prevAns.tokens_cached) ?? 0;
+    const prevOutInUsd = ledgerNum(prevAns.cost_in_usd) ?? 0;
+    const prevOutTok = ledgerNum(prevAns.tokens_out) ?? ledgerNum(prevAns.tokens_in_full) ?? 0;
     const prevRoundN = prevAns.round_index || Math.max(0, (r.index || 1) - 1);
     // Prompt residual (never includes answer mass or Compact Out)
     const coTokEarly = Math.round(Number((up.compact_out || {}).tokens_in) || 0);
@@ -871,7 +860,7 @@ function renderRoundTree(rounds, opts) {
     ) || 0;
     // Fallback peel if server fields missing (use In mass, not pure TokZ)
     const rawUser = Number(up.uncached_est_raw ?? up.tokens_in ?? up.uncached_est) || 0;
-    if (!prevAbsorbed && up.prompt_tokens_in == null && prevInTok > 0 && rawUser >= prevInTok) {
+    if (up.prompt_tokens_in == null && prevInTok > 0 && rawUser >= prevInTok) {
       promptIn = Math.max(0, rawUser - prevInTok);
       if (rawUser > 0) promptUsd = (Number(up.cost_in_usd) || 0) * (promptIn / rawUser);
     }
@@ -914,14 +903,21 @@ function renderRoundTree(rounds, opts) {
     const ansBits = [];
     if (prevAns.tokens_thought) ansBits.push("thought");
     if (prevAns.tokens_reasoning) ansBits.push("reasoning");
-    if (prevAns.tokens_message || prevInTokRaw) ansBits.push("message");
-    const ansLabel = ansBits.length ? ansBits.join(" · ") : "thought · reasoning · message";
-    const prevAnsLine = (!prevAbsorbed && prevInTok > 0)
-      ? `<div class="node" title="${esc(prevAns.note || "Thought TokZ + Reasoning TokF + Message TokZ (hooks excluded)")}">
+    if (prevAns.tokens_message) ansBits.push("message");
+    const prevAnsLedger = joinParts([
+      partIn(prevInTok, prevOutInUsd),
+      partCached(prevCachedTok, prevAns.cost_cached_usd),
+    ]);
+    const prevSource = prevOutTok > 0 && prevOutTok !== prevInTok + prevCachedTok
+      ? `<span class="muted">Previous Out ${fmtTokens(prevOutTok)}</span>`
+      : "";
+    const prevAnsLine = (prevAnsLedger || prevOutTok > 0)
+      ? `<div class="node" title="${esc(prevAns.note || "Last answer from the previous round")}">
           <span class="tag llm-out-in">LLM answer round [${esc(String(prevRoundN))}]</span>
-          <span class="sum-gray" title="${esc(ansLabel)}">${esc(ansLabel)}</span>
-          ${partIn(prevInTok, prevOutInUsd)}
-          ${eolTokenizerMeta({ tokenizer_tokens: prevTokZ || prevInTok }, prevInTok)}
+          ${ansBits.length ? `<span class="sum-gray">${esc(ansBits.join(" · "))}</span>` : ""}
+          ${prevAnsLedger}
+          ${prevSource}
+          ${eolTokenizerMeta({ tokenizer_tokens: prevTokZ }, prevInTok)}
         </div>`
       : "";
     const co = up.compact_out || {};
@@ -988,6 +984,7 @@ function renderRoundTree(rounds, opts) {
           ${userHeadTot > 0 ? " " + totalPrice(userHeadTot) : ""}
         </summary>
         ${compactOutLine}
+        ${prevAnsLine}
         ${promptLine}
         ${livreCardLine}
         ${harnessCardLine}

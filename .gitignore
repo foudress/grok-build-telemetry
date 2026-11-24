@@ -39,6 +39,7 @@ out/_tmp*
 !/test/test_state_wire_slim.py
 !/test/test_ledger_identities.py
 !/test/test_official_rates.mjs
+!/test/test_round_tree.mjs
 !/test/test_codex_adapt.py
 !/test/test_codex_store.py
 !/test/test_launch_source.py

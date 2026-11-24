@@ -419,8 +419,7 @@ def _step_children(
 def _round_from_calls(
     index: int,
     calls: list[dict[str, Any]],
-    prev_end: Optional[float],
-    prev_context: Optional[int],
+    previous: Optional[dict[str, Any]],
     notes: list[dict[str, Any]],
 ) -> dict[str, Any]:
     totals = _sum_calls(calls)
@@ -430,6 +429,7 @@ def _round_from_calls(
     effort = str(last.get("effort") or first.get("effort") or "")
     start_ep = _epoch(first.get("t"))
     end_ep = _epoch(last.get("t"))
+    prev_end = previous["_epoch"] if previous is not None else None
     idle_ms = None
     if prev_end is not None and start_ep is not None:
         idle_ms = max(0, int((start_ep - prev_end) * 1000))
@@ -598,10 +598,13 @@ def _round_from_calls(
             "user_in_usd": user_usd,
             "total_usd": usd_in + usd_cached + usd_out,
         })
-    ctx_start = prev_context
-    if ctx_start is None:
-        ctx_start = system["opening_tokens"] if system else max(0, first_prompt - user_tok)
+    ctx_start = previous["context_end"] if previous is not None else (
+        system["opening_tokens"] if system else max(0, first_prompt - user_tok)
+    )
     ctx_end = steps[-1]["context_end"]
+    answer = _previous_answer(previous, first_prompt, user_cache, notes[0])
+    answer_in = answer["tokens_in"] if answer is not None else 0
+    answer_usd = answer["cost_in_usd"] if answer is not None else 0.0
     return {
         "index": index,
         "completed": True,
@@ -624,16 +627,45 @@ def _round_from_calls(
             "kind": "user_prompt",
             "tokens_in": user_tok,
             "uncached_est": user_tok,
-            "prompt_tokens_in": user_tok,
+            "prompt_tokens_in": user_tok - answer_in,
             "tokens_cached": user_cache,
             "context_tokens": first_prompt,
             "cost_cached_usd": user_cache_usd,
             "cost_in_usd": user_usd,
-            "prompt_cost_in_usd": user_usd,
+            "prompt_cost_in_usd": user_usd - answer_usd,
             "preview": next((str(c.get("user_preview")) for c in calls if c.get("user_preview")), ""),
+            **({"prev_llm_answer": answer} if answer is not None else {}),
         },
         "model_steps": steps,
         "_epoch": end_ep or start_ep,
+    }
+
+
+def _previous_answer(
+    previous: Optional[dict[str, Any]], prompt: int, cached: int, note: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    if previous is None:
+        return None
+    step = previous["model_steps"][-1]
+    out = step["tokens_out"]
+    if not out or step.get("compacts_after"):
+        return None
+    # Approximate the answer's position immediately after the preceding input.
+    # Clip each share to the next call's existing User input and cache budgets.
+    start = step["context_start"]
+    retained = min(out, max(0, prompt - start))
+    cached_answer = min(retained, max(0, cached - start))
+    uncached_answer = min(retained - cached_answer, note["user_new"])
+    return {
+        "kind": "prev_llm_answer",
+        "round_index": previous["index"],
+        "call_index": step["index"],
+        "tokens_out": out,
+        "tokens_in": uncached_answer,
+        "tokens_cached": cached_answer,
+        "cost_in_usd": uncached_answer * note["in_rate"],
+        "cost_cached_usd": note["bill"]["cached"] * (cached_answer / cached) if cached else 0.0,
+        "note": "Estimated share of the previous round's last answer in this round's input.",
     }
 
 
@@ -694,7 +726,6 @@ def _view(
     calls = _calls(thread)
     notes = _annotate(calls, price=price)
     rounds_all = []
-    prev = None
     order: list[str] = []
     groups: dict[str, list[int]] = {}
     for i, call in enumerate(calls):
@@ -708,11 +739,9 @@ def _view(
         rnd = _round_from_calls(
             n,
             [calls[i] for i in idxs],
-            prev,
-            rounds_all[-1]["context_end"] if rounds_all else None,
+            rounds_all[-1] if rounds_all else None,
             [notes[i] for i in idxs],
         )
-        prev = rnd.get("_epoch")
         rounds_all.append(rnd)
     turns = [_turn_from_round(r) for r in rounds_all]
     series = []

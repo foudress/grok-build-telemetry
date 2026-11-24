@@ -61,6 +61,12 @@ prefix for Round 1. It ends at the last call's input plus its own output.
 Pricing and live context use the observed input, and each call's context line
 shows its own input and output.
 
+In subsequent rounds, `prev_llm_answer` shows the previous round's last call
+under User. Codex and Antigravity estimate the answer's retained input from the
+previous prompt boundary and split it across the current User uncached and
+cached budgets. The prompt line shows the remaining uncached share. The answer
+is omitted after a recorded between-round compaction.
+
 ## Canonical round fields
 
 ```
@@ -111,6 +117,7 @@ model_steps[].{tokens_in, tokens_cached, tokens_out, children[]}
 | Round In | `bd.tree_in_tokens` | re-sum user+calls unless `tree_in` absent |
 | Round Cached/Out/$ | `r.cached_read_tokens` / `output_tokens` / `estimate_usd` | — |
 | User header In | `bd.user_in_tokens` (prompt + prev billed + Compact Out) | TokZ |
+| LLM answer under User | `user_prompt.prev_llm_answer` (In and Cached shares when stamped, prior Out for reference when different) | count prior Out in the current ledger |
 | Cache miss | `cache_miss_in_*` | under User |
 | User Cached R1 | **0** | invent prior |
 | Enc TokZ | `tokenizer_tokens` if **> 0** else `encrypted_tokens` | treat `0` as stamp |
@@ -118,7 +125,7 @@ model_steps[].{tokens_in, tokens_cached, tokens_out, children[]}
 | Call In | `step.tokens_in` | double peel compact |
 | Sub Agent N | `sa.tokens_in/cached/out` of the **round** | lifetime + System |
 
-Frozen quirks: System spliced in HTML looking for `>Round 1<`. Enc `prevAbsorbed` hardcoded `false`. Context chart User Y uses `display_in_tokens` (may ≠ billed User In). Compact glue = `head[:800]` only. `MAX_ROUNDS_RETAINED` / wire window = **4000**. ToolDef jump is System remainder, never Round 1 tree In.
+Frozen quirks: System spliced in HTML looking for `>Round 1<`. Context chart User Y uses `display_in_tokens` (may ≠ billed User In). Compact glue = `head[:800]` only. `MAX_ROUNDS_RETAINED` / wire window = **4000**. ToolDef jump is System remainder, never Round 1 tree In.
 
 ## Period (`/api/aggregate`)
 

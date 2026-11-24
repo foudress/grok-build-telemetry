@@ -8,6 +8,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from token_telemetry.codex.adapt import build_period, sessions_for_ui, state_for
 from token_telemetry.codex.prices import price_usage
 from token_telemetry.codex.api import CodexFeed
@@ -102,6 +104,11 @@ def test_state_matches_dashboard_rounds() -> None:
     assert rounds[0]["user_prompt"]["tokens_cached"] == 40
     assert rounds[0]["model_steps"][0]["tokens_cached"] == 50
     assert rounds[0]["model_steps"][1]["tokens_cached"] == 0
+    assert "prev_llm_answer" not in rounds[0]["user_prompt"]
+    user = rounds[1]["user_prompt"]
+    answer = user["prev_llm_answer"]
+    assert (answer["round_index"], answer["call_index"], answer["tokens_out"]) == (1, 2, 3)
+    assert (answer["tokens_cached"], answer["tokens_in"], user["prompt_tokens_in"]) == (2, 1, 3)
     assert state["turns"][0]["uncached_input_tokens"] == 18
     assert state["sub_sessions"][0]["turns"][0]["uncached_input_tokens"] == 7
     assert state["sub_sessions"][0]["session_kind"] == "subagent"
@@ -114,6 +121,34 @@ def test_state_matches_dashboard_rounds() -> None:
     focused = sessions_for_ui(snap, focus="c")
     assert focused[0]["session_id"] == "c"
     assert any(row["session_id"] == "p" for row in focused)
+
+
+@pytest.mark.parametrize(("uncached", "cached", "compact", "answer_in", "answer_cached"), [
+    (200, 4900, False, 30, 0),
+    (70, 5030, False, 0, 30),
+    (100, 4220, False, 0, 0),
+    (200, 4900, True, 0, 0),
+])
+def test_previous_answer_only_splits_the_existing_user_bill(
+    uncached: int, cached: int, compact: bool, answer_in: int, answer_cached: int,
+) -> None:
+    first = _call("2026-10-21T12:00:00Z", "t1", 100, 4900, 30, 8)
+    second = _call("2026-10-21T12:00:30Z", "t2", uncached, cached, 2, 0)
+    first["model"] = second["model"] = "gpt-6-luna"
+    first["compact_after"] = compact
+    snap = {"threads": [{"id": "p", "is_root": True, "updated": second["t"], "calls": [first, second]}]}
+    state = state_for(snap, "p", pinned="p")
+    rnd = state["rounds"][1]
+    user = rnd["user_prompt"]
+    answer = user.get("prev_llm_answer", {})
+    assert bool(answer) is not compact
+    assert answer.get("tokens_in", 0) == answer_in
+    assert answer.get("tokens_cached", 0) == answer_cached
+    assert user["prompt_tokens_in"] + answer_in == rnd["breakdown"]["user_in_tokens"]
+    assert user["prompt_cost_in_usd"] + answer.get("cost_in_usd", 0) == pytest.approx(user["cost_in_usd"])
+    assert user["tokens_cached"] == rnd["cached_read_tokens"] == cached
+    assert answer.get("cost_cached_usd", 0) == pytest.approx(user["cost_cached_usd"] * answer_cached / cached)
+    assert rnd["breakdown"]["tree_in_tokens"] == state["turns"][1]["uncached_input_tokens"] == uncached
 
 
 def test_round_tree_shows_tools_without_changing_totals() -> None:
